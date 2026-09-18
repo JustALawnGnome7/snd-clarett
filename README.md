@@ -277,8 +277,8 @@ sudo rm /var/lib/alsa/asound.state          # only if no other card needs it
 
 ## How it works / contributing
 
-The design, the FCP protocol, model detection, the module parameters, and the
-reverse-engineering history are documented in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+The design, the FCP transport, model detection, diagnostics and the module parameters are
+documented in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
 ## License
 
