@@ -1,0 +1,19 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# Source tarballs from `make dist` (the input to the RPM specs)
+*.tar.gz
+
+# Scratch capture/diagnostic dumps
+*.log
+
+# Editor/OS noise
+*~
+.DS_Store
