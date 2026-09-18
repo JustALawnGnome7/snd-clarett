@@ -109,10 +109,8 @@ out:
  *    device only echoes seq (it does not require a 0 start), and fcp-server never inspects seq,
  *    so continuing the monotonic counter is correct and race-free.
  *
- * BENCH RISK (untested): our probe already armed the device in-kernel, which ran INIT_1/INIT_2
- * once this power cycle. fcp.c's fcp_reinit re-runs them on a live device, so they are meant to
- * be re-runnable, but INIT_1 is command #0 of the vendor session-start and re-issuing it on an
- * already-armed device is the top thing to verify (re-running the *full* arm is known to wedge).
+ * INIT_1/INIT_2 are safe to issue on a device whose session is already running (fcp.c's
+ * fcp_reinit does the same); INIT_1 may report a nonzero FCP status there while still working.
  */
 static int clarett_hwdep_init_cmd(struct clarett *c, struct fcp_init __user *arg)
 {
@@ -162,19 +160,9 @@ out:
  * heartbeat uses) and projects the raw levels through the map. SET_METER_LABELS attaches an
  * FCP_CHANNEL_LABELS TLV naming each channel. Mirrors sound/usb/fcp.c's meter control.
  *
- * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT `[HW — 4Pre]`. The slot stride is
- * 4 bytes (48 u32 words), but only the low 16 bits carry the level, so the old code's plain u32 read
- * yielded values ~8000x over full scale and clamped every channel to CLARETT_METER_MAX. Observed
- * words: 0x020a020a, 0x020e020e, and on a later run 0x01cf01cf, 0x01ca01ca — i.e. {522,522},
- * {526,526}, {463,463}, {458,458}. Sane idle levels in the 0..4095 range, each duplicated.
- *
- * The halves being IDENTICAL in every sample across runs is what rules out "two u16 channels per
- * word": two independent channels would not track each other exactly. Corroborating: slot 28 (byte
- * offset 112) is live and moves with the rest between runs, which is past the end of a 48-entry u16
- * reply (96 bytes), so the reply really is 48 u32 words.
- *
- * Still unconfirmed: whether num_meters counts slots 1:1 (assumed) — a reply-length sweep against
- * num_meters settles it, and would also explain why only slots 0 and 18-23 ever carry signal here.
+ * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT. The reply is 48 u32 words, one per slot, and
+ * each word carries the same 16-bit level (0..4095) in both halves — e.g. 0x020a020a = 522. Read
+ * only the low half: the whole word is ~8000x full scale. num_meters is assumed to count slots 1:1.
  */
 static int clarett_hwdep_meter_info(struct snd_kcontrol *kctl,
 				    struct snd_ctl_elem_info *ui)
@@ -454,7 +442,7 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  * cause register (ev = the monitor-mask cause bits) — the FCP notification word is not exposed on
  * any surface we can read. We therefore deliver an all-categories event (~0) so fcp-server does a
  * correct, if broad, re-read of all notifiable controls. If a real notification word is ever
- * decoded (e.g. a future capture or a DEVMAP field), carry it through here instead of the wildcard.
+ * found, carry it through here instead of the wildcard.
  */
 /*
  * Minimum gap between notification wakes. Writable at runtime:
@@ -463,17 +451,11 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  * trips on a 2Pre (the routing and mixer controls are not notifiable, so they cost nothing), so
  * 20 Hz would be roughly 160 round trips a second.
  *
- * 50 ms rather than something smaller because MEASURED (2Pre): the 0x400 config-change
- * signal is a PERIODIC HEARTBEAT at ~13.4 Hz, not a change event. Counting notifications reaching
- * fcp-server over 10 s gave ~135 at every limiter setting from 50 ms down to 0, ~135 after halving
- * the re-read work per wake, and ~133 while the monitor knob was turned continuously for the whole
- * 10 s. Neither the timer, nor the workload, nor actual device activity moves that number.
- *
- * So the device says "re-read me" on a fixed cadence and says nothing about what changed — which is
- * why the relay is a wildcard, and why front-panel tracking is capped at one update per ~75 ms.
- * 50 ms passes essentially everything on offer while still collapsing a burst; going faster needs
- * the driver to poll the monitor bytes and synthesise a notification on change, not a shorter timer.
- * (The "~30 Hz idle" figure in the older comments here was wrong.)
+ * 50 ms rather than something smaller because the 0x400 config-change signal is a PERIODIC
+ * HEARTBEAT at ~13.4 Hz, not a change event: the rate is the same idle, under load, and while a
+ * control is being turned. So the device says "re-read me" on a fixed cadence and says nothing about
+ * what changed — which is why the relay is a wildcard, and why front-panel tracking is capped at one
+ * update per ~75 ms. 50 ms passes essentially everything on offer while still collapsing a burst.
  */
 static uint notify_ms = 50;
 module_param(notify_ms, uint, 0644);
@@ -494,18 +476,16 @@ static void clarett_hwdep_notify_wake(struct work_struct *work)
 void clarett_hwdep_notify(struct clarett *c, u32 ev)
 {
 	/*
-	 * The device asserts the 0x400 config-change notification steadily (~30 Hz idle), and we can
+	 * The device asserts the 0x400 config-change notification steadily (~13.4 Hz), and we can
 	 * only relay a wildcard (~0) since the FCP notification word is not exposed — so every wake
 	 * makes fcp-server re-read every control it marks notifiable. Coalesce: set the event now, and
 	 * wake at most once per notify_ms so a storm of idle notifications becomes one re-read.
 	 *
 	 * schedule_delayed_work(), NOT mod_delayed_work(): it is a no-op while the work is already
-	 * queued, so the wake lands 200 ms after the FIRST notification of a burst. mod_delayed_work()
-	 * pushes the deadline out on every arrival, which is a debounce — and against a source that
-	 * never goes idle it never fires at all. That was the bug: the flag was set forever behind a
-	 * wake that never came, so userspace received exactly one notification (whatever was pending
-	 * when it opened the hwdep) and nothing afterwards. Front-panel changes — the monitor knob,
-	 * mute, dim — therefore never reached fcp-server, while the driver logged every one of them.
+	 * queued, so the wake lands notify_ms after the FIRST notification of a burst.
+	 * mod_delayed_work() pushes the deadline out on every arrival, which is a debounce — and
+	 * against a source that never goes idle it never fires at all, so userspace would see one
+	 * notification and nothing afterwards.
 	 */
 	if (!c->hwdep_ready)
 		return;

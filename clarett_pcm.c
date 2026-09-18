@@ -12,11 +12,8 @@
  *
  * Two ALSA substreams share the one engine: whichever prepares first arms it full-duplex, the other
  * attaches at the current clock. The engine ONLY clocks when both rings live in one contiguous buffer
- * with r1 = r0 + ring (proven by the engine-start probe), which is why TX is always armed even for
- * capture-only (it plays silence until a playback stream fills it).
- *
- * Calibration caveat (clarett.h): frames-per-0x300-event uses CLARETT_CTR_FRAMES; verified on the 2Pre.
- * Clocking and period flow are independent of that constant.
+ * with r1 = r0 + ring, which is why TX is always armed even for capture-only (it plays silence until a
+ * playback stream fills it).
  */
 #include <linux/dma-mapping.h>
 #include <linux/math64.h>
@@ -33,73 +30,60 @@
 static void clarett_build_rings(struct clarett *c);	/* rebuilt at prepare when dyn_period changes cadence */
 
 /*
- * Replay the vendor's pre-arm re-init batch in the stream handshake (see clarett_stream_handshake).
- * TESTED ON A 4Pre AND IT CHANGES NOTHING: the device accepts every command (err=0) but the engine
- * still raises one period event with ctr=0. Default OFF because it overlaps the probe-time bring-up
- * that is documented to wedge GET_DATA when re-run on an armed device, and it has no demonstrated
- * benefit to weigh against that. Kept as a lever for retesting on other models.
+ * Diagnostic: issue an extra re-init batch in the stream handshake (see clarett_stream_handshake). It
+ * has no known benefit, so it is off by default.
  */
 static bool stream_batch;
 module_param(stream_batch, bool, 0644);
 MODULE_PARM_DESC(stream_batch,
-		 "Replay the vendor's pre-arm re-init batch (INIT_2, subsystem enables 1-8, count "
-		 "queries, 0x004001 x6) before arming the stream engine (default off; no effect on a 4Pre).");
+		 "Diagnostic: issue a re-init batch (INIT_2, subsystem enables 1-8, count queries, "
+		 "0x004001 x6) before arming the stream engine (default off).");
 
 /*
  * dyn_period: derive the RX IRQ cadence from the negotiated ALSA period instead of the fixed 256-frame
  * default, so a DAW can pick a smaller device buffer (down to one 16-frame fragment). It rebuilds the
- * descriptor ring at a finer marker cadence; both directions are locked to one period (option a: DAWs use a
- * single duplex buffer size anyway).
+ * descriptor ring at a finer marker cadence; both directions are locked to one period (DAWs use a single
+ * duplex buffer size anyway).
  *
- * HARDWARE-VERIFIED (8Pre): the 0x300 counter free-runs in 16-frame units regardless of marker
- * spacing — its per-event step scaled proportionally with the cadence across a 64x range (+0x01/+0x04/+0x08/
- * +0x10/+0x40 at cadence 1/4/8/16/64), so the servicer's step*CLARETT_CTR_FRAMES advance stays correct with no
- * change, and a 1 kHz reference captured at 1000.0 Hz (no drift) at every one. Cadence 1 (EVERY descriptor
- * IRQ-flagged, 8x the vendor's ~14 density) held stable over 132k periods / ~44 s with rekicks=0, wraps=0,
- * late=0 — the engine tolerates maximum flag density. Consequently the counter's wrap/recovery window is 0x100
- * units = 4096 frames = ~85 ms at EVERY cadence, so a finer period does not reduce the scheduling-gap tolerance
- * (it rode through the platform's ~42 ms SMI freeze at cadence 4, coalesced periods recovered exactly, wraps=0).
+ * The 0x300 counter free-runs in 16-frame units regardless of marker spacing, so the servicer's
+ * step*CLARETT_CTR_FRAMES advance is correct at every cadence, and the counter's wrap/recovery window stays
+ * 0x100 units = 4096 frames = ~85 ms: a finer period does not reduce the tolerance for scheduling gaps. The
+ * engine accepts every descriptor being IRQ-flagged (cadence 1).
  *
- * ON by default. The floor is one 16-frame fragment (CLARETT_DYN_MIN_FRAMES = CLARETT_FRAG_FRAMES, cadence 1),
- * the hardware minimum and verified above — a 16x drop from the old 256 floor. dyn_period=0 restores the fixed
- * 256-frame cadence. NOTE: with PipeWire adopting the card it arms the engine first and the duplex lock coerces
- * the app to PipeWire's quantum, so a DAW controls the buffer size only once PipeWire has released the card
- * (standard pro-audio setup).
+ * ON by default. The floor is one 16-frame fragment (CLARETT_DYN_MIN_FRAMES, cadence 1), the hardware
+ * minimum. dyn_period=0 restores the fixed 256-frame cadence. NOTE: with PipeWire adopting the card it arms
+ * the engine first and the duplex lock holds the app to PipeWire's period, so a DAW controls the buffer
+ * size only once PipeWire has released the card (standard pro-audio setup).
  *
- * The period is only half of what an app feels as latency. The total ALSA buffer used to be PINNED to the
- * 4096-frame ring, so an app that keeps its buffer full ran 85 ms of playback latency no matter how small a
- * period it asked for; it is now any power-of-two fraction of the ring down to CLARETT_MIN_BUFFER_FRAMES, and
- * at most CLARETT_MAX_PERIODS of the app's own period.
+ * The period is only half of what an app feels as latency; the buffer is bounded too — a power-of-two
+ * fraction of the ring down to CLARETT_MIN_BUFFER_FRAMES, and at most CLARETT_MAX_PERIODS of the app's
+ * own period.
  */
-#define CLARETT_DYN_MIN_FRAMES	CLARETT_FRAG_FRAMES	/* one fragment = 16 frames (cadence 1); the verified floor */
+#define CLARETT_DYN_MIN_FRAMES	CLARETT_FRAG_FRAMES	/* one fragment = 16 frames (cadence 1): the floor */
 static bool dyn_period = true;
 module_param(dyn_period, bool, 0444);
 MODULE_PARM_DESC(dyn_period,
 		 "Derive the RX IRQ cadence from the chosen ALSA period, lowering the minimum device buffer from "
-		 "256 to 16 frames (default on; verified drift-free at cadence 1-64). 0 = fixed 256-frame cadence. "
+		 "256 to 16 frames (default on). 0 = fixed 256-frame cadence. "
 		 "A DAW controls the period only once PipeWire has released the card.");
 
 /*
- * Override the highest sample rate the PCM advertises. Default 0 = use the per-model confirmed cap
- * (clarett_model.max_rate): single speed (44.1/48) everywhere, plus double/quad on models where the
- * high-rate data plane is hardware-confirmed (the 2Pre, to 192 kHz). Set this to opt a NOT-yet-confirmed
- * model into the higher rates for testing: the transport already sends SET_CLOCK{rate,Internal} for any
- * rate and the stream width is rate-independent, but confirm with a known tone (correct pitch on the
- * analogue channel) before trusting a rate on an ADAT model, where double/quad speed is unverified.
+ * Override the highest sample rate the PCM advertises. Default 0 = use the per-model verified cap
+ * (clarett_model.max_rate). Set this to opt an unverified model into the higher rates for testing: the
+ * transport sends SET_CLOCK for any rate and the stream width is rate-independent, but confirm with a
+ * known tone (correct pitch on the analogue channel) before trusting a rate.
  */
 static unsigned int max_rate;
 module_param(max_rate, uint, 0444);
 MODULE_PARM_DESC(max_rate,
 		 "Override the highest advertised sample rate for ALL models: 48000, 96000, or 192000. "
-		 "0 (default) uses each model's hardware-confirmed cap. 44.1 and 48 kHz are always offered.");
+		 "0 (default) uses each model's verified cap. 44.1 and 48 kHz are always offered.");
 
 /*
  * Clock source sent with SET_CLOCK at each stream arm: 24=Internal, 0=ADAT, 3=S/PDIF on every model
- * (the 2Pre XML claims 4 for S/PDIF; measured, 4 locks to any external source and 3 is the one that
- * tracks S/PDIF alone — see clarett.h). The 8PreX alone adds 1=ADAT 2 and 2=Wordclock, both untested.
- * Default Internal. Set to 0 to slave to an incoming ADAT clock (needed to receive a digital ADAT input
- * cleanly). The source is NOT a config-space byte — it lives only in the SET_CLOCK payload — so it
- * cannot be mapped as an fcp-server global control, and there is no clock-source ALSA control yet.
+ * (see clarett.h). The 8PreX alone adds 1=ADAT 2 and 2=Wordclock, both untested. Default Internal. Set
+ * to 0 to slave to an incoming ADAT clock (needed to receive a digital ADAT input cleanly). This is the
+ * value behind the "Clock Source" control below.
  *
  * PER-CARD, indexed by ALSA card number (the one /proc/asound/cards shows), because a two-card rig needs
  * one master and one slave: feeding one Clarett's ADAT output into another's input requires the source
@@ -135,8 +119,8 @@ static void clarett_set_clock_source(struct clarett *c, int value)
 /*
  * "Clock Source" — the one control this driver owns rather than leaving to fcp-server.
  *
- * It cannot go through fcp-server's map: the clock source is NOT a config-space byte (the [XML]
- * <clocking> element carries no offset-bytes), it exists only in the SET_CLOCK payload, which is
+ * It cannot go through fcp-server's map: the clock source is NOT a config-space byte, it exists only in
+ * the SET_CLOCK payload, which is
  * {u32 rate, u32 source} — and fcp-server has no idea what sample rate the device is running at, so it
  * cannot issue that command safely. This driver already sends SET_CLOCK at every stream arm and knows
  * the negotiated rate, so the selection belongs here. alsa-scarlett-gui renders any element named
@@ -256,15 +240,14 @@ static const struct snd_pcm_hardware clarett_pcm_hw = {
 	.periods_min      = 2,
 };
 
-/* Pointer to the block-1 (capture) RX sample area inside the contiguous hardware buffer. Descriptor mode:
- * [TX table][TX samples][RX table][RX samples]. Flat mode: [TX samples][RX samples]. clarett_stream_rx_off()
- * returns the right offset for the model's mode. */
+/* Pointer to the block-1 (capture) RX sample area inside the contiguous hardware buffer:
+ * [TX table][TX samples][RX table][RX samples]. */
 static u8 *clarett_rx_area(struct clarett *c)
 {
 	return (u8 *)c->stream_buf + clarett_stream_rx_off(c);
 }
 
-/* RX capture sample-ring size in bytes (== the capture ALSA buffer), per mode. */
+/* RX capture sample-ring size in bytes (the largest capture ALSA buffer). */
 static size_t clarett_rx_ring_bytes(struct clarett *c)
 {
 	return clarett_stream_rx_area_bytes(c);
@@ -311,11 +294,9 @@ static u8 clarett_rx_live_channels(struct clarett *c, unsigned int rate)
  * Latch how much of each capture frame the device actually fills at this rate, for clarett_rx_drain() to
  * blank on the way out. Called from prepare, once the rate is negotiated.
  *
- * The removed channels are NOT left untouched by the engine, which an earlier version of this assumed:
- * hardware shows it keeps depositing a sparse residue — one non-zero sample every 32 frames, an impulse
- * train at -25 dBFS — into channels it dropped at the immediately preceding speed tier (ADAT 5-8 at
- * double, ADAT 3-4 at quad), while channels dropped a full tier earlier get nothing at all. So blanking
- * the ring once cannot hold; it has to happen per period, on the frames handed to ALSA.
+ * The removed channels are NOT left untouched by the engine: it keeps depositing a sparse residue (one
+ * non-zero sample every 32 frames, ~-25 dBFS) into some of them. So blanking the ring once cannot hold;
+ * it has to happen per period, on the frames handed to ALSA.
  */
 static void clarett_set_rx_live(struct clarett *c, unsigned int rate)
 {
@@ -332,8 +313,8 @@ static void clarett_set_rx_live(struct clarett *c, unsigned int rate)
  * contiguous ALSA buffer (starting at that stream's own frame `apos` — the two differ by the capture
  * direction's attach base and wrap independently). The RX area is a table of NDESC fragment SLOTS of
  * c->rx_slot bytes; ring frame f lives in slot (f/FRAG_FRAMES) at byte (f%FRAG_FRAMES)*frame within that
- * slot. When rx_slot == audio-bytes/fragment (the contiguous default) this is just a linear copy; when
- * padded (scatter-gather experiment) it gathers per fragment across the gaps. FRAG_FRAMES divides the ring,
+ * slot. When rx_slot == audio-bytes/fragment this is just a linear copy; when padded (the page-safe
+ * default for models whose fragment is not a power of two) it gathers per fragment across the gaps. FRAG_FRAMES divides the ring,
  * so a chunk clipped to the fragment boundary also handles the ring wrap.
  *
  * `abuf` is the ALSA buffer in frames, which is NOT the ring: it is a power-of-two divisor of it, so the
@@ -382,8 +363,8 @@ static void clarett_rx_drain(struct clarett *c, u8 *alsa, u32 apos, u32 pos, u32
  * contiguous ALSA playback buffer (starting at that stream's own frame `apos`). Exact mirror of
  * clarett_rx_drain with source/destination swapped: the TX area is NDESC fragment SLOTS of c->tx_slot
  * bytes; ring frame f lives in slot (f/FRAG_FRAMES) at byte (f%FRAG_FRAMES)*frame within that slot. When
- * tx_slot == audio-bytes/fragment (tx_frag_pad=0) this degenerates to the old linear copy; when padded it
- * scatters per fragment across the gaps (matching the vendor's non-contiguous TX ring). FRAG_FRAMES divides
+ * tx_slot == audio-bytes/fragment this degenerates to a linear copy; when padded it scatters per fragment
+ * across the gaps. FRAG_FRAMES divides
  * the ring, so a chunk clipped to the fragment boundary also handles the ring wrap.
  *
  * `abuf` is the ALSA buffer in frames, a power-of-two divisor of the ring rather than the ring itself, so
@@ -423,46 +404,24 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos
  * concurrent DMA read is never torn by our write. It only has to exceed the engine's advance during ONE
  * fill memcpy (a few frames — a ~64 KB copy is single-digit microseconds), NOT the whole inter-tick gap:
  * the fill covers the ENTIRE ring ahead of the read, so even a lagged tick reads frames a prior tick
- * already filled. It must also stay <= the app's steady-state lead (>= one ALSA period, min 256 frames),
- * or the fill's near edge reads not-yet-written data — the PipeWire skipping. 64 frames satisfies both. */
+ * already filled. 64 frames is a single fragment-aligned margin comfortably above that. */
 #define CLARETT_TX_GUARD_FRAMES	(4 * CLARETT_FRAG_FRAMES)	/* 64 frames */
 
 /*
- * Smallest ALSA buffer offered. The buffer used to be PINNED to the 4096-frame ring, which set playback
- * latency for any app that keeps the buffer full — measured on an 8Pre at a 16-frame period: delay 4000
- * frames, 83 ms, against the 1.75 ms the DAW believed it had asked for. The buffer is now a power-of-two
- * divisor of the ring instead, which keeps ALSA frame k and ring frame k wrapping coherently.
+ * Smallest ALSA buffer offered. The buffer is a power-of-two divisor of the 4096-frame ring, which keeps
+ * ALSA frame k and ring frame k wrapping coherently.
  *
- * The floor is twice CLARETT_TX_GUARD_FRAMES, and the factor of two is the point rather than the value:
- * an app's steady-state lead cannot exceed the buffer, the fill refuses to write within GUARD frames of
- * the engine's read position, and the guard has to stay BELOW that lead or the fill's near edge reads
- * frames the app has not written yet — the skipping this guard was introduced to cure.
+ * The floor is twice CLARETT_TX_GUARD_FRAMES, so that even a minimal buffer leaves room for the guard
+ * (which the fill clamps to half the buffer).
  */
 #define CLARETT_MIN_BUFFER_FRAMES	(2 * CLARETT_TX_GUARD_FRAMES)	/* 128 frames */
 
 /*
  * The guard as a lever. Its job is ANTI-TEARING: keeping the fill clear of the engine's current read
- * position. What it is not is a latency term — the ALSA buffer and the reported delay are unchanged
- * across its whole range (measured identical at 64/128/256 on an 8Pre at a 512-frame buffer). It sets a
- * deadline instead: a frame has to be in the ALSA buffer roughly this many frames before the engine
- * reaches its ring slot, or the engine plays whatever was already there.
- *
- * The text here used to claim the opposite risk — that a guard EXCEEDING the app's steady-state lead
- * would make the fill's near edge hand the engine frames the app had not written — and advised turning
- * the guard DOWN if skipping appeared. Neither half is supported by measurement. On hardware (8Pre), via
- * a device-internal digital loopback carrying a sample-counter ramp checked frame by frame: a client
- * pinning its lead at 48 frames against a 64-frame guard was indistinguishable from one leading by 128,
- * with break counts tracking the client's OWN underrun count and not the lead at all. And with a normal
- * full-buffer client every guard from 16 to 96 came out equally clean, at a 32- and a 64-frame period
- * alike (single-digit breaks throughout). So there is no measured basis for lowering it, and none for
- * raising it either.
- *
- * UNRESOLVED, and the reason the floor stays at one fragment rather than being raised: the same sweep
- * driven by a SYNTHETIC client that pins a short lead showed guard 16 and 32 tearing catastrophically —
- * tens of thousands of whole-buffer skip/repeat pairs per 25 s — while 64 stayed in single digits, 3/3.
- * That did not reproduce with an ordinary client at either period, so it is unattributed, and plausibly
- * an artifact of that client rather than a property of the driver. Do not act on it without a retest,
- * and note that everything above was measured through a host with a large periodic firmware stall.
+ * position. It is not a latency term — the ALSA buffer and the reported delay do not change with it. It
+ * sets a deadline instead: a frame has to be in the ALSA buffer roughly this many frames before the
+ * engine reaches its ring slot, or the engine plays whatever was already there. With an ordinary
+ * full-buffer client, guards from 16 to 96 frames behave the same.
  *
  * Clamped per fill to half the ALSA buffer, so the guard is satisfied by any app that keeps its buffer
  * even half full, and floored at one fragment. If skipping appears at a small buffer, the honest fix is
@@ -472,41 +431,25 @@ static unsigned int tx_guard = CLARETT_TX_GUARD_FRAMES;
 module_param(tx_guard, uint, 0644);
 MODULE_PARM_DESC(tx_guard,
 		 "Frames the playback fill stays clear of the engine's TX read position (default 64, "
-		 "clamped to half the ALSA buffer, floored at one 16-frame fragment). Measured to have "
-		 "no effect on reported latency; see clarett_pcm.c before changing it.");
+		 "clamped to half the ALSA buffer, floored at one 16-frame fragment). Does not affect "
+		 "reported latency; see clarett_pcm.c before changing it.");
 
 /*
  * Largest ALSA buffer offered, in frames; 0 = the whole 4096-frame ring, the default.
  *
- * An optional hard cap, and no longer the latency control. What it used to be for is now done by the
- * period rule (CLARETT_MAX_PERIODS): alsa-lib's snd_pcm_hw_params_choose() resolves every parameter with
- * set_first (the minimum) EXCEPT BUFFER_SIZE, which it resolves with set_last, so an app that pins only
- * the period — most of them, including DAWs that display a period count they never actually request — is
- * handed the largest buffer allowed. With nothing but the ring as the limit, a DAW at a 16-frame period ran
- * 85 ms of playback latency. The rule ties that largest value to the app's own period instead.
+ * An optional hard cap. Latency is bounded by the period rule (CLARETT_MAX_PERIODS): alsa-lib's
+ * snd_pcm_hw_params_choose() resolves every parameter with set_first (the minimum) EXCEPT BUFFER_SIZE,
+ * which it resolves with set_last, so an app that pins only the period is handed the largest buffer
+ * allowed, and the rule ties that to the app's own period. Setting this caps every client below what the
+ * rule would allow; a value at the floor pins every client at 128 frames. PipeWire copes with any value
+ * down to the floor by shrinking its ALSA node's period.
  *
- * It used to default to CLARETT_MIN_BUFFER_FRAMES, which made the ceiling equal the floor and PINNED every
- * client at 128 frames whatever it asked for — and that broke a client moving audio in blocks larger than
- * the pin (see CLARETT_MAX_PERIODS). Setting it now caps every client below what the rule would allow; a
- * value at the floor reinstates the pin. Lowering it does not break PipeWire, measured on hardware twice
- * (2Pre and 8Pre): PipeWire negotiates exactly the advertised ceiling at every value down to the floor and
- * adapts by shrinking the ALSA node's period — its graph quantum never moves.
- *
- * The floor is measured, not assumed. Swept 128..4096 on a stall-free host against the widest device in
- * the range (60 capture channels at 48 kHz, client at SCHED_FIFO), every ceiling delivered its EXACT
- * expected period count with no client overrun, no late tick, no engine overrun and no bad read. The
- * governing quantity is the servicer's worst-case excess over the nominal period, which measured
- * ~205-233 us and — the part that matters — did NOT scale with the period, so it is scheduling overhead
- * rather than anything the buffer size influences. Against a 2.7 ms buffer that is a ~11x margin, so the
- * default is not marginal even at the widest geometry.
- *
- * To decide whether a given host needs a larger ceiling, do NOT read gapmax directly: it tracks the
- * NOMINAL period (period/rate) plus that ~220 us, so the same figure means health at a large period and
- * ruin at a small one. Divide by the nominal period first. The unambiguous signals are readmax (tens of
- * microseconds on a healthy host; tens of MILLISECONDS means a platform freeze caught mid-readl) and the
- * late/overrun/badread counters. A host showing a ~40 ms readmax needs a buffer above its stall — ask the
- * app for one; with this left at the ring every size up to 85 ms is available — and no smaller buffer will
- * help it, because the stall is not a buffering problem.
+ * The 128-frame floor has ample margin: the servicer's worst-case lateness is ~200-300 us regardless of
+ * period on a well-behaved host, against a 2.7 ms buffer. When judging whether a host needs a larger
+ * buffer, do NOT read gapmax directly — it tracks the nominal period plus that overhead, so divide by the
+ * nominal period first. The unambiguous signals are readmax (tens of microseconds on a healthy host; tens
+ * of MILLISECONDS means a platform stall caught mid-readl) and the late/overrun/badread counters. A host
+ * with a ~40 ms stall needs a buffer larger than the stall — ask the app for one.
  */
 static unsigned int max_buffer;
 module_param(max_buffer, uint, 0644);
@@ -538,8 +481,8 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
  *   playback — refill the TX ring AHEAD of the engine's read pointer from the playback ALSA buffer, so
  *              the audio the app queued is in place before the engine reads it.
  *
- * Both rings map frame k at (k mod ring_frames), and the ALSA buffers are pinned to the same frame count,
- * so ring offset == ALSA offset in each direction. The pcm_lock serialises these copies against hw_free,
+ * Both rings map frame k at (k mod ring_frames); each ALSA buffer is a power-of-two divisor of the ring
+ * and each direction has its own attach base, so the copies map positions through both. The pcm_lock serialises these copies against hw_free,
  * which clears the substream pointer and frees the ALSA buffer; period_elapsed is called after unlocking
  * (the substream object itself lives until close).
  */
@@ -572,8 +515,8 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 		/*
 		 * Clamped to the ALSA buffer rather than the ring, and skipped forward to the newest n frames.
 		 * The app has lost the rest either way (ALSA will xrun on the hw_ptr jump), but it must be
-		 * handed the most recent audio, not the oldest. Reachable in normal operation: the ~42 ms
-		 * platform freeze advances the engine ~2000 frames, far past a small buffer.
+		 * handed the most recent audio, not the oldest. Reachable in normal operation: a ~40 ms
+		 * platform stall advances the engine ~2000 frames, far past a small buffer.
 		 */
 		clarett_rx_drain(c, cs->runtime->dma_area, apos, pos, n, abuf);
 	}
@@ -629,7 +572,7 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 }
 
 /*
- * dyn_period duplex lock (option a): once either direction has pinned the session's period (clarett_pcm_hw_params
+ * dyn_period duplex lock: once either direction has pinned the session's period (clarett_pcm_hw_params
  * -> c->lock_period), constrain the other direction's period to the same frame count. DAWs drive the card as a
  * single duplex device with one buffer size, so this takes nothing real away; it guarantees the two directions
  * share the one RX marker cadence the engine is armed with. No lock pinned yet -> leave the period free.
@@ -656,11 +599,10 @@ static int clarett_rule_lock_period(struct snd_pcm_hw_params *params, struct snd
  * This is what bounds latency for an app that pins only the period: alsa-lib resolves BUFFER_SIZE with
  * set_last, so such an app is handed the largest buffer the constraints allow, and tying that largest value
  * to the period it chose keeps its latency proportional to its own request. A fixed ceiling cannot do that
- * without also shortchanging clients that ask for more. Pinned at 128 frames (the old max_buffer default),
- * it gave a JUCE client — which asks for four periods of its block size and then reads and writes whole
- * blocks — 4 x 32 = 128 frames for any block of 64 or more. From a 128-frame block up, its read-then-write
- * loop overran capture and underran playback every cycle, and because JUCE sets the stop threshold to the
- * boundary nothing stopped the stream: it was heard as garbled, repeating audio rather than as dropouts.
+ * without also shortchanging clients that ask for more: a JUCE client asks for four periods of its block
+ * size and then reads and writes whole blocks, so a buffer smaller than its block overruns capture and
+ * underruns playback every cycle — and because JUCE sets the stop threshold to the boundary, nothing stops
+ * the stream; it is heard as garbled, repeating audio rather than as dropouts.
  *
  * Four is what both JUCE and PipeWire request, so each gets exactly what it asks for.
  */
@@ -700,7 +642,7 @@ static int clarett_rule_period_by_buffer(struct snd_pcm_hw_params *params, struc
 /*
  * Advertised rate set. 44.1 and 48 kHz (single speed) are always offered; 88.2/96 (double) and 176.4/192
  * (quad) are added up to the effective cap — the max_rate module override if set, else the model's
- * hardware-confirmed clarett_model.max_rate. All six are SET_CLOCK enums the device lists.
+ * verified clarett_model.max_rate. All six are SET_CLOCK enums the device lists.
  */
 static unsigned int clarett_rate_caps(struct clarett *c, unsigned int *rmin, unsigned int *rmax)
 {
@@ -729,10 +671,9 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 	size_t buf = play ? clarett_tx_ring_bytes(c) : clarett_rx_ring_bytes(c);
 	u32 frame  = (u32)chans * 4;
 	/*
-	 * Minimum period. Fixed path: one 256-frame hardware IRQ period (CLARETT_IRQ_DESCS descriptors) — a fixed
-	 * tiny period forced PipeWire into a rigid 5 ms cadence it serviced badly (audible skipping), so a floor
-	 * plus a step lets it pick a comfortable larger period. dyn_period lowers the floor to the finest verified
-	 * cadence (CLARETT_DYN_MIN_FRAMES) and derives the marker cadence from whatever period the app picks
+	 * Minimum period. Fixed path: one 256-frame hardware IRQ period (CLARETT_IRQ_DESCS descriptors), with a
+	 * step so a client can pick a larger multiple. dyn_period lowers the floor to the finest cadence
+	 * (CLARETT_DYN_MIN_FRAMES) and derives the marker cadence from whatever period the app picks
 	 * (clarett_pcm_prepare). The BUFFER is pinned to the ring on the fixed path; under dyn_period it is any
 	 * power-of-two fraction of it, which is what keeps ALSA frame k and ring frame k wrapping together.
 	 */
@@ -788,13 +729,13 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 					  SNDRV_PCM_HW_PARAM_BUFFER_SIZE, -1);
 		if (err < 0)
 			return err;
-		/* Lock both directions to one period (option a). */
+		/* Lock both directions to one period. */
 		return snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
 					   clarett_rule_lock_period, c,
 					   SNDRV_PCM_HW_PARAM_PERIOD_SIZE, -1);
 	}
-	/* Legacy fixed cadence: buffer pinned to the ring, period a whole number of 256-frame hardware
-	 * periods. Left as it was — this path exists as the known-good fallback. */
+	/* Fixed cadence (dyn_period=0): buffer pinned to the ring, period a whole number of 256-frame
+	 * hardware periods. */
 	err = snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, buf, buf);
 	if (err < 0)
 		return err;
@@ -855,16 +796,12 @@ static int clarett_pcm_hw_free(struct snd_pcm_substream *ss)
 }
 
 /*
- * Stage-1 stream-config handshake. The VM re-issues SET_CLOCK + the
- * no-arg session lifecycle (0x6004 ×2 / 0x6005) in-session, immediately before every engine arm. The device
- * resets its stream config when idle, so nothing established earlier survives to PCM-arm time and this
- * handshake has to run at every arm. It is deliberately the re-run-safe SUBSET, not a full bring-up.
- * Process context, so the mailbox is safe.
- *
- * Stage 2: the per-channel CONFIG_PUSH burst (model->stream_tx_ids / stream_rx_ids) re-declares which physical
- * inputs feed which DMA stream channels — without it the engine arms cleanly but no samples are routed in and
- * 0x300 never ticks (periods=0). Wire order (from a 2Pre stream-start capture): SET_CLOCK, GET_6.2, GET_7.2, push tx
- * ids, GET_7.3, push rx ids, then the lifecycle commands. Non-fatal: log and proceed even if a command errors.
+ * Stream-config handshake, run immediately before every engine arm: the device resets its stream config
+ * when idle, so nothing established earlier survives to arm time. SET_CLOCK first, then the per-channel
+ * CONFIG_PUSH burst (model->stream_tx_ids / stream_rx_ids), which declares which physical inputs feed
+ * which DMA stream channels — without it the engine arms cleanly but no samples are routed and 0x300
+ * never ticks. Order: SET_CLOCK, GET_6.2, GET_7.2, push tx ids, GET_7.3, push rx ids, then the sync
+ * queries. Non-fatal: log and proceed even if a command errors. Process context, so the mailbox is safe.
  */
 static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 {
@@ -881,7 +818,7 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 
 	e_clk = clarett_fcp(c, FCP_SET_CLOCK, clk, sizeof(clk));
 
-	/* Per-channel routing push (skipped if the model has no captured ids). */
+	/* Per-channel routing push (skipped if the model has no ids). */
 	if (m->n_stream_tx_ids || m->n_stream_rx_ids) {
 		clarett_fcp(c, FCP_GET_62, NULL, 0);
 		clarett_fcp(c, FCP_GET_72, NULL, 0);
@@ -898,15 +835,8 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 		}
 	}
 
-	/*
-	 * The vendor's pre-arm RE-INIT batch (from a 4Pre boot-to-stream capture). Our engine
-	 * state at arm is byte-identical to the vendor's — its failing arms read 0x218=0xe
-	 * 0x21c=0xd->0xe 0x318=0x3 0x31c=0x3 and so do we — and it arms and stalls exactly as we do
-	 * four times over. What it does differently is issue this batch, then re-arm once, after
-	 * which the 0x300 counter advances. The commands look like a subset of probe-time bring-up
-	 * (subsystem enables + count queries), re-issued per stream start; semantics are not decoded,
-	 * so this is a verbatim replay. ids 1..8 and idx 0..5 are as observed on the 4Pre.
-	 */
+	/* Diagnostic re-init batch (stream_batch): subsystem enables 1..8, count queries, and
+	 * 0x004001 for indices 0..5. Semantics not decoded. */
 	if (stream_batch) {
 		static const u32 count_queries[] = { 0x001000, 0x002000, 0x003000, 0x004000 };
 		u8 arg[4];
@@ -925,17 +855,10 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 		}
 	}
 
-	/*
-	 * The pre-arm triple, in the vendor's order: 0x6004, 0x6002, 0x6005 — NOT 0x6004 twice.
-	 * Every occurrence of these opcodes in the 4Pre boot-to-stream capture is that triple (sometimes
-	 * doubled for full duplex, which is where the old "VM issues twice" note came from), and the
-	 * triple at 21:58:18.70 is what immediately precedes the one arm that streams: the vendor
-	 * arms and fails exactly as we do — 0x110=7, one period event, 0x110=0 + 0x100=0xf, retry —
-	 * four times over, then issues this batch, re-arms once, and the counter starts advancing.
-	 */
-	e_en1    = clarett_fcp(c, FCP_STREAM_ENABLE, NULL, 0);
+	/* The sync queries, in order 0x6004, 0x6002, 0x6005 (see FCP_SYNC_READ in clarett.h). */
+	e_en1    = clarett_fcp(c, FCP_SYNC_READ, NULL, 0);
 	e_en2    = clarett_fcp(c, FCP_GET_62, NULL, 0);
-	e_commit = clarett_fcp(c, FCP_STREAM_COMMIT, NULL, 0);
+	e_commit = clarett_fcp(c, FCP_SYNC_RATE, NULL, 0);
 
 	dev_dbg(&c->pci->dev,
 		 "stream-handshake: SET_CLOCK{%u,%u}=%d CONFIG_PUSH=%d(err=%d) batch=%s(err=%d) "
@@ -953,10 +876,9 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
  *
  * Either way the direction records its attach point in the shared clock. ALSA resets hw_ptr to 0 on every
  * prepare, so .pointer must report from there; without the base, a stream attaching to an already-running
- * engine (a second direction, or the SAME one recovering from an xrun) saw its first .pointer return the
- * engine's absolute position mod buffer_size. That reads as an enormous hw_ptr jump and the core xruns it
- * within a tick — which then re-prepares, and xruns again. Audio stayed dead until every substream closed
- * and the engine was torn down (a module reload, in practice).
+ * engine (a second direction, or the SAME one recovering from an xrun) would see its first .pointer return
+ * the engine's absolute position mod buffer_size — an enormous hw_ptr jump that the core xruns within a
+ * tick, re-prepares, and xruns again.
  */
 static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 {
@@ -969,20 +891,15 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 	arm = !c->stream_on;
 	if (arm) {
 		/*
-		 * CLAIM THE ARM UNDER THE LOCK. c->stream_on used to be published only at the END of
-		 * clarett_engine_arm(), several milliseconds later — clarett_stream_handshake() runs ~20
-		 * mailbox commands in between — so two prepares landing inside that window both decided they
-		 * were first. Both then armed the engine AND called clarett_engine_run(), whose unconditional
-		 * `c->stream_svc = kthread_run(...)` overwrote the first thread's pointer, orphaning a
-		 * SCHED_FIFO kthread that nothing could ever kthread_stop(). On rmmod that orphan keeps
-		 * executing module text while devres frees it: a panic, not a warning.
-		 *
-		 * Reproduced by starting `arecord &` and `aplay` together at dyn_period cadence 4: two
-		 * `engine armed` lines 240 us apart, two servicers, and only one `stopped` line at teardown.
-		 * PipeWire spaces its two prepares widely enough to have hidden this; a DAW opening duplex
-		 * would not. Publishing here is safe: engine_arm sets it again (idempotent), engine_stop's
-		 * `if (!c->stream_on) return` still holds, and the only other reader is the 0x400 notify gate,
-		 * which merely starts suppressing relays a few ms earlier.
+		 * CLAIM THE ARM UNDER THE LOCK. clarett_engine_arm() runs ~20 mailbox commands (the stream
+		 * handshake) before the engine is up, so if stream_on were published only at its end, two
+		 * prepares landing inside that window (a duplex client starting both directions at once) would
+		 * both decide they were first. Both would then arm the engine AND call clarett_engine_run(),
+		 * whose `c->stream_svc = kthread_run(...)` would overwrite the first thread's pointer, orphaning
+		 * a SCHED_FIFO kthread that nothing could kthread_stop() — and that on rmmod keeps executing
+		 * module text while devres frees it. Publishing here is safe: engine_arm sets it again
+		 * (idempotent), engine_stop's `if (!c->stream_on) return` still holds, and the only other reader
+		 * is the 0x400 notify gate, which merely starts suppressing relays a few ms earlier.
 		 */
 		c->stream_on = true;
 		c->pcm_frames = 0;	/* first direction in: the shared clock starts here */
@@ -1023,13 +940,12 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 		}
 	}
 
-	/* First direction in: arm the full-duplex engine. block 0 (TX) base, block 1 (RX) base — in
-	 * descriptor mode each points at its table; r1 offset is clarett_stream_r1_off() for the mode. */
+	/* First direction in: arm the full-duplex engine. block 0 (TX) base, block 1 (RX) base — each
+	 * points at its descriptor table. */
 	r0 = c->stream_dma;
 	r1 = c->stream_dma + clarett_stream_r1_off(c);
 
-	/* In-session stream-config handshake immediately before arming, matching the VM (handshake ->
-	 * program regs -> arm). Establishes the device's stream routing/mode for this session. */
+	/* Stream-config handshake immediately before arming (handshake -> program regs -> arm). */
 	clarett_stream_handshake(c, ss->runtime->rate);
 	clarett_engine_arm(c, r0, r1);
 
@@ -1100,10 +1016,9 @@ static const struct snd_pcm_ops clarett_pcm_ops = {
 
 /*
  * Build both static descriptor tables in the contiguous hardware buffer ([TX ring][RX ring], each =
- * [table][samples]). Each entry is a bare 8-byte LE fragment bus address, 0x100-aligned; the per-direction
- * fragment is clarett_frag_bytes(channels) (a whole-frame, 0x100-aligned span). The LAST entry carries the
- * wrap flag in its low bits (TX 0x01, RX 0x03) — matching the live 8PreX vendor table from the RAM dump —
- * and there is NO zero terminator. dma_alloc_coherent returns zeroed memory, so the TX samples are already
+ * [table][samples]). Each entry is a bare 8-byte LE fragment bus address, strided by the fragment slot
+ * (tx_slot / rx_slot). The LAST entry carries the wrap flag in its low bits (TX 0x01, RX 0x03), and there
+ * is NO zero terminator. dma_alloc_coherent returns zeroed memory, so the TX samples are already
  * silence and the RX sample area (the engine's write target) starts clean.
  *
  * No pre-fill is needed: the engine reads the TABLE (valid, non-null entries -> it clocks) and writes
@@ -1116,7 +1031,7 @@ static void clarett_build_rings(struct clarett *c)
 	size_t tx_ring = clarett_pcm_tx_ring(c);
 	u32 tx_frag = clarett_frag_bytes(c->model->playback_channels);
 	u32 tx_slot = c->tx_slot;		/* TX descriptor stride: audio bytes, or a padded slot */
-	u32 rx_slot = c->rx_slot;		/* RX descriptor stride: audio bytes, or a padded slot (experiment) */
+	u32 rx_slot = c->rx_slot;		/* RX descriptor stride: audio bytes, or a padded slot */
 	__le64 *tx_tbl = (__le64 *)c->stream_buf;
 	__le64 *rx_tbl = (__le64 *)((u8 *)c->stream_buf + tx_ring);
 	dma_addr_t tx_smp = c->stream_dma + tbl;
@@ -1127,9 +1042,8 @@ static void clarett_build_rings(struct clarett *c)
 		tx_tbl[i] = cpu_to_le64(tx_smp + (u64)i * tx_slot);	/* slotted: non-contiguous when padded */
 		rx_tbl[i] = cpu_to_le64(rx_smp + (u64)i * rx_slot);	/* slotted: fragments non-contiguous when padded */
 		/* Periodic RX IRQ marker: the engine raises a counted 0x300 period when it
-		 * consumes an IRQ-flagged descriptor. Every clarett_irq_descs(c)-th one (default 16, matching
-		 * the vendor's ~14-descriptor cadence; dyn_period tightens it to the chosen ALSA period).
-		 * TX carries no periodic marker (vendor TX flags only the last). */
+		 * consumes an IRQ-flagged descriptor. Every clarett_irq_descs(c)-th one (default 16;
+		 * dyn_period tightens it to the chosen ALSA period). TX flags only its last entry. */
 		if ((i + 1) % clarett_irq_descs(c) == 0)
 			rx_tbl[i] |= cpu_to_le64(CLARETT_DESC_IRQ);
 	}
@@ -1175,7 +1089,7 @@ int clarett_create_pcm(struct clarett *c)
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &c->pci->dev, prealloc, prealloc);
 
 	/* Debug: the probe summary in clarett_probe() already states that a PCM registered and how wide
-	 * it is; the ring/buffer detail here is bring-up instrumentation. */
+	 * it is; this adds the ring/buffer detail. */
 	dev_dbg(&c->pci->dev,
 		 "PCM registered (playback %uch / capture %uch, S32_LE @%u, bufs tx=%zu rx=%zu B @%pad)\n",
 		 c->model->playback_channels, c->model->capture_channels, CLARETT_PCM_RATE,

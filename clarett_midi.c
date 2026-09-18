@@ -3,15 +3,14 @@
  * Focusrite Clarett (Thunderbolt) — DIN MIDI (ALSA rawmidi).
  *
  * The MIDI transport is register PIO through a single memory-mapped MIDI UART at BAR0 REG_MIDI_DATA
- * (0x58c) — NOT the FCP mailbox, NOT the audio DMA ring. Reverse-engineered from three 2Pre
- * MMIO captures; the framing is:
+ * (0x58c) — NOT the FCP mailbox, NOT the audio DMA ring. The framing is:
  *
  *   TX  write (count << 24) | (b2 << 16) | (b1 << 8) | b0  to REG_MIDI_DATA, where count = the number of
  *       valid MIDI bytes 1..3 packed low->high in transmit order. `count` is a plain BYTE COUNT (the SysEx
  *       F7 terminator is a lone count=1 word), NOT a USB-MIDI CIN. Chunking is by raw 3-byte grouping of
  *       the outgoing byte stream, independent of message boundaries — so the TX path just hands the device
- *       whatever bytes ALSA has queued, three at a time. The vendor reads REG_MIDI_STATUS before each write
- *       (a TX-ready gate, or advisory — unconfirmed); we mirror that read.
+ *       whatever bytes ALSA has queued, three at a time. REG_MIDI_STATUS is read before each write, as a
+ *       possible TX-ready gate.
  *
  *   RX  read REG_MIDI_DATA one byte per read = (valid << 24) | byte, valid = bit24 (MIDI_RX_VALID); a read
  *       returns 0 when the RX FIFO is empty. RX is interrupt-driven (an idle device does zero MMIO): the
@@ -22,11 +21,10 @@
  * independent of the FCP control session, so MIDI works regardless of control-plane state. DIN MIDI is
  * line-wide across the Clarett Thunderbolt range (the 2Pre carries it too), so the rawmidi is not model-gated.
  *
- * Open follow-ups (harmless first-cut assumptions, flagged inline): which MSI vector carries the MIDI RX
- * interrupt (we drain from the ISR on ANY vector, so it does not matter for correctness); whether the
- * pre-TX REG_MIDI_STATUS read is a required ready-gate (a large SysEx dump could overrun the device FIFO —
- * midi_tx_pace_us throttles if so); and whether the RX interrupt needs an explicit enable at input-open
- * (assumed already enabled by the bring-up's REG_IRQ0_ENABLE write).
+ * Open questions, none affecting correctness: which MSI vector carries the MIDI RX interrupt (the ISR
+ * drains on ANY vector); whether the pre-TX REG_MIDI_STATUS read is a required ready-gate (a large SysEx
+ * dump could overrun the device FIFO — midi_tx_pace_us throttles if so); and whether the RX interrupt
+ * needs an explicit enable at input-open (assumed covered by the REG_IRQ0_ENABLE write at probe).
  */
 #include <linux/io.h>
 #include <linux/delay.h>
@@ -130,7 +128,7 @@ static void clarett_midi_tx_work(struct work_struct *w)
 		for (i = 0; i < n; i++)
 			word |= (u32)buf[i] << (i * 8);
 
-		clarett_rl(c, REG_MIDI_STATUS);	/* vendor reads status before each write (ready gate?) */
+		clarett_rl(c, REG_MIDI_STATUS);	/* status read before each write (possible ready gate) */
 		clarett_wl(c, REG_MIDI_DATA, word);
 
 		if (midi_tx_pace_us)

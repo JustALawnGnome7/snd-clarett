@@ -2,12 +2,12 @@
 /*
  * Focusrite Clarett (Thunderbolt) ALSA driver — PCI bring-up and data-plane engine.
  *
- * Supports the Clarett Thunderbolt line (2Pre / 4Pre / 8Pre / 8PreX), auto-detected
- * at probe. Provides the mixer control plane (through the FCP hwdep + fcp-server),
+ * Supports the Clarett Thunderbolt line (2Pre / 4Pre / 8Pre / 8PreX) and the Red 8Line,
+ * detected at probe. Provides the mixer control plane (through the FCP hwdep + fcp-server),
  * PCM capture and playback, and DIN MIDI.
  *
- * Reverse-engineering provenance: clean-room notes from MMIO traces and
- * Focusrite's own device XML; no vendor driver code was used.
+ * Clean-room: built from black-box observation of the device's host interface and
+ * Focusrite's device XML descriptors; no vendor driver code was used.
  */
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -32,15 +32,15 @@
 static bool stream_probe;
 module_param(stream_probe, bool, 0444);
 MODULE_PARM_DESC(stream_probe,
-		 "Data-plane experiment: after bring-up, program the ring registers with a driver "
-		 "buffer and watch for vec1/vec2 IRQs + DMA-pointer movement (off by default).");
+		 "Diagnostic: after probe, program the ring registers with a driver buffer and watch "
+		 "for vec1/vec2 IRQs + DMA-pointer movement (off by default; excludes enable_pcm).");
 
 static bool enable_pcm = true;
 module_param(enable_pcm, bool, 0444);
 MODULE_PARM_DESC(enable_pcm,
-		 "Register the PCM devices (playback + capture, S32_LE @48k, descriptor-ring engine driven "
-		 "by the 0x300 servicer). Default on — hardware-confirmed capture and full-duplex playback on "
-		 "the 2Pre. Set 0 for a mixer-only card, or when using stream_probe (mutually exclusive).");
+		 "Register the PCM devices (playback + capture, S32_LE, descriptor-ring engine driven "
+		 "by the 0x300 servicer). Default on. Set 0 for a control-only card, or when using "
+		 "stream_probe (mutually exclusive).");
 
 static int tx_trace;
 module_param(tx_trace, int, 0644);
@@ -48,30 +48,26 @@ MODULE_PARM_DESC(tx_trace,
 		 "Diagnostic (off by default): every Nth 0x300 period, log the engine's block-0 (TX) and "
 		 "block-1 (RX) DMA pointer regs (0x218/0x318) alongside the ctr step and our fill clock "
 		 "(pcm_frames). N = the value (e.g. tx_trace=32 logs one line per 32 periods; 1 = every "
-		 "period). Reveals whether the engine consumes TX faster than our fill (the 8PreX playback "
-		 "rate/tearing hypothesis). Writable at runtime via /sys/module/snd_clarett/parameters.");
+		 "period). Shows whether the engine consumes TX faster than the fill. Runtime-writable.");
 
 /*
  * Host bring-up ("arm") policy at probe: THE DRIVER NEVER ARMS.
  *
- * A device that has ever been armed self-arms from flash across a power cycle: reads, input metering, AND
- * control writes all work with no host bring-up (hardware-confirmed device-wide — 2Pre and 8Pre, no arm:
- * model auto-detected, meters live, Inst/Line relay switching). Every unit that has ever been through
- * Focusrite Control is in that state, so a host-side ~232-command replay is redundant on real hardware,
- * and its SET_MUX/SET_MIX steps would reset the user's routing to the vendor default. Probe waits for the
- * flash-persisted session to answer (clarett_detect_model) and detects the model from it, arming nothing.
+ * A device that has been set up once restores its session from flash at power-up: reads, input metering
+ * and control writes all work with no host bring-up. Every unit that has been through Focusrite Control
+ * is in that state, and a host-side bring-up would reset the user's routing and mixer to the factory
+ * default. Probe waits for the flash-persisted session to answer (clarett_detect_model) and detects the
+ * model from it, arming nothing.
  *
- * If the device never answers within wait_ready_ms, probe does NOT fall back to a placeholder — that
- * masked a not-ready / collapsed device as a working card. It fails loudly so the condition gets
- * attention; a used device usually just needs a moment, so reload to retry.
+ * If the device never answers within wait_ready_ms, probe does NOT fall back to a placeholder, which
+ * would pass a not-ready device off as a working card. It fails loudly; reload to retry.
  */
 
 /*
- * Total budget for the readiness retry, which backs off geometrically (see the loop in probe). It has to
- * cover a device still waking from a cold power-up: measured on an 8Pre, a first command issued ~1 s
- * after enumeration is not answered and 10 s is still too early, while tens of seconds of quiet lets it
- * through. This is only meaningful WITH the backoff — the same budget spent polling tightly recovers
- * nothing, at any size.
+ * Total budget for the readiness retry (see the loop in probe). It has to cover a device still waking
+ * from a cold power-up, which can take tens of seconds of quiet. It is only meaningful with the long
+ * quiet between attempts (CLARETT_READY_RETRY_MS) — the same budget spent polling tightly recovers
+ * nothing.
  *
  * Costs a warm attach nothing: the first attempt answers in ~90 us and the budget is never touched.
  * Probe is asynchronous, so the worst case does not stall the PCI hotplug worker.
@@ -82,31 +78,19 @@ MODULE_PARM_DESC(tx_trace,
 static unsigned int wait_ready_ms = 100000;
 module_param(wait_ready_ms, uint, 0644);
 MODULE_PARM_DESC(wait_ready_ms,
-		 "Total budget (ms) for the backing-off readiness retry at probe before giving up "
+		 "Total budget (ms) for the readiness retry at probe before giving up "
 		 "(default 100000). A warm device answers the first attempt and never spends it.");
 
 /*
  * Leave the device untouched for this long after attach, before the pre-mailbox init.
  *
- * WHAT IS OBSERVED, and it is less than a diagnosis: an in-probe first touch ~140 ms after enumeration
- * fails reliably, and a first touch at 1 s or later has not failed in any run. 3 s is margin over the
- * only failing point ever measured, not a tuned value — the mechanism is NOT established.
+ * A first touch ~140 ms after enumeration can fail, while one at 1 s or later has not. 3 s is margin over
+ * that, not a tuned value; the mechanism is not established.
  *
- * When it does fail, the command completes (DONE raised) but never DMAs a response; the trailing ack is
- * withheld — it must be, since acking an unlanded response is what caused the manifestation wall — and
- * the device is then left holding it unretired, answering it in place of every later command (stale
- * rseq, blanket err=3). Nothing recovers that, which is why this is a don't-touch window and not a
- * retry.
- *
- * RULED OUT, each on hardware, so none of these is worth trying again: recovering the wedge by retrying
- * (tight polling at 2/10/180 s budgets, 25 s spacing, replaying this init every 5 s, and the two
- * combined); resetting the mailbox via 0x510/0x500 + the DMA address (38 resets); raising the response
- * deadline to 3 s (the response is never sent, not late); device wake time from power-up (a 1 s delay
- * passes 4/4); and an unstable enumeration (3/3 runs flapped and passed).
- *
- * One asymmetry remains unexplained and is the place to start if this resurfaces: a manual sysfs bind
- * has never failed, 5/5 including at 1 s, while the automatic probe failed consistently without any
- * settle — same device, same timing window, different invocation path.
+ * When it does fail, the command completes (DONE raised) but never DMAs a response, so the trailing ack
+ * is withheld (acking an unlanded response makes the device refuse the session), and the device is left
+ * holding that command unretired, answering it in place of every later one (stale rseq, err=3). Nothing
+ * over the mailbox recovers that, which is why this is a don't-touch window rather than a retry.
  *
  * Every probe pays it, including a reload or sysfs rebind: unbinding disables the PCI device and
  * re-enabling brings it back in whatever state a fresh attach is in.
@@ -115,47 +99,40 @@ static unsigned int settle_ms = 3000;
 module_param(settle_ms, uint, 0644);
 MODULE_PARM_DESC(settle_ms,
 		 "Leave the device untouched for this long (ms) after attach before the first init "
-		 "(default 3000). Touching the device ~140 ms after enumeration wedges it unrecoverably; "
-		 "a first touch at 1 s or later has not failed. Margin over the observed failure, not a "
-		 "tuned value — the mechanism is not established. 0 disables the wait.");
+		 "(default 3000). Touching a freshly attached device too early can wedge its mailbox until "
+		 "it is power-cycled. 0 disables the wait.");
 
 /*
- * RX fragment slot stride (even-channel capture drift — FIXED). The capture drifted its channel
- * alignment by 8 bytes per 4 KB page — LCM(0x380 fragment, 4096 page) = 28672 B = 512 frames — because our
- * RX buffer was ONE contiguous coherent region, so the engine streamed across fragment boundaries and the
- * page drift accumulated. Giving each RX fragment its own page-safe SLOT (a power of two, so it divides the
- * page) over a page-aligned area makes every fragment page-contained, forcing per-fragment DMA like the
- * vendor's scatter-gather. HARDWARE-CONFIRMED on the 2Pre: slot 0x400 -> channels 2-13 silent, ch0 a clean
- * dropout-free tone, engine clocks normally. Default (-1) = auto = roundup_pow_of_two(fragment). 0 = the old
- * contiguous layout (drifts — kept for A/B). >0 = fragment audio bytes + this many (manual experiment).
+ * RX fragment slot stride. A fragment that straddles a 4 KB page is mis-framed by the device's DMA: with
+ * the fragments packed contiguously, the capture drifts its channel alignment by 8 bytes per page. Giving
+ * each RX fragment its own page-safe SLOT (a power of two, so it divides the page) over a page-aligned
+ * area keeps every fragment page-contained. Default (-1) = auto = roundup_pow_of_two(fragment). 0 = packed
+ * contiguously (drifts; diagnostic). >0 = fragment audio bytes + this many.
  */
 static int rx_frag_pad = -1;
 module_param(rx_frag_pad, int, 0444);
 MODULE_PARM_DESC(rx_frag_pad,
-		 "RX fragment slot: -1 = auto page-safe pow2 (default, fixes the even-channel drift), "
-		 "0 = contiguous (old, drifts), >0 = audio bytes + this padding (manual).");
+		 "RX fragment slot: -1 = auto page-safe pow2 (default), 0 = contiguous (drifts; "
+		 "diagnostic), >0 = audio bytes + this padding.");
 
 static int tx_frag_pad = -1;
 module_param(tx_frag_pad, int, 0444);
 MODULE_PARM_DESC(tx_frag_pad,
 		 "TX fragment slot (mirror of rx_frag_pad): -1 = auto page-safe pow2 (default), "
-		 "0 = contiguous (the old back-to-back TX ring that folded 28ch->4 on the 8PreX), "
-		 ">0 = audio bytes + this padding. The working RX path and the vendor TX ring are both "
-		 "non-contiguous; this makes our TX match.");
+		 "0 = contiguous (garbles playback on models whose fragment is not a power of two; "
+		 "diagnostic), >0 = audio bytes + this padding.");
 
 static int meter_poll_ms = CLARETT_METER_POLL_MS;
 module_param(meter_poll_ms, int, 0444);
 MODULE_PARM_DESC(meter_poll_ms,
-		 "Period (ms) of the GET_METER heartbeat the device requires to APPLY control writes to "
-		 "hardware. Focusrite Control polls ~every 40 ms continuously; without it our byte-correct "
-		 "writes complete (done=1) but the front-panel preamp/monitor state never moves. Default 40. "
-		 "Set 0 to disable (for A/B testing the hypothesis).");
+		 "Period (ms) of the GET_METER host heartbeat, as Focusrite Control issues while connected. "
+		 "Default 40; 0 disables it (diagnostic).");
 
 /*
- * Relay 0x400 notifications to userspace while a stream runs. Off by default, which suppresses
- * the relay for the duration of any stream (see the stream_on gate in clarett_irq); runtime-
- * writable so the gate can be A/B tested without a reload. The gate's case rests on audible skips
- * that were observed only on a host with a periodic firmware freeze, so it is unproven there.
+ * Relay 0x400 notifications to userspace while a stream runs. Off by default, which suppresses the
+ * relay for the duration of any stream (see the stream_on gate in clarett_irq) to save the mailbox
+ * traffic of fcp-server's re-reads; monitor_poll keeps the monitor controls live meanwhile.
+ * Runtime-writable.
  */
 static bool notify_while_streaming;
 module_param(notify_while_streaming, bool, 0644);
@@ -167,50 +144,35 @@ MODULE_PARM_DESC(notify_while_streaming,
 static int dma_bits = 32;
 module_param(dma_bits, int, 0444);
 MODULE_PARM_DESC(dma_bits,
-		 "DMA coherent mask width (bits). Default 32 lands the stream buffer at the top of 32-bit "
-		 "IOVA space (~0xffe00000); the VM's buffers sat mid-range (~1.5-1.9 GB). Lower this (e.g. "
-		 "31 -> <2GB, 30 -> <1GB) to force the allocation into the VM's range and test whether the "
-		 "engine's burst-then-stall is sensitive to buffer address. Long shot: PTR advances at "
-		 "0xffe00000 with no fault, so the high address is not obviously the blocker.");
+		 "DMA coherent mask width (bits). Default 32. Lower it (e.g. 31 -> <2 GB, 30 -> <1 GB) to "
+		 "force the stream buffer lower in the address space (diagnostic).");
 
 static bool monitor_enables = true;
 module_param(monitor_enables, bool, 0444);
 MODULE_PARM_DESC(monitor_enables,
 		 "At probe, write the monitor HW-enable bits (0x48/0x49, cmd3) so global Mute/Dim affect "
-		 "Monitor Out 1-2. Default true. FC's captured 2Pre control session does NOT send these, so "
-		 "they are additive writes we make beyond FC. Set 0 to make our command stream an exact "
-		 "SUBSET of FC's and A/B whether any extra write we make is "
-		 "wedging control manifestation. If toggles still don't manifest with both off, the on-wire "
-		 "surface is fully exhausted and the gap is conclusively off-wire DMA.");
+		 "Monitor Out 1-2. Default true; 0 leaves the device's own setting.");
 
 static bool seed_dump;
 module_param(seed_dump, bool, 0444);
 MODULE_PARM_DESC(seed_dump,
-		 "One-shot dump of the full seeded config shadow [0,256) at probe (16 lines). For locating "
-		 "the device's read-back offset of preamp Mode/Air: diff the dump between two known input "
-		 "states. Default 0.");
+		 "One-shot dump of the full seeded config shadow [0,256) at probe (16 lines); diff two "
+		 "dumps to locate a setting's offset. Default 0.");
 
 static bool premailbox_reads = true;
 module_param(premailbox_reads, bool, 0444);
 MODULE_PARM_DESC(premailbox_reads,
-		 "Replay the vendor's exact pre-mailbox BAR0 READ sequence at attach (caps/serial/fw-header/"
-		 "cause-blocks/0x514/0x58c) before the first FCP command. Motivated by the cold gdb "
-		 "ladder: the working device answers error=0 from mailbox command #0, so the accept-vs-refuse gate "
-		 "is set PRE-mailbox. Pre-mailbox WRITES already match FC byte-for-byte; "
-		 "this read set is the sole remaining host-visible pre-mailbox difference. Default true; set 0 for "
-		 "the old (walled) read-minimal probe to A/B whether the reads flip GET_DATA to error=0.");
+		 "Read the full pre-mailbox BAR0 register set at attach (caps/serial/fw-header/"
+		 "cause-blocks/0x514/0x58c) before the first FCP command. Default true; 0 reads only "
+		 "what the driver uses (diagnostic).");
 
 static bool error_probe;
 module_param(error_probe, bool, 0444);
 MODULE_PARM_DESC(error_probe,
-		 "Diagnostic: after bring-up, send a few deliberately MALFORMED FCP "
-		 "commands (bad offset, zero length, unknown opcode) alongside a valid GET_DATA and log each "
-		 "response's DMA error word (resp+8) + size. If the malformed commands return a DIFFERENT code "
-		 "than the valid one's error=3, the device parses per-command (error=3 = a specific semantic "
-		 "rejection); if ALL return error=3/size=0 identically, it is a blanket out-of-band session refusal. "
-		 "Off by default (sends junk commands). One-shot at probe. MUST be combined with meter_poll_ms=0: the "
-		 "meter-poll worker otherwise races the probe on the shared resp_buf and c->seq (its GET_METER "
-		 "responses land in the buffer and it bumps the seq), corrupting per-command attribution.");
+		 "Diagnostic: at probe, send a few deliberately MALFORMED FCP commands (bad offset, zero "
+		 "length, unknown opcode) alongside a valid GET_DATA and log each response's error word "
+		 "(resp+8) and size. Off by default (sends junk commands). Combine with meter_poll_ms=0, or "
+		 "the heartbeat's responses interleave with the probe's.");
 
 static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, clarett_8pre,
 				  red_8line;	/* defined below; chosen by clarett_detect_model() */
@@ -218,20 +180,18 @@ static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, cla
 /*
  * Model selection: THE DEVICE DECIDES, always. There is deliberately no override.
  *
- * The whole Clarett Thunderbolt line shares PCI id 1cb5:0002 and presents a byte-identical
- * PRE-MAILBOX surface (MMIO regs, config space, the fw-info header, even the dummy serial —
- * checked across 2Pre/4Pre/8PreX captures), and there is no userspace shortcut either: the line is
- * entirely Thunderbolt 2, firmware-tunneled rather than enumerated as kernel-managed TB routers, so
- * no DROM device_name appears in sysfs. But the device reports its own stream geometry:
- * GET_7.1{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per model — live-confirmed
- * (4,14) 2Pre and (8,20) 4Pre.
+ * The whole line shares PCI id 1cb5:0002 and presents a byte-identical PRE-MAILBOX surface (MMIO
+ * regs, config space, the fw-info header, even the dummy serial), and the Thunderbolt DROM's model
+ * name is not reliably visible either (whether a Thunderbolt 2 unit is enumerated as a kernel-managed
+ * Thunderbolt device depends on the host firmware). But the device reports its own stream geometry:
+ * GET_7.1{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per model.
  *
  * Everything downstream is sized from c->model: channel counts, DMA ring and descriptor geometry,
  * fragment strides, routing and mixer tables, meter layout, the fcp-server map slug. A wrong model
  * is therefore not a cosmetic mislabel, it is a card that streams the wrong width into wrongly
- * strided rings — which is why a mismatch now REFUSES TO REGISTER rather than fall back to a
- * plausible guess, and why the guess is not available as a module parameter either. If a genuinely
- * new model appears, the probe error prints the raw geometry pair to add to the table below.
+ * strided rings — which is why a mismatch REFUSES TO REGISTER rather than fall back to a plausible
+ * guess, and why no guess is available as a module parameter either. If a genuinely new model
+ * appears, the probe error prints the raw geometry pair to add to the table below.
  */
 
 /*
@@ -242,8 +202,8 @@ static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, cla
  *
  * A NULL return is fatal to probe either way — there is no fallback model — but *collapsed
  * distinguishes WHY, because the two need opposite things from the user: true = the GET path is
- * dead (transport error, or a status=3/size=0 refusal), the session-collapse signature (GETs
- * refused while SETs still err=0), which usually means "not ready yet, retry"; false = a VALID
+ * dead (transport error, or a status=3/size=0 refusal), which usually means "not ready yet,
+ * retry"; false = a VALID
  * reply whose geometry is not in the table, i.e. genuinely unknown hardware, which needs a new
  * clarett_model entry. The non-quiet warn on each path prints the raw pair for exactly that.
  */
@@ -263,11 +223,9 @@ static const struct clarett_model *clarett_detect_model(struct clarett *c, bool 
 	*collapsed = false;
 
 	/*
-	 * GET_7.1's reply arrives by DMA, invisible in every MMIO trace — so a model's identity
-	 * pair is only trustworthy once read back from that model's live hardware (2Pre/4Pre are;
-	 * 8Pre/8PreX are XML-inferred). Instrument every early return with the raw response so a
-	 * first attach of an unconfirmed model pins the cause (transport vs. status vs. unmatched)
-	 * in one line, and surfaces the actual pair to fold back into the table.
+	 * Every early return logs the raw response (when not quiet), so a first attach of a new
+	 * model pins the cause (transport vs. status vs. unmatched) in one line and surfaces the
+	 * actual pair to add to the table.
 	 */
 	err = clarett_fcp(c, FCP_GET_71, &band0, 1);
 	if (err) {
@@ -287,7 +245,7 @@ static const struct clarett_model *clarett_detect_model(struct clarett *c, bool 
 			dev_warn(&c->pci->dev,
 				 "model auto-detect: GET_7.1 bad response (status=%u size=%u raw playback=%u capture=%u)\n",
 				 status, size, pb, cap);
-		*collapsed = true;	/* GET refused (status=3/size=0) while SETs pass — collapse */
+		*collapsed = true;	/* GET refused (status=3/size=0) */
 		return NULL;
 	}
 
@@ -318,42 +276,30 @@ static void clarett_hw_init(struct clarett *c)
 	void __iomem *bar = c->bar0;
 
 	/*
-	 * The pre-mailbox writes below (0x510/0x500 device-enable, DMA-response address, 0x104 cause latch)
-	 * match FC's cold attach byte-for-byte. What did NOT match, until premailbox_reads, is the vendor's
-	 * READ set at attach: the cold gdb ladder proved the working
-	 * device already answers FCP error=0 from mailbox command #0, so the accept/refuse gate is decided
-	 * BEFORE the first command — and the only host-visible pre-mailbox difference is that the vendor
-	 * reads caps/0x4/0x8/0x514/0x58c, all four cause blocks, and the full fw-info header, which our
-	 * read-minimal probe never issued. This branch replays the vendor's EXACT pre-mailbox read+write
-	 * order (from the cold gdb ladder trace) in case a status/version/read-to-clear-cause read is part of an
-	 * attach handshake. readl() returns are discarded except serial/fw (kept for dev_info).
-	 *
-	 * INTER-ACCESS TIMING is matched to the vendor too. The cold-ladder trace shows the vendor spaces
-	 * these register GROUPS by ~0.8-8 ms of real driver-side pause, reproduced below with usleep_range
-	 * (hw_init runs in probe/process context, so sleeping is fine). The ~17-20 us *intra*-burst spacing
-	 * in the trace is x-no-mmap trap overhead — a VM measurement artifact (~100 ns on native hardware) —
-	 * so those accesses are left back-to-back. Gaps vary boot-to-boot with scheduling; these are the
-	 * measured cold-boot representatives. Tests whether the pre-mailbox gate is timing-sensitive (the read
-	 * set alone, issued back-to-back, did not flip it).
+	 * Pre-mailbox init: 0x510/0x500 device enable, the DMA-response address, and 0x104 (interrupt
+	 * causes). By default (premailbox_reads) this also reads the full attach register set — caps,
+	 * 0x4/0x8/0x514/0x58c, all cause blocks and the whole fw-info header — in the order, and with the
+	 * ~1-8 ms spacing between register groups, of a normal attach. readl() returns are discarded except
+	 * serial/fw (kept for the probe summary). Process context, so sleeping is fine.
 	 */
 	if (premailbox_reads) {
 		u32 r000, r004, r008, r514, r58c_a, r58c_b;
 
-		readl(bar + REG_INFO);			/* 0x8000 — vendor's first touch */
+		readl(bar + REG_INFO);			/* 0x8000 — first touch */
 		r004 = readl(bar + 0x004);
 		r008 = readl(bar + 0x008);
 		r000 = readl(bar + REG_CAPS);		/* 0x000 */
-		c->serial_hi = readl(bar + REG_SERIAL_HI);	/* 0x014 (vendor reads hi before lo) */
+		c->serial_hi = readl(bar + REG_SERIAL_HI);	/* 0x014 (hi before lo) */
 		c->serial_lo = readl(bar + REG_SERIAL_LO);	/* 0x010 */
-		usleep_range(7000, 7200);		/* vendor gap ~7.07 ms */
+		usleep_range(7000, 7200);		/* ~7 ms */
 		r514 = readl(bar + 0x514);
 		usleep_range(1300, 1400);		/* ~1.30 ms */
 		clarett_wl(c, 0x510, 0x8);
-		r58c_a = readl(bar + 0x58c);		/* ~21 us (native) — back-to-back */
+		r58c_a = readl(bar + 0x58c);		/* back-to-back with the write */
 		usleep_range(780, 850);			/* ~0.78 ms */
 		clarett_wl(c, 0x500, 0x8);
 		usleep_range(880, 950);			/* ~0.88 ms */
-		clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);	/* 0x104 — vendor writes this BEFORE the DMA addr */
+		clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);	/* 0x104 — BEFORE the DMA addr */
 		usleep_range(5640, 5800);		/* ~5.64 ms */
 		clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
 		usleep_range(1850, 1950);		/* ~1.85 ms */
@@ -361,12 +307,9 @@ static void clarett_hw_init(struct clarett *c)
 		usleep_range(3200, 3350);		/* ~3.22 ms */
 		{
 			/*
-			 * Read-to-clear cause blocks, in the vendor's order (0x100, 0x300, 0x200, 0x400).
-			 * These are the confirmed trigger of the Analogue-2 gain LED flash at probe — the
-			 * device's first-ever physical response — isolated to the read-to-clear itself, since
-			 * dropping just these reads stops the flash while the info/version reads do not. On a
-			 * cold boot they report (and clear) whatever the device latched at power-on, so the
-			 * logged value is the physical event being cleared.
+			 * Read-to-clear cause blocks (0x100, 0x300, 0x200, 0x400, 0x500). On a cold boot they
+			 * report and clear whatever the device latched at power-on; clearing them is also what
+			 * makes the Analogue 2 gain LED flash briefly at probe.
 			 */
 			u32 c100 = readl(bar + REG_IRQ0_CAUSE);
 			u32 c300 = readl(bar + STREAM_BLK1);
@@ -393,10 +336,9 @@ static void clarett_hw_init(struct clarett *c)
 		readl(bar + REG_INFO + 0x1c);
 	} else {
 		/*
-		 * Read-minimal baseline (the known-walled probe). 0x510/0x500 are the vendor's first two
-		 * writes at device open (global clock/converter-subsystem enable); the DMA-response address
-		 * goes to REG_DMA_ADDR_LO/HI (HI = bus-address high32 — hardcoding the trace's 0x2 faulted the
-		 * IOMMU); 0x104 latches interrupt causes (completion is still polled, clarett_mailbox.c).
+		 * Read-minimal variant (premailbox_reads=0, diagnostic). 0x510/0x500 are the device-open
+		 * writes (global clock/converter-subsystem enable); the DMA-response address goes to
+		 * REG_DMA_ADDR_LO/HI (HI = bus-address high 32 bits); 0x104 enables the interrupt causes.
 		 */
 		c->serial_lo = readl(bar + REG_SERIAL_LO);
 		c->serial_hi = readl(bar + REG_SERIAL_HI);
@@ -411,32 +353,12 @@ static void clarett_hw_init(struct clarett *c)
 	}
 
 	memset(c->shadow, 0, sizeof(c->shadow));
-
-	/*
-	 * TODO: the firmware init handshake observed at boot (INIT_2 plus the
-	 * 0x5000/0x6000/0x7000 command sequence) is not yet decoded. The mailbox
-	 * accepts config commands without replaying it in testing, but a robust
-	 * bring-up probably needs to understand/replay that sequence.
-	 */
 }
 
 /*
- * The collapsed-session state (observed on the 2Pre, after a run of PCM arm/stop churn): the
- * mailbox still answers and still echoes the opcode, but every response payload is zeros — CAP_READ says
- * no category is supported even for DATA, while a DATA-category GET_DATA is what just answered. A module
- * reload clears it, so it is host/session state, not the device losing its arm; power-cycling is not
- * needed. Trigger not yet isolated. A CAP_READ bench tool is the one-command check.
- */
-
-/*
- * Error-code discrimination probe. Send a valid GET_DATA plus three
- * deliberately malformed commands and log each response's DMA error word (resp+8) and size.
- * Our walled device returns error=3/size=0 to valid commands; if the malformed ones return the
- * SAME (error=3/size=0) the device blanket-refuses the session out-of-band (not parsing our
- * commands), whereas a DIFFERENT code (or a no-response timeout, echo=0) means it parses each
- * command and error=3 is a specific semantic rejection. Reads resp+8 directly because the BAR
- * MBOX_ERROR word (which clarett_fcp's return reflects) reads 0 for us — the real error is in
- * the DMAed response.
+ * Error-code probe (error_probe, diagnostic). Send a valid GET_DATA plus deliberately malformed and
+ * unsupported commands, and log each response's error word (resp+8) and size. Reads resp+8 directly
+ * because the BAR MBOX_ERROR word reads 0; the real error is in the DMAed response.
  */
 static void clarett_error_probe(struct clarett *c)
 {
@@ -446,38 +368,25 @@ static void clarett_error_probe(struct clarett *c)
 		u8 data[8];
 		u16 len;
 	} cmds[] = {
-		/* Discrimination set — resp+8 status byte across session states (8PreX;
-		 * legacy_mbox_cycle=1 reproducibly forces the premature-ack wall):
-		 *   WORKING session: per-command validation, distinct status per failure stage —
-		 *     valid → err=0; bad param (offset out of range / oversized length) → err=1;
-		 *     unsupported category (ESP_DFU 0x009, CAP_READ-disabled) → err=4; unknown opcode or
-		 *     bad sub-op in a SUPPORTED category → err=7. (Zero-length and off+len-past-end reads
-		 *     are accepted → err=0.) Vocabulary seen: {0,1,3,4,7}; 2/5/6 unobserved. The codes are
-		 *     an enum keyed to where validation fails, NOT an all-odd bitfield (err=4 is even).
-		 *   WALLED session (err=3): ALL commands — valid, bad-offset, unknown-opcode, exotic —
-		 *     return an identical canned refusal (err=3, size=0, seq=0 [request seq NOT echoed],
-		 *     opcode echoed, response landed). Per-command validation is fully suppressed; err=3
-		 *     is a session-level refusal that overrides it.
-		 *   (An earlier 2Pre run saw malformed commands DROPPED with no response rather
-		 *     than a landed err=3 — a 2Pre/8PreX or condition difference.) Kept as controls. */
+		/* Status codes (resp+8) on a working session, one per validation stage:
+		 *   valid → 0; bad parameter (offset out of range / oversized length) → 1;
+		 *   unsupported category (ESP_DFU 0x009) → 4; unknown opcode or sub-op in a
+		 *   supported category → 7. Zero-length and past-the-end reads are accepted (0).
+		 * A refused session answers everything identically: err=3, size=0, seq=0 (the
+		 * request seq is not echoed), opcode echoed. */
 		{ "GET_DATA{24,4} valid",     FCP_GET_DATA, { 24,0,0,0,  4,0,0,0 }, 8 },
 		{ "GET_DATA bad-offset",      FCP_GET_DATA, { 0,0,0xff,0xff, 4,0,0,0 }, 8 },
 		{ "unknown opcode 0x0000ff",  0x0000ff,     { 0 }, 0 },
-		/* Opcode survey: the vendor's cold ladder got err=0 + real data on ALL of these. Does the
-		 * device answer ANY of them for us (err=0), or is everything denied? READ_SEG is the segment
-		 * "open" the vendor issues at seq 0; the GET_7/GET_6 are device queries; CONFIG_PUSH{id} is the
-		 * per-id NAME query (vendor id 0x1e -> "ADAT 8"); GET_DATA{0xc8} hits the persistent appspace. */
+		/* Queries that answer with real data on a working session: READ_SEG (segment open),
+		 * GET_7/GET_6 device queries, CONFIG_PUSH{id} (a per-id name query: 0x1e -> "ADAT 8"),
+		 * and GET_DATA{0xc8} in the persistent appspace. */
 		{ "READ_SEG{0,8}",            FCP_READ_SEG, { 0,0,0,0,  8,0,0,0 }, 8 },
 		{ "GET_7.1{0}",               0x007001,     { 0 }, 1 },
 		{ "GET_6.2",                  0x006002,     { 0 }, 0 },
 		{ "CONFIG_PUSH{0x1e}",        0x005000,     { 0x1e, 0 }, 2 },
 		{ "GET_DATA{0xc8,8}",         FCP_GET_DATA, { 0xc8,0,0,0, 8,0,0,0 }, 8 },
-		/* Status-vocabulary probes: error conditions at DIFFERENT validation stages than
-		 * bad-offset/unknown-opcode, run on a WORKING session (a walled one flattens all to 3):
-		 * length errors, an unknown sub-op inside a SUPPORTED category, and a command in an
-		 * UNSUPPORTED category (CAP_READ reports 0x009 ESP_DFU disabled — the probe that surfaced
-		 * err=4, distinct from the err=7 an unknown opcode gets in a live category). Read-only /
-		 * no-op — no writes, no side effects. */
+		/* Further validation stages: length errors, an unknown sub-op inside a supported
+		 * category, and a command in an unsupported one. Read-only — no side effects. */
 		{ "GET_DATA zero-len",        FCP_GET_DATA, { 24,0,0,0,  0,0,0,0 }, 8 },
 		{ "GET_DATA oversized-len",   FCP_GET_DATA, { 0,0,0,0,  0,0,1,0 }, 8 },   /* len=0x10000 */
 		{ "GET_DATA overrun-end",     FCP_GET_DATA, { 0xf8,0,0,0, 0x40,0,0,0 }, 8 }, /* off ok, off+len past end */
@@ -501,9 +410,9 @@ static void clarett_error_probe(struct clarett *c)
 		 * The device DMAs its response ASYNCHRONOUSLY, a little after the BAR done bit clarett_fcp
 		 * polls — so reading resp_buf immediately races and catches the PREVIOUS command's late
 		 * response. Wait for THIS command's response by matching the echoed opcode (unique per command
-		 * after the memset). NOTE: on a refusal the device writes err=3 and does NOT echo the
-		 * request seq (it writes seq=0), so we match echo ONLY; a timeout is a genuine no-response.
-		 * Requires meter_poll_ms=0 (else the meter worker steals resp_buf / bumps seq).
+		 * after the memset). A refusal does not echo the request seq (it writes seq=0), so match the
+		 * echo ONLY; a timeout is a genuine no-response. Requires meter_poll_ms=0 (else the heartbeat
+		 * shares resp_buf and bumps seq).
 		 */
 		memset(c->resp_buf, 0, 32);
 		ret = clarett_fcp(c, cmds[i].opcode, cmds[i].data, cmds[i].len);
@@ -530,16 +439,11 @@ static void clarett_error_probe(struct clarett *c)
 }
 
 /*
- * Seed the whole config shadow from the device. clarett_hw_init() zeroes the shadow; without a
- * full seed every control outside the monitor region (Air @174+i, Mode @166+i, output gains)
- * REPORTS a default the hardware may not be in, and the first put() writes that fiction to the
- * device — post-crossing that physically overwrites the state the device restored from flash.
- * One GET of the full shadow window [0, CLARETT_CONFIG_SIZE) makes alsamixer (and an alsactl
- * store) reflect the device's actual state at load. It also covers the command-3 enable bytes
- * (72/73), whose packed bits need real values for a safe read-modify-write.
- * The first GET after programming the DMA address can come back empty (echo word 0), so retry
- * briefly. Guard on BOTH the echo word AND the response size: a walled device returns the
- * header with size=0 and no payload, and copying that would seed stale buffer bytes.
+ * Seed the whole config shadow from the device. clarett_hw_init() zeroes the shadow; the seed
+ * gives the command-3 enable bytes (72/73) their real values, which their packed bits need for a
+ * safe read-modify-write. The first GET after programming the DMA address can come back empty
+ * (echo word 0), so retry briefly. Guard on BOTH the echo word AND the response size: a refusing
+ * device returns the header with size=0 and no payload, and copying that would seed stale bytes.
  */
 static int clarett_seed_shadow(struct clarett *c)
 {
@@ -558,9 +462,9 @@ static int clarett_seed_shadow(struct clarett *c)
 		size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 		if (echo == (CMD_EXEC_FLAG | FCP_GET_DATA) && size >= CLARETT_CONFIG_SIZE) {
 			memcpy(c->shadow, r + FCP_RESP_DATA_OFF, CLARETT_CONFIG_SIZE);
-			/* Only 24/28/112 are confirmed to read back live (same three the notify refresh
-			 * trusts); mark just those known. The rest of the seed — preamp Mode/Air in
-			 * particular — is not device-reported, so it stays unknown and its first put writes. */
+			/* Only 24/28/112 are known to read back live; mark just those known. The rest of
+			 * the seed — preamp Mode/Air in particular — is not device-reported, so it stays
+			 * unknown and its first write goes through. */
 			set_bit(24,  c->shadow_known);
 			set_bit(28,  c->shadow_known);
 			set_bit(112, c->shadow_known);
@@ -589,7 +493,7 @@ static int clarett_enable_monitor_hw_controls(struct clarett *c)
 }
 
 /*
- * Carve the coherent buffer into two identical rings (block 0 = TX, block 1 = RX). Each ring is a
+ * stream_probe diagnostic layout: two identical rings (block 0 = TX, block 1 = RX). Each ring is a
  * zero-terminated descriptor table followed by its sample fragments; *ring is one ring's byte span,
  * so block 1 begins at offset *ring. Same math in start and report so they agree.
  */
@@ -610,10 +514,9 @@ static void clarett_stream_report(struct work_struct *work)
 	u32 c1_hits = 0, c2_hits = 0, c2_min = 0xffffffff, c2_max = 0;
 
 	/*
-	 * The real streaming signal is the block cause register, which the Windows driver POLLS (not
-	 * MSI): during playback 0x300 returns 0x80000000 | period-counter stepping by 0xc, while
-	 * 0x218/0x318 stay static (0x12/0x4 — the same values our engine reaches). Poll 0x200/0x300
-	 * here in a ~40 ms burst; bit31-set reads with an advancing low counter == periods firing.
+	 * The streaming signal is the block cause register: while streaming, 0x300 reads
+	 * 0x80000000 | an advancing period counter. Poll 0x200/0x300 here in a ~40 ms burst; bit31-set
+	 * reads with an advancing low counter == periods firing.
 	 */
 	for (i = 0; i < 2000; i++) {
 		u32 c1 = readl(c->bar0 + STREAM_BLK0);		/* 0x200 cause (read-to-clear) */
@@ -656,12 +559,9 @@ static void clarett_stream_report(struct work_struct *work)
 
 /*
  * Persistent servicing engine. The data-plane DMA engine is flow-controlled: it raises a period on the
- * 0x300 cause register and waits for the host to ACK by reading it (read-to-clear), exactly as the
- * Windows driver does — it polls the cause block the whole time audio plays. Without this the engine
- * does ~4 descriptors and stalls; with it, it clocks for the stream lifetime (verified: counter climbs
- * monotonically while serviced). This kthread IS the device's required runtime; the future PCM path
- * calls snd_pcm_period_elapsed from here. Poll at ~5-10 kHz (the proven rate; Windows uses ~400 Hz, so
- * there is wide margin to slow this down once the counter->frame mapping is pinned).
+ * 0x300 cause register and waits for the host to ACK by reading it (read-to-clear). Without that the
+ * engine does a few descriptors and stalls; serviced, it clocks for the stream's lifetime. This kthread
+ * polls the cause block for the whole stream and drives the PCM path (clarett_pcm_tick) from it.
  */
 /*
  * Log one servicer telemetry line at info if the window was BAD, else at debug. The healthy case is
@@ -693,7 +593,7 @@ static int clarett_stream_service(void *data)
 	bool seen = false;
 	bool gone = false;	/* set when the device leaves the bus: park the loop, never return early (kthread_stop UAF) */
 	/*
-	 * Tick-lateness telemetry (audible-skip diagnosis). The period counters cannot show
+	 * Tick-lateness telemetry. The period counters cannot show
 	 * this: they accumulate the HARDWARE ctr delta, so a late servicer catches up on the next tick and
 	 * the totals stay perfectly smooth while the audio glitches. What matters is the wall-clock gap
 	 * between period events — nominal is CLARETT_CTR_FRAMES*step/rate, which is NOT a constant: dyn_period
@@ -701,15 +601,15 @@ static int clarett_stream_service(void *data)
 	 * and the rate varies too. clarett_tick_late_us() derives the threshold from both — do not reintroduce
 	 * a fixed one. A gap far over nominal means the TX refill landed late and the engine read ring content the app had not been
 	 * copied into yet. step_max is the same signal without a clock: the counter delta per event is
-	 * normally ~0xd, so a doubled step IS a missed poll. Reset each log window.
+	 * normally one period's worth, so a doubled step IS a missed poll. Reset each log window.
 	 */
 	ktime_t last_ev = ktime_get();
 	u64 gap_max_us = 0;
 	u32 gap_late = 0, step_max = 0;
 	/*
-	 * readmax = longest a single MMIO read-block took (us). Distinguishes the ~48 ms blackout's mechanism:
-	 * if readmax ~= gapmax, the time is spent INSIDE a readl() (the TB link/tunnel stalling a read
-	 * completion); if readmax stays small while gapmax spikes, the thread was descheduled BETWEEN reads.
+	 * readmax = longest a single MMIO read-block took (us). Tells a stall's mechanism: if readmax ~=
+	 * gapmax, the time is spent INSIDE a readl() (the TB link stalling a read completion, or the whole
+	 * host frozen); if readmax stays small while gapmax spikes, the thread was descheduled BETWEEN reads.
 	 */
 	u64 read_us_max = 0;
 
@@ -722,8 +622,8 @@ static int clarett_stream_service(void *data)
 		}
 
 		/*
-		 * Gate ACKing on stream_run. The engine is armed (and prefilled ~4 descriptors) by
-		 * clarett_engine_arm, but stays paused until the PCM trigger flips stream_run — reading
+		 * Gate ACKing on stream_run. The engine is armed (and prefetches a few descriptors) by
+		 * clarett_engine_arm, but stays paused until stream_run is set — reading
 		 * 0x300 (read-to-clear) IS the period ACK that releases it, so withholding the read keeps
 		 * the engine quiescent between prepare and START. The probe path sets stream_run at start.
 		 */
@@ -733,19 +633,17 @@ static int clarett_stream_service(void *data)
 		}
 
 		/*
-		 * Cause-register ownership (the fix for control-during-streaming skips + mailbox timeouts).
-		 * The vendor's steady-state sweep reads all five blocks (0x100,0x300,0x200,0x400,0x500), and we
-		 * do too WHEN IDLE — 0x100 asserts bit31 per period (read-to-clear), leaving it unserviced walls
-		 * the session (manifestation-wall class). But 0x100 (mailbox DONE), 0x400 (mailbox COMMAND-PHASE),
-		 * and 0x500 (IRQ summary) belong to the MAILBOX while a command is in flight: the servicer runs at
-		 * ~6.6 kHz, so read-clearing 0x400 mid-command corrupts the device's command-phase handshake — the
-		 * command times out (fcp-server "Connection timed out") and the stall cascades into an audible
-		 * stream skip. So during a command the servicer reads ONLY the stream period blocks it owns
-		 * (0x300/0x200); the mailbox sweep reciprocally skips those two while streaming (clarett_mailbox.c).
-		 * The meter poll and every fcp-server command set cmd_inflight, so the guard covers all of them.
+		 * Cause-register ownership. When no command is in flight the servicer sweeps all five blocks
+		 * (0x100, 0x300, 0x200, 0x400, 0x500): 0x100 asserts bit31 per period (read-to-clear) and must
+		 * be serviced. But 0x100 (mailbox DONE), 0x400 (mailbox command phase) and 0x500 (IRQ summary)
+		 * belong to the MAILBOX while a command is in flight: the servicer runs at ~6.6 kHz, and
+		 * read-clearing 0x400 mid-command corrupts the command-phase handshake, so the command times
+		 * out. During a command the servicer therefore reads ONLY the stream period blocks it owns
+		 * (0x300/0x200); the mailbox sweep reciprocally skips those two while streaming
+		 * (clarett_mailbox.c). Every mailbox command sets cmd_inflight, so the guard covers them all.
 		 */
 		bool busy = atomic_read(&c->cmd_inflight);
-		ktime_t rt0 = ktime_get();		/* time the read block: is the blackout inside a readl()? */
+		ktime_t rt0 = ktime_get();		/* time the read block: is a stall inside a readl()? */
 
 		if (!busy)
 			readl(bar + REG_IRQ0_CAUSE);	/* 0x100 per-period cause (bit31) + mailbox DONE */
@@ -767,10 +665,9 @@ static int clarett_stream_service(void *data)
 		 * derived from it would wreck pcm_frames.
 		 *
 		 * Two cases. The device really left the bus (cable pulled, unit switched off) — stop. Or the
-		 * link is TRANSIENTLY unreachable while the device is still attached: measured on the 2Pre
-		 * — ~46 ms windows in which every MMIO read returns ~0, the servicer's "late
-		 * tick" and its 0x7fffffff counter being the same event. Drop the sample and let the next
-		 * good read's modular difference recover the whole advance.
+		 * link is TRANSIENTLY unreachable while the device is still attached (windows of tens of ms
+		 * in which every MMIO read returns ~0 have been seen on some hosts). Drop the sample and let
+		 * the next good read's modular difference recover the whole advance.
 		 */
 		if (c2 == 0xffffffff) {
 			if (pci_dev_is_disconnected(c->pci)) {
@@ -779,7 +676,7 @@ static int clarett_stream_service(void *data)
 				 * is the target of kthread_stop() in clarett_engine_stop(), and a kthread that
 				 * exits on its own BEFORE kthread_stop() runs makes kthread_stop() dereference
 				 * the already-reaped task — a use-after-free that oopses in kthread_stop() from
-				 * the pciehp remove thread (kthread_stop+0x44, near-NULL CR2). Park instead (the
+				 * the pciehp remove thread. Park instead (the
 				 * `gone` check at the loop top idles without touching the dead device) and let
 				 * kthread_stop() set kthread_should_stop() to end the loop and reap us cleanly.
 				 */
@@ -798,44 +695,23 @@ static int clarett_stream_service(void *data)
 			u32 ctr = c2 & CLARETT_CTR_MASK;
 			u32 step;
 
-			/* First events of a session: raw counter values (2Pre steps +0xd/event, wraps at a
-			 * small modulus — the frame advance is ctr-delta driven). Debug, not info: eight lines
-			 * per arm is noise on a working driver, and dynamic debug brings them back. */
+			/* First events of a session: raw counter values (the frame advance is ctr-delta
+			 * driven). Debug: eight lines per arm is noise on a working driver. */
 			if (atomic_read(&c->stream_periods) < 8)
 				dev_dbg(&c->pci->dev, "stream-ev[%d]: 0x300=0x%08x\n",
 					atomic_read(&c->stream_periods), c2);
 
 			/*
-			 * Frames captured since the last event = ctr delta * CLARETT_CTR_FRAMES. The counter is a
-			 * small free-running period counter that wraps at an unknown modulus; on a forward step use
-			 * the real delta (which also captures a coalesced double-period), and on a wrap or a glitched
-			 * jump reuse the last good step (the hardware period is stable, ~0xd). This self-calibrates
-			 * the sample rate without needing the modulus.
-			 */
-			/*
-			 * True advance = the MODULAR difference (CLARETT_CTR_MOD). A counter wrap and a late
-			 * poll are the same arithmetic, so this recovers the frames a delayed tick has to make
-			 * up instead of throwing them away.
+			 * Frames captured since the last event = ctr delta * CLARETT_CTR_FRAMES, where the delta
+			 * is the MODULAR difference (CLARETT_CTR_MOD). A counter wrap and a late poll are the same
+			 * arithmetic, so this recovers the frames a delayed tick has to make up instead of
+			 * throwing them away — losing them would put pcm_frames permanently behind the engine,
+			 * so the TX guard would no longer cover where the engine reads.
 			 *
-			 * The old test — forward difference, capped at 4 periods, else "reuse the last step" —
-			 * could not tell a wrap from a genuinely large delta and substituted ONE period for
-			 * both. Measured cost (2Pre): a 47 ms servicer stall clocked 7 periods in
-			 * hardware and advanced pcm_frames by 1, discarding 1536 frames. That error is permanent
-			 * and cumulative — it puts pcm_frames behind the engine's real read position, so the TX
-			 * guard window no longer covers where the engine is reading and we overwrite it, and
-			 * pointer() under-reports to ALSA. Audible as skipping that OUTLIVES whatever caused the
-			 * stall, which is what made it look correlated with unrelated userspace activity.
-			 */
-			/*
-			 * Reject only samples carrying bits we have never seen — which is still exactly the
-			 * all-ones reads of a dead/stalled link that this test was written for. The old test
-			 * was a range check on (c2 & 0x7fffffff), and that keeps CLARETT_CTR_OVERRUN: a valid
-			 * counter of 0x1a in an overrun sample read as 0x4000001a and was thrown away as corrupt.
-			 * See CLARETT_CTR_OVERRUN in clarett.h for the cadence sweep that identified the flag and
-			 * the proof that the counter in those samples is correct.
-			 *
-			 * Dropping is still safe whatever a future unknown bit turns out to mean: the next
-			 * accepted sample's modular difference recovers the advance across the gap.
+			 * Reject only samples carrying bits outside CLARETT_CTR_KNOWN — in practice the all-ones
+			 * reads of a dead link. CLARETT_CTR_OVERRUN samples carry a valid counter and are kept
+			 * (see clarett.h). Dropping is safe whatever an unknown bit means: the next accepted
+			 * sample's modular difference recovers the advance across the gap.
 			 */
 			if (c2 & ~CLARETT_CTR_KNOWN) {
 				bad_reads++;
@@ -890,11 +766,11 @@ static int clarett_stream_service(void *data)
 		}
 		if (time_after(jiffies, next_log)) {
 			/*
-			 * DEFAULT-QUIET. This line used to be unconditional dev_info, i.e. one kernel-log line
-			 * every 2 s forever on any machine running PipeWire. Print at info only when the window
-			 * saw something actually wrong — a late tick (how the ~42 ms platform freeze presents),
-			 * a device-side period overrun, or a rejected sample — and leave the healthy
-			 * case to dynamic debug. To get every window back without also enabling the ~24 Hz
+			 * DEFAULT-QUIET: a stream is open for as long as PipeWire holds the card, so an
+			 * unconditional line would log every 2 s indefinitely. Print at info only when the
+			 * window saw something actually wrong — a late tick (how a platform stall presents), a
+			 * device-side period overrun, or a rejected sample — and leave the healthy case to
+			 * dynamic debug. To get every window back without also enabling the ~24 Hz
 			 * mailbox trace, match this statement by its format:
 			 *   echo 'format "stream-svc:" +p' >/sys/kernel/debug/dynamic_debug/control
 			 */
@@ -936,7 +812,7 @@ static int clarett_stream_service(void *data)
 	/*
 	 * One summary per stream, same default-quiet rule as the window line: at info only if the run
 	 * had anything wrong with it, so a clean session leaves the log untouched from arm to teardown.
-	 * PTR tells whether the engine walked the descriptor table at all — the thing ctr=0 leaves open.
+	 * PTR tells whether the engine walked the descriptor table at all.
 	 */
 	clarett_svc_log(c, run_late || bad_reads || overruns,
 		 "stream-svc: stopped (periods=%d ctr=0x%x wraps=%u ptr0=0x%x ptr1=0x%x; "
@@ -950,30 +826,21 @@ static int clarett_stream_service(void *data)
 }
 
 /*
- * Arm the data-plane engine over caller-provided descriptor-table bases.
- * r0 = block-0 (TX/playback) table base, r1 = block-1 (RX/capture) table base; pass 0 to skip a block
- * Replays SET_CLOCK, the 12-register stream
- * arm (base-before-enable), and the DATA_CMD{5} commit. Sleeps (mailbox FCP) — call from prepare or
- * probe context, never from the atomic PCM trigger. Leaves the engine armed-and-committed but paused:
- * it prefills a few descriptors and waits for the servicer to ACK 0x300 (gated by stream_run).
+ * Program the data-plane engine over caller-provided descriptor-table bases.
+ * r0 = block-0 (TX/playback) table base, r1 = block-1 (RX/capture) table base; pass 0 to skip a block.
+ * Leaves the engine armed but paused: it prefetches a few descriptors and waits for the servicer to
+ * ACK 0x300 (gated by stream_run).
  */
 static void clarett_engine_program(struct clarett *c, dma_addr_t r0, dma_addr_t r1)
 {
 	void __iomem *bar = c->bar0;
 
 	/*
-	 * Faithful replica of the VM's register-only arm — the exact 14-write sequence that brings 0x300 alive
-	 * (from a 2Pre stream-start capture: 0x110=0 stop, then 0x100=0xf, 0x108, 0x20c=1, per-block geometry,
-	 * 0x10c, 0x110=7, and 0x300 immediately reads 0x8000000c, ticking +0xc/period). Two corrections vs the
-	 * old order: (1) ack the cause block (0x100=0xf) first — we previously only READ 0x100, never wrote it;
-	 * (2) the global enable (0x20c=1) comes BEFORE the geometry/base writes, as the VM does (DMA only starts
-	 * on the 0x110=7 arm, which stays last, so there is no null-base fault).
-	 *
-	 * NO per-arm FCP. The VM issues SET_CLOCK / CONFIG_PUSH / 0x6004 / 0x6005 only in the in-session
-	 * handshake (clarett_stream_handshake, run from PCM prepare BEFORE this), and issues NO DATA_CMD at all
-	 * during 2Pre stream start. The old SET_CLOCK + DATA_CMD{5} here were redundant/wrong (the device latches
-	 * the clock during the handshake's CONFIG_PUSH) and one SET_CLOCK was timing out (-110). A null base arg
-	 * skips that block (capture-only passes r0=0).
+	 * The register-only arm sequence: ack the cause block (0x100=0xf), 0x108, the global enable
+	 * (0x20c=1) BEFORE the geometry/base writes, per-block geometry and bases, 0x10c, then 0x110=7.
+	 * DMA only starts on the 0x110=7 arm, which stays last, so there is no null-base fault; 0x300 then
+	 * starts ticking. No FCP commands here: the mailbox side (SET_CLOCK, CONFIG_PUSH, sync queries) is
+	 * clarett_stream_handshake(), run from PCM prepare before this. A null base arg skips that block.
 	 */
 	writel(0xf, bar + REG_IRQ0_CAUSE);				/* 0x100 = 0xf: ack cause block */
 	writel(0x10, bar + REG_STREAM_IRQ_CFG);				/* 0x108 */
@@ -1010,15 +877,8 @@ void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1)
 	clarett_engine_program(c, r0, r1);
 
 	/*
-	 * Post-arm state. The vendor's 0x300 counter counts DESCRIPTORS consumed (12 per 4 ms period
-	 * event x 16 frames per fragment = 192 frames = 4.00 ms at 48k), and it reads 0xc even on the
-	 * arms that go on to stall — while ours reads 0, i.e. the engine signals a period without
-	 * consuming a single descriptor. So capture whether the bases latched and where the per-block
-	 * pointers start; PTR is the vendor's own progress read (0x21c/0x31c in its steady-state sweep).
-	 *
-	 * Debug, not info: this is a 12-register RE dump on a path a desktop takes every time an app
-	 * opens the card. Its other use — spotting the duplex double-arm by two of these microseconds
-	 * apart — is now covered by the WARN_ON_ONCE in clarett_engine_run().
+	 * Post-arm state: whether the bases latched and where the per-block pointers start. Debug, not
+	 * info: this path runs every time an app opens the card.
 	 */
 	dev_dbg(&c->pci->dev,
 		 "engine armed: blk0 chans=%u size=0x%x base=%08x:%08x ctrl=%08x ptr=%08x | blk1 chans=%u size=0x%x base=%08x:%08x ctrl=%08x ptr=%08x (model chans tx=%u rx=%u)\n",
@@ -1043,7 +903,7 @@ void clarett_engine_run(struct clarett *c)
 	/*
 	 * Never start a second servicer. The pointer is the ONLY handle kthread_stop() has, so overwriting
 	 * it orphans a SCHED_FIFO thread that polls the BAR forever and faults on module text after rmmod.
-	 * clarett_pcm_prepare() now claims the arm under pcm_lock so this cannot be reached, but a silent
+	 * clarett_pcm_prepare() claims the arm under pcm_lock so this cannot be reached, but a silent
 	 * thread leak is far too expensive to leave guarded by one caller's discipline.
 	 */
 	if (WARN_ON_ONCE(c->stream_svc))
@@ -1059,9 +919,9 @@ void clarett_engine_run(struct clarett *c)
 		return;
 	}
 	/*
-	 * Real-time priority for the servicer: it ACKs 0x300 and refills the TX ring on every ~4 ms period,
-	 * and if userspace preempts it (the mixer GUI's continuous meter polling + UI rendering was enough)
-	 * the TX fill falls behind and the engine replays stale audio — audible skips despite no XRUN. It
+	 * Real-time priority for the servicer: it ACKs 0x300 and refills the TX ring every period, and if
+	 * userspace preempts it the TX fill falls behind and the engine replays stale audio — audible skips
+	 * despite no XRUN. It
 	 * sleeps ~150 us between polls (work is microseconds), so it yields constantly and cannot starve the
 	 * system; SCHED_FIFO just guarantees it runs promptly when a period is due. Low RT priority so it
 	 * sits above normal tasks but below any other real-time thread.
@@ -1070,12 +930,10 @@ void clarett_engine_run(struct clarett *c)
 }
 
 /*
- * Data-plane engine-start probe (opt-in via stream_probe). Replays the captured
- * stream-start register sequence, but now with a valid descriptor table: 0x210/0x214 point
- * at a zeroed-terminated array of 8-byte bus addresses, each naming one STREAM_SIZE_VAL fragment of our
- * coherent buffer. Then watches whether the engine runs (vec1/vec2 IRQs, advancing pointer, the device
- * writing the capture buffer). NOT a PCM implementation. The point is to test whether starting the
- * engine makes the control plane physically manifest (e.g. the Mute LED).
+ * Data-plane engine-start diagnostic (opt-in via stream_probe). Arms the engine over a minimal descriptor
+ * table — 0x210/0x214 point at a zero-terminated array of 8-byte bus addresses, each naming one
+ * stream_frag fragment of a coherent buffer — and watches whether it runs (vec1/vec2 IRQs, advancing
+ * pointer, the device writing the capture buffer). NOT a PCM implementation.
  */
 int clarett_engine_start(struct clarett *c)
 {
@@ -1105,11 +963,9 @@ int clarett_engine_start(struct clarett *c)
 	}
 
 	/*
-	 * The live vendor descriptor table (RAM dump of the Windows TX ring) flags ONLY its last entry
-	 * with bit 0 set; every other entry is 0x100-aligned (low bit clear). That bit is the engine's
-	 * end-of-list / ring-wrap marker. Our driver previously relied on the zero terminator alone, and
-	 * the playback engine's per-descriptor status writeback bursts to base 0 without it. Fragment
-	 * addresses are even (FRAG=0x1c0, page-aligned base), so bit 0 is free to carry the flag.
+	 * Bit 0 on the LAST entry is the engine's end-of-list / ring-wrap marker; without it the
+	 * playback engine's per-descriptor status writeback bursts to base 0. Fragment addresses are
+	 * even, so bit 0 is free to carry the flag.
 	 */
 	tx_tbl[CLARETT_STREAM_NDESC - 1] |= cpu_to_le64(1);
 	rx_tbl[CLARETT_STREAM_NDESC - 1] |= cpu_to_le64(1);
@@ -1124,7 +980,7 @@ int clarett_engine_start(struct clarett *c)
 	r0 = c->stream_dma;		/* block-0 descriptor-table base */
 	r1 = c->stream_dma + ring;	/* block-1 descriptor-table base */
 
-	/* Arm+commit the engine (SET_CLOCK, 12-register sequence, DATA_CMD{5}). */
+	/* Arm the engine (register sequence only; no handshake on this diagnostic path). */
 	clarett_engine_arm(c, r0, r1);
 	WRITE_ONCE(c->stream_run, true);	/* probe streams immediately — no PCM trigger to gate it */
 	clarett_engine_run(c);
@@ -1157,21 +1013,15 @@ void clarett_engine_stop(struct clarett *c)
 	struct task_struct *svc;
 
 	/*
-	 * CLAIM THE TEARDOWN UNDER pcm_lock. Both directions can close simultaneously — `arecord` and
-	 * `aplay` reaching the end of a timed duplex run in the same instant does it every time — and
+	 * CLAIM THE TEARDOWN UNDER pcm_lock. Both directions can close simultaneously, and
 	 * clarett_pcm_detach() makes its "last one out" test AFTER dropping pcm_lock, so two callers can
-	 * both observe both substreams NULL and both arrive here. This function used to read stream_svc,
-	 * kthread_stop() it and NULL it with nothing serialising that, so both read the same task pointer
-	 * and both stopped it. The first wins; the SECOND calls kthread_stop() on a task that has already
-	 * exited and been reaped, and blocks forever on a completion nothing will signal again — leaving
-	 * the closing process unkillable in D state, every later open queued behind it, and the module
-	 * impossible to unload without a panic. (Diagnostic signature: the servicer's "stopped" line DOES
-	 * appear — the winner ran to completion — while a process sits in kthread_stop().)
+	 * both observe both substreams NULL and both arrive here. If both read the same stream_svc and
+	 * both called kthread_stop(), the second would stop a task that has already exited and been
+	 * reaped, blocking forever — an unkillable closing process, and a module that cannot be unloaded.
 	 *
 	 * Taking stream_on and the servicer handle together under the lock makes exactly one caller
 	 * proceed; the loser returns at the stream_on test. This is the teardown mirror of the arm claim
-	 * in clarett_pcm_prepare(): same bug shape, an "am I first/last?" decision evaluated outside the
-	 * lock that guards the state it reads.
+	 * in clarett_pcm_prepare().
 	 *
 	 * kthread_stop() MUST run outside pcm_lock: the servicer calls clarett_pcm_tick(), which takes
 	 * pcm_lock, so stopping it while holding the lock trades this hang for a deadlock.
@@ -1220,13 +1070,12 @@ static void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0)
 
 /*
  * MSI handler. One Linux IRQ per MSI vector, dispatched by vector index (dev_id).
- * The device signals control-plane events on vec0; we check the notification cause
- * (0x400) there. We must NOT read the mailbox cause (0x100) — that is read-to-clear
- * and racing clarett_fcp()'s poll would make mailbox commands time out (mailbox
- * completion stays polled). vec1/vec2 are the data-plane period-IRQ suspects — when the
- * engine-start probe is active we just count them (MSI is edge-triggered, so not clearing a
- * cause register can't storm); reading the block cause reg (0x200/0x300) is harmless observation.
- * Every vector returns IRQ_HANDLED so the core doesn't disable the MSI as spurious.
+ * The device signals control-plane events on vec0. While a mailbox command is in flight a vec0
+ * MSI is its completion, and the ISR reads the mailbox cause (0x100); otherwise it checks the
+ * notification cause (0x400). vec1/vec2 are the stream period vectors; the servicer polls the
+ * period blocks, so here they are only counted (for the stream_probe diagnostic). MSI is
+ * edge-triggered, so not clearing a cause register cannot storm. Every vector returns
+ * IRQ_HANDLED so the core doesn't disable the MSI as spurious.
  */
 static irqreturn_t clarett_irq(int irq, void *dev_id)
 {
@@ -1234,7 +1083,7 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 	struct clarett *c = ic->c;
 
 	/*
-	 * MIDI RX is register PIO (REG_MIDI_DATA); which MSI vector signals it is unconfirmed, so drain on
+	 * MIDI RX is register PIO (REG_MIDI_DATA); which MSI vector signals it is not known, so drain on
 	 * every vector — that is vector-agnostic AND stops an undrained RX FIFO from livelocking whichever
 	 * line it lands on. A no-op until the rawmidi device exists and whenever the FIFO is empty.
 	 */
@@ -1244,10 +1093,10 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 	if (ic->idx == CLARETT_VEC_EVENT) {
 		bool inflight = atomic_read(&c->cmd_inflight);
 
-		/* Vendor mailbox cycle: a vec0 MSI during a command IS the completion signal. Read
-		 * the mailbox cause here (the vendor sweep's first, MSI-paced 0x100 read) and hand
-		 * the rest of the sweep to the waiting clarett_fcp. An in-command MSI without DONE
-		 * (e.g. a notification) is left to the waiter's timeout/poll fallback. */
+		/* Default mailbox cycle: a vec0 MSI during a command IS the completion signal. Read
+		 * the mailbox cause here (the sweep's first, MSI-paced 0x100 read) and hand the rest
+		 * of the sweep to the waiting clarett_fcp. An in-command MSI without DONE (e.g. a
+		 * notification) is left to the waiter's timeout/poll fallback. */
 		if (inflight) {
 			u32 cause = readl(c->bar0 + REG_IRQ0_CAUSE);	/* read-to-clear */
 
@@ -1264,23 +1113,17 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 
 		/* vec0 also fires on mailbox-DONE, and 0x400 reads its idle level 0x3 (== NOTIFY_MON_PRIMARY)
 		 * at completion time (see the REG_NOTIFY_CAUSE note in clarett.h). Skipping the notify path
-		 * while our own command is in flight suppresses that self-reflection. NOTE (hardware-confirmed):
-		 * this is minor — the bulk of the "notification retried indefinitely" storm is the
-		 * DEVICE genuinely re-asserting 0x3 (us-scale bursts, inflight=0) because our GET is empty;
-		 * the guard can't stop that. Real front-panel events also arrive in the idle gaps.
-		 * ctl_ready gates snd_ctl_notify: with the handlers now hooked BEFORE the controls
-		 * exist (early IRQ for MSI-paced completion), a pre-controls event must not notify.
+		 * while our own command is in flight suppresses that self-reflection. ctl_ready gates the
+		 * relay: the handlers are hooked BEFORE the controls exist (for MSI-paced completion), and a
+		 * pre-controls event must not notify.
 		 *
 		 * stream_on gate: while the engine streams, vec0 ALSO fires on every audio period, and 0x400
 		 * reads its idle 0x3 each time — so this path would schedule a relay ~per period (coalesced to
 		 * one wake per notify_ms). The relay is a wildcard (the FCP notify word is not exposed), so
-		 * fcp-server answers each wake by re-reading every notifiable control, a GET_DATA apiece. That
-		 * mailbox load is real. The claim that it causes audible skips and command timeouts is NOT
-		 * established: it was observed only on a host whose firmware freezes the whole machine
-		 * periodically while a Thunderbolt device streams, which produces the same symptoms on its own.
-		 * The gate therefore stays on by default and notify_while_streaming turns it off for an A/B.
-		 * While it is on, front-panel changes reach userspace mid-stream only through monitor_poll,
-		 * which covers the monitor region and nothing else. */
+		 * fcp-server answers each wake by re-reading every notifiable control, a GET_DATA apiece. The
+		 * gate saves that mailbox load; notify_while_streaming turns it off. While it is on,
+		 * front-panel changes reach userspace mid-stream only through monitor_poll, which covers the
+		 * monitor region and nothing else. */
 		if (ev && READ_ONCE(c->ctl_ready) &&
 		    (!READ_ONCE(c->stream_on) || READ_ONCE(notify_while_streaming))) {
 			atomic_or(ev, &c->notify_bits);
@@ -1294,10 +1137,6 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/*
- * On a notification (front-panel button), mirror the vendor flow: re-read the
- * monitor config region, then tell userspace the monitor controls may have changed.
- */
 /*
  * Debounced flash-persist worker. clarett_write_u8 schedules this CLARETT_SAVE_DELAY_MS after a
  * control change (cancel+reschedule, so a burst coalesces into one save); it issues the single
@@ -1332,28 +1171,14 @@ static void clarett_notify_work(struct work_struct *work)
 }
 
 /*
- * GET_METER heartbeat. Focusrite Control polls GET_METER continuously while connected, and that poll
- * turns out to be the device's required host heartbeat: without it, control writes complete (done=1,
- * fcperr=0) but never reach hardware (front-panel state frozen). We replay FC's exact 8-byte payload
- * (pad=0, num_meters=0x30=48, magic=1) and re-arm ourselves every meter_poll_ms. The response is
- * discarded: fcp-server owns the meter control and issues its own GET_METER through the hwdep.
- * Self-requeuing delayed_work; cancelled at remove.
- */
-/*
- * Monitor-region change poll — the "knob is frozen while streaming" fix.
+ * Monitor-region change poll: keeps the front-panel knob live while streaming.
  *
  * The 0x400 notification relay is suppressed for the duration of a stream (the stream_on gate in
- * clarett_irq): vec0 also fires on every audio period, 0x400 reads its idle 0x3 each time, and the
- * relay is a wildcard, so fcp-server would answer each period by re-reading EVERY control — which
- * floods the mailbox and nicks the stream. The gate's premise was that front-panel moves during
- * playback are rare; with enable_pcm on by default that is false, because PipeWire adopts the card
- * and holds a PCM open more or less permanently, so the knob stops tracking essentially always.
- *
- * So do what the wildcard relay cannot: read the monitor region ourselves at the meter rate and
- * relay only when the bytes actually CHANGE. Cost is one GET_DATA per tick beside the GET_METER the
- * heartbeat already issues at that same rate during streaming; a steady state with nobody touching
- * the unit relays nothing at all. The region (24, len 92) covers the monitor mute/dim flags and the
- * master volume pair at 32/33 — the same bytes the notify refresh trusts to read back live.
+ * clarett_irq), and with PipeWire holding a PCM open more or less permanently, that is most of the
+ * time. So read the monitor region at the meter rate and relay only when the bytes actually CHANGE.
+ * Cost is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
+ * the unit relays nothing at all. The region (24, len 92) covers the monitor mute/dim flags, the
+ * master volume pair at 32/33, the HW-enable bits and the knob.
  *
  * The poll runs whether or not audio is streaming: the relay it feeds is only needed while streaming
  * (outside a stream the 0x400 relay is live and does that job), but clarett_hw_gain_follow() hangs
@@ -1364,16 +1189,15 @@ module_param(monitor_poll, bool, 0644);
 MODULE_PARM_DESC(monitor_poll,
 		 "Poll the monitor config region and act when it changes: relay a notification while "
 		 "streaming, so the front-panel knob keeps tracking (the 0x400 relay is gated off for the "
-		 "duration of a stream), and drive hw_gain_follow. Default on; 0 restores the old "
-		 "behaviour, where the knob is frozen for as long as any PCM is open.");
+		 "duration of a stream), and drive hw_gain_follow. Default on; with 0 the knob does not "
+		 "update in userspace for as long as any PCM is open.");
 
 /*
  * Keep the SW gain of every output under HARDWARE control equal to the front-panel knob.
  *
  * The device applies the knob in its own signal path and never writes it back: turning it moves byte
- * 112 only, while the per-output gains (out_gains[].offset) stay wherever software last left them
- * (hardware-confirmed on the 2Pre). Two visible consequences, both of which the USB
- * siblings avoid because the in-kernel scarlett2 driver synthesises the link: the GUI's per-output
+ * 112 only, while the per-output gains (out_gains[].offset) stay wherever software last left them.
+ * Two visible consequences, both of which the USB siblings avoid because the in-kernel scarlett2 driver synthesises the link: the GUI's per-output
  * fader does not follow the knob, and toggling an output HW -> SW makes its volume JUMP to whatever
  * stale software value was stored.
  *
@@ -1444,8 +1268,8 @@ static void clarett_hw_gain_follow(struct clarett *c, const u8 *cfg)
 
 /*
  * Meter-source follow (8PreX). fcp-server's "Meter Source" enum writes only the selector byte @184,
- * but the physical meter bridge is routed by the per-source channel-index tables @136/146/156 (XML
- * <hardware-meters>). Nothing derives those from 184 on its own — so without this the selector LED
+ * but the physical meter bridge is routed by the per-source channel-index tables @136/146/156. Nothing
+ * derives those from 184 on its own — so without this the selector LED
  * moves while the meters keep displaying whichever bank the tables were last set to. On a change we
  * write the selected source's three per-band tables and commit with activate 8, which commits them
  * together with the selector byte fcp-server already staged. No-op on models with no meter-source
@@ -1530,9 +1354,8 @@ static void clarett_meter_work(struct work_struct *work)
 			/*
 			 * The meter control exists (fcp-server set the map): make the heartbeat's poll ALSO
 			 * refresh the shared cache and stamp hwdep_meter_polled, so the GUI-facing .get serves
-			 * that cache instead of issuing its own GET_METER per read. This collapses the meter
-			 * traffic to ONE poll rate — the flood of per-read device commands was disrupting the
-			 * stream (skips) and timing out other mailbox commands during playback.
+			 * that cache instead of issuing its own GET_METER per read — one meter poll rate, not
+			 * one device command per GUI read.
 			 */
 			u8 req[8];		/* {pad:u16=0, num_meters:u16, magic:u32=1} */
 
@@ -1545,7 +1368,7 @@ static void clarett_meter_work(struct work_struct *work)
 				c->hwdep_meter_polled = jiffies ? jiffies : 1;
 			mutex_unlock(&c->hwdep_lock);
 		} else {
-			/* No meter control yet — the generic heartbeat (the "device needs it" hypothesis). */
+			/* No meter control yet — the plain heartbeat. */
 			static const u8 meter_req[8] = { 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00 };
 
 			clarett_fcp(c, FCP_GET_METER, meter_req, sizeof(meter_req));
@@ -1559,24 +1382,20 @@ static void clarett_meter_work(struct work_struct *work)
 	}
 }
 
-/* Allocate MSI vectors. The config-space side effect is the point of doing this early:
- * pci_alloc_irq_vectors() programs the device's MSI capability (address/data, MME) and
- * sets the enable bit (plus INTx-disable), so the device's own config space flips to the
- * vendor-observed 0x406+MSI-on state. The vendor enables MSI BEFORE its first BAR access
- * (cold trace: MSI enable @.068, first pre-mailbox BAR write @.082, doorbell after) — our
- * old order left MSI off for the whole arm + seed, a device-visible pre-command-#0
- * difference. Handlers hook later (clarett_setup_irq); the mailbox is
- * polled, so unhandled-but-enabled MSI in between is harmless (edge-triggered). */
+/* Allocate MSI vectors. Done early for the config-space side effect: pci_alloc_irq_vectors()
+ * programs the device's MSI capability (address/data, MME) and sets the enable bit (plus
+ * INTx-disable), so MSI is on BEFORE the first BAR access, as the device sees on a normal
+ * attach. Handlers hook later (clarett_setup_irq); unhandled-but-enabled MSI in between is
+ * harmless (edge-triggered, and the mailbox falls back to polling). */
 static void clarett_enable_msi(struct clarett *c)
 {
 	struct pci_dev *pci = c->pci;
 	int nvec;
 
-	/* Request up to CLARETT_NUM_VECTORS but accept as few as 1: under vfio passthrough the guest
-	 * often cannot grant all 4 (seen: -ENOSPC for min=max=4), and hard-failing left us with ZERO
-	 * interrupts — a real divergence from FC, which always has MSI up. With MSI collapsed to fewer
-	 * vectors the device funnels all causes to the lower vector(s); clarett_irq reads the cause regs
-	 * regardless, so notifications still work. */
+	/* Request up to CLARETT_NUM_VECTORS but accept as few as 1: some platforms cannot grant all 4,
+	 * and failing outright would leave no interrupts at all. With fewer vectors the device funnels
+	 * all causes to the lower vector(s); clarett_irq reads the cause regs regardless, so
+	 * notifications still work. */
 	nvec = pci_alloc_irq_vectors(pci, 1, CLARETT_NUM_VECTORS, PCI_IRQ_MSI);
 	if (nvec < 0) {
 		dev_warn(&pci->dev,
@@ -1584,9 +1403,8 @@ static void clarett_enable_msi(struct clarett *c)
 		return;
 	}
 	c->n_vec = nvec;
-	/* Record the achieved count: 4/4 matches FC (Enable+ Count=4/4); fewer means the platform
-	 * (typically vfio passthrough) collapsed them and causes funnel to the allocated vectors.
-	 * A short count is a degraded configuration worth a warn; the expected 4/4 is debug. */
+	/* Record the achieved count. A short count is a degraded configuration worth a warn; the
+	 * expected 4/4 is debug. */
 	if (nvec < CLARETT_NUM_VECTORS)
 		dev_warn(&pci->dev, "MSI: got %d/%d vectors (causes funnel to the allocated ones)\n",
 			 nvec, CLARETT_NUM_VECTORS);
@@ -1639,8 +1457,8 @@ static void clarett_teardown_irq(struct clarett *c)
  * card->private_free: runs inside snd_card_free AFTER userspace is disconnected and the
  * last file handle has closed — after the final possible mailbox transaction — but before
  * c (card private data) is freed, and with the MSI completion path still hooked, so those
- * last transactions ran the normal MSI-paced cycle rather than the 100 ms degraded wait
- * the old remove order imposed. Must tolerate a partially initialized card (probe error
+ * last transactions run the normal MSI-paced cycle rather than a 100 ms degraded wait.
+ * Must tolerate a partially initialized card (probe error
  * paths reach here through the same snd_card_free).
  */
 static void clarett_card_free(struct snd_card *card)
@@ -1666,8 +1484,8 @@ static void clarett_card_free(struct snd_card *card)
 	 * (a straggler that already started runs its GET on the poll fallback — harmless). */
 	cancel_work_sync(&c->notify_work);
 	/* Last, because notify_work is what re-arms it: the debounced hwdep relay wake. c is freed
-	 * the moment this returns to snd_card_free, and a live 200 ms timer into freed memory panics
-	 * the host — which is exactly what a surprise removal (device powered off) used to do. */
+	 * the moment this returns to snd_card_free, and a live timer into freed memory would panic
+	 * the host on a surprise removal (device powered off). */
 	clarett_hwdep_free(c);
 }
 
@@ -1747,15 +1565,14 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		err = -ENOMEM;
 		goto err_free;
 	}
-	/* The >4G lead: every working FC capture programs 0x414 != 0 (buffer above
-	 * 4 GiB); log our address so the A/B is visible from the kernel log alone. */
+	/* Log the response buffer's bus address (0x414 carries the high word). */
 	dev_dbg(&pci->dev, "resp buffer dma addr %pad (0x414 high word 0x%x, dma_bits=%d)\n",
 		&c->resp_dma, upper_32_bits(c->resp_dma), dma_bits);
 
-	/* Vendor attach order: MSI is enabled in config space before the first BAR access,
-	 * so the device never sees a session start from a host without an interrupt path.
-	 * Handlers hook immediately too: with the vendor mailbox cycle the completion is
-	 * MSI-paced from command #0 of the arm (the notify path stays gated on ctl_ready). */
+	/* MSI is enabled in config space before the first BAR access, so the device never sees
+	 * a session start from a host without an interrupt path. Handlers hook immediately too:
+	 * mailbox completion is MSI-paced from the first command (the notify path stays gated on
+	 * ctl_ready). */
 	clarett_enable_msi(c);
 	clarett_setup_irq(c);
 
@@ -1764,14 +1581,14 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	clarett_hw_init(c);
 
 	/*
-	 * Establish the session. The driver never arms: a device that has been armed once self-arms from
-	 * flash, so reads, input metering and control writes all work with no host bring-up. Wait for that
+	 * Establish the session. The driver never arms: a device that has been set up once restores its
+	 * session from flash, so reads, input metering and control writes all work with no host bring-up. Wait for that
 	 * flash-persisted session to answer, detect the model from it, and leave the device's own routing
 	 * alone.
 	 *
 	 * A cold Thunderbolt attach can race device readiness (command #0's response may not land), so poll
-	 * clarett_detect_model quietly — a warn per attempt would be noise — until it answers or the settle
-	 * budget expires.
+	 * clarett_detect_model quietly — a warn per attempt would be noise — until it answers or the
+	 * wait_ready_ms budget expires.
 	 */
 	{
 		bool collapsed = false;
@@ -1780,20 +1597,11 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		int tries = 0;
 
 		/*
-		 * Readiness retry, with the emphasis on QUIET rather than on frequency.
-		 *
-		 * Recovering a device caught mid-wake needs TWO things together, and each alone is measured
-		 * useless: a long stretch of being left completely alone, AND a fresh pre-mailbox init
-		 * after it. Re-asking over the mailbox without replaying the init fails at 50 ms, 25 s and
-		 * 180 s spacing; replaying the init every 5 s fails across 13 attempts. Both successes had
-		 * a long quiet followed by a fresh init (20 s and 30 s). So each retry waits out the full
-		 * interval untouched, then re-inits and asks once.
-		 *
-		 * The first command also wedges the mailbox when it fails — it completes but never DMAs a
-		 * response, so the trailing ack is withheld (it must be; acking an unlanded response is
-		 * what caused the manifestation wall) and the device answers that command in place of
-		 * every later one. Re-running init clears that too, which is why a reload has always
-		 * worked where waiting never did.
+		 * Readiness retry, with the emphasis on QUIET rather than on frequency: recovering a device
+		 * caught mid-wake needs a long stretch left completely alone AND a fresh pre-mailbox init
+		 * after it (see CLARETT_READY_RETRY_MS). So each retry waits out the full interval
+		 * untouched, then re-inits and asks once. Re-running the init also clears a mailbox wedged
+		 * by a failed first command, which is why a reload recovers where waiting does not.
 		 *
 		 * A warm device answers the first attempt in ~90 us and never re-inits.
 		 */
@@ -1819,8 +1627,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 
 		if (collapsed) {
 			/*
-			 * Never became ready. Do NOT register a placeholder — that masked a not-ready or
-			 * collapsed device as a working card. Fail the probe loudly so it gets attention.
+			 * Never became ready. Do NOT register a placeholder, which would pass a not-ready
+			 * device off as a working card. Fail the probe loudly so it gets attention.
 			 */
 			dev_err(&pci->dev,
 				"device did not become ready within %u ms over %d attempts (mailbox %s) — refusing "
@@ -1850,8 +1658,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		/* Nothing arms the device, so its flash-persisted routing stands untouched. */
 	}
 
-	/* RX fragment slot stride: default = page-safe pow2 (fixes the even-channel drift);
-	 * 0 = contiguous (old); >0 = audio + manual padding. */
+	/* RX fragment slot stride: default = page-safe pow2; 0 = contiguous; >0 = audio + padding. */
 	{
 		u32 frag = clarett_frag_bytes(c->model->capture_channels);
 
@@ -1859,8 +1666,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 			   : rx_frag_pad == 0 ? frag
 					      : frag + rx_frag_pad;
 	}
-	/* TX fragment slot stride, mirror of rx_slot: the working RX and the vendor TX are both
-	 * non-contiguous; our contiguous TX ring folded 28ch->4 on the 8PreX. Default page-safe pow2. */
+	/* TX fragment slot stride, mirror of rx_slot (a contiguous TX ring garbles playback on
+	 * models whose fragment is not a power of two). Default page-safe pow2. */
 	{
 		u32 frag = clarett_frag_bytes(c->model->playback_channels);
 
@@ -1869,15 +1676,14 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 					      : frag + tx_frag_pad;
 	}
 
-	/* Start the GET_METER heartbeat. FC polls continuously from connect onward; the device
-	 * needs it to apply control writes to hardware. Run it for the rest of probe too, so the
-	 * monitor-enable writes below take effect like a real session. */
+	/* Start the GET_METER heartbeat now, so it is running for the rest of probe too, as in a
+	 * normal session, when the monitor-enable writes below go out. */
 	if (meter_poll_ms > 0)
 		schedule_delayed_work(&c->meter_work,
 				      msecs_to_jiffies(meter_poll_ms > 0 ? meter_poll_ms : CLARETT_METER_POLL_MS));
 
-	/* Seed the shadow from the device so mixer "get" reflects real state at load and the
-	 * enable-byte RMW below is safe. Best-effort: if it fails we skip the enable writes. */
+	/* Seed the shadow from the device so the enable-byte RMW below is safe. Best-effort: if it
+	 * fails we skip the enable writes. */
 	seeded = clarett_seed_shadow(c);
 	if (seeded)
 		dev_warn(&pci->dev,
@@ -1885,9 +1691,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 			 seeded);
 	else if (seed_dump) {
 		/* One-shot full [0,256) seeded-shadow dump (gated on seed_dump so normal loads stay
-		 * quiet). scarlett2 reads Air/Level via GET_DATA at SMALL offsets (0x09..0x8c), not the
-		 * XML write-offset 174 — so the readable preamp state, if any, is somewhere in this window
-		 * we never inspected. Dump the lot to locate it (diff two known input states). */
+		 * quiet); diff two dumps to locate a setting. */
 		int off;
 
 		for (off = 0; off < CLARETT_CONFIG_SIZE; off += 16)
@@ -1895,8 +1699,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 				 off, 16, c->shadow + off);
 	}
 
-	/* Diagnostic: characterize the FCP error=3 refusal (blanket session block vs per-command).
-	 * Requires meter_poll_ms=0 so the meter worker doesn't race the shared resp_buf/seq (see param desc). */
+	/* Diagnostic: log the FCP status codes for valid and malformed commands. Requires
+	 * meter_poll_ms=0 so the heartbeat doesn't share resp_buf/seq (see param desc). */
 	if (error_probe) {
 		if (meter_poll_ms > 0)
 			dev_warn(&pci->dev,
@@ -1945,13 +1749,12 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 
 	WRITE_ONCE(c->ctl_ready, true);	/* controls exist; the ISR notify path may fire */
 
-	/* Experimental capture PCM (data-plane bring-up). Owns the engine, so it excludes stream_probe. Both
-	 * models use the per-direction descriptor path (geometry derived from channel counts), so no per-model
-	 * gate is needed beyond enable_pcm. */
+	/* PCM. Owns the engine, so it excludes stream_probe. Every model uses the per-direction
+	 * descriptor path (geometry derived from channel counts), so no per-model gate is needed. */
 	if (enable_pcm) {
 		err = clarett_create_pcm(c);
 		if (err)
-			dev_warn(&pci->dev, "PCM create failed (%d); continuing mixer-only\n", err);
+			dev_warn(&pci->dev, "PCM create failed (%d); continuing without PCM\n", err);
 		else
 			pcm_ok = true;	/* c->pcm is set before the buffer alloc that can still fail */
 		err = 0;
@@ -1964,8 +1767,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		dev_warn(&pci->dev, "MIDI create failed (%d); continuing without MIDI\n", err);
 	err = 0;
 
-	/* Opt-in data-plane experiment: start the audio engine and watch what happens. Best-effort;
-	 * needs the IRQ handlers (above) hooked first so vec1/vec2 period IRQs are counted. */
+	/* Opt-in data-plane diagnostic: start the engine and report what it does. Best-effort; needs
+	 * the IRQ handlers (above) hooked first so vec1/vec2 period IRQs are counted. */
 	if (stream_probe && c->model->stream_frag && !enable_pcm && c->irq_ready) {
 		err = clarett_engine_start(c);
 		if (err)
@@ -1999,11 +1802,9 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 
 	pci_set_drvdata(pci, card);
 	/*
-	 * The probe summary — and, on a healthy load, the ONLY thing this driver prints. Everything
-	 * else that used to land here (pre-mailbox register dumps, the DMA response address, the MSI
-	 * count, per-subsystem "registered" lines, the arm/engine register dumps, the 2 s servicer
-	 * telemetry) is RE instrumentation and now sits at dev_dbg. Bring any of it back at runtime
-	 * with dynamic debug, e.g. `echo 'module snd_clarett +p' >/sys/kernel/debug/dynamic_debug/control`
+	 * The probe summary — and, on a healthy load, the ONLY thing this driver prints. The detail
+	 * (register dumps, the DMA response address, the MSI count, per-subsystem lines, the
+	 * servicer telemetry) sits at dev_dbg. Bring any of it back at runtime with dynamic debug, e.g. `echo 'module snd_clarett +p' >/sys/kernel/debug/dynamic_debug/control`
 	 * for all of it, or match one statement by format string to skip the ~24 Hz mailbox trace.
 	 */
 	{
@@ -2046,9 +1847,8 @@ static void clarett_remove(struct pci_dev *pci)
 	 * Stop the stream servicer FIRST, before any of the card teardown.
 	 *
 	 * snd_card_free() frees the PCM devices — and with them each substream's runtime and
-	 * runtime->dma_area — before it calls card->private_free (clarett_card_free), which is where
-	 * the servicer used to be stopped. A servicer still ticking across that window dereferences a
-	 * freed capture buffer in clarett_pcm_tick(). Unloading the module normally hides this because
+	 * runtime->dma_area — before it calls card->private_free (clarett_card_free). A servicer still
+	 * ticking across that window would dereference a freed capture buffer in clarett_pcm_tick(). Unloading the module normally hides this because
 	 * userspace has already closed the PCM, but a SURPRISE REMOVAL — the unit powered off mid-
 	 * stream — leaves the engine armed and the servicer running straight into the free.
 	 *
@@ -2108,8 +1908,8 @@ static const struct clarett_out_gain clarett_8prex_gains[] = {
 static const char * const clarett_mode_mli[] = { "Mic", "Line", "Inst" };
 static const char * const clarett_mode_ml[]  = { "Mic", "Line" };
 
-/* Hardware-meter sources for the 8PreX (XML <hardware-meters>; source values [TRACE], activate 8).
- * Selecting one writes its three per-band channel-index tables (@136/146/156) then SET_DATA{184}. */
+/* Hardware-meter sources for the 8PreX (activate 8). Selecting one writes its three per-band
+ * channel-index tables (@136/146/156) then SET_DATA{184}. */
 static const struct clarett_meter_source clarett_8prex_meter_sources[] = {
 	{ "Analogue", 1, {
 		{  0,  1,  2,  3,  4,  5,  6,  7, 26, 27 },
@@ -2138,19 +1938,18 @@ static const struct clarett_preamp clarett_8prex_preamps[] = {
 };
 
 /*
- * Per-channel stream-routing CONFIG_PUSH ids, DERIVED (not captured) from the global source-id
- * enumeration proven byte-for-byte on the 2Pre AND 4Pre captures: the id space
- * is model-independent with per-category reserved blocks —
+ * Per-channel stream-routing CONFIG_PUSH ids. The id space is model-independent, with per-category
+ * reserved blocks —
  *   Analogue N -> 0x0d + (N-1)   (block reserves 8: 0x0d..0x14)
  *   S/PDIF   N -> 0x15 + (N-1)   (0x15..0x16)
  *   ADAT     N -> 0x17 + (N-1)   (block reserves 16: 0x17..0x26 — why loopback is 0x27 even on the
  *                                 8-ADAT 2Pre/4Pre, which use only 0x17..0x1e)
  *   Loopback N -> 0x27 + (N-1)
  *   Playback N -> 0x2b + (N-1)   (TX)
- * The 8PreX just fills more of each block. Order follows the XML: TX = Playback 1..28; RX = the
- * record-outputs order (Analogue 1-8, S/PDIF 1-2, Loopback 1-2, then ADAT 1-16). Without these the
- * stream-config handshake pushes nothing, the device streams at a narrower default width, and a 28ch
- * playback ring is consumed as ~12ch — the stereo pair smears onto outputs 1-2/5-6/9-10 (28 mod 12 = 4).
+ * The 8PreX just fills more of each block. Order: TX = Playback 1..28; RX = the record-outputs order
+ * (Analogue 1-8, S/PDIF 1-2, Loopback 1-2, then ADAT 1-16). Without these the stream-config handshake
+ * pushes nothing, the device streams at a narrower default width, and a 28ch playback ring is consumed
+ * as ~12ch — the stereo pair smears across outputs.
  */
 static const u8 clarett_8prex_stream_tx[] = {
 	0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
@@ -2166,10 +1965,9 @@ static const u8 clarett_8prex_stream_rx[] = {
 
 /*
  * Selectable clock sources for the "Clock Source" control, Internal first. Values are the SET_CLOCK
- * enums (clarett.h): Internal 24, S/PDIF 3, ADAT 0 — hardware-verified on the 2Pre and 8Pre, and shared
- * by the whole line. The 8PreX's second ADAT port and wordclock input are [XML]-derived and could not be
- * verified (Sync Status is unreliable on that model), but they are real connectors, so they are offered
- * with the caveat recorded at CLARETT_CLOCK_ADAT2.
+ * enums (clarett.h): Internal 24, S/PDIF 3, ADAT 0, shared by the whole line. The 8PreX's second ADAT
+ * port and wordclock input are unverified (see CLARETT_CLOCK_ADAT2), but they are real connectors, so
+ * they are offered.
  */
 static const struct clarett_clock_src clarett_clock_srcs[] = {
 	{ "Internal", CLARETT_CLOCK_INTERNAL },
@@ -2199,13 +1997,12 @@ static const struct clarett_model clarett_8prex = {
 	.n_meter_sources = ARRAY_SIZE(clarett_8prex_meter_sources),
 	.capture_channels = STREAM_CHANS,
 	.playback_channels = STREAM_CHANS,
-	.rx_live_mid = 20,			/* [XML] two ADAT ports: ch20-27 (pin-m=0x0) gone at double speed */
+	.rx_live_mid = 20,			/* two ADAT ports: ch20-27 gone at double speed */
 	.clock_srcs = clarett_8prex_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_8prex_clock_srcs),
-	.rx_live_high = 16,			/* + ch16-19 (pin-h=0x0) gone at quad */
-	.max_rate = 192000,			/* HW-CONFIRMED double + quad speed for CAPTURE: analogue on ch0 reads
-						 * correct pitch at 96k and 192k, full 28ch width, no glitches. Rate-
-						 * independent geometry (no SMUX shrink). Single-speed playback confirmed. */
+	.rx_live_high = 16,			/* + ch16-19 gone at quad */
+	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
+						 * and 192k, full width); playback verified at single speed. */
 	.stream_frag = STREAM_SIZE_VAL,
 	.stream_tx_ids = clarett_8prex_stream_tx,
 	.n_stream_tx_ids = ARRAY_SIZE(clarett_8prex_stream_tx),
@@ -2214,20 +2011,11 @@ static const struct clarett_model clarett_8prex = {
 };
 
 /*
- * Clarett 2Pre (Thunderbolt). Control-plane values from the XML diff against the 8PreX
- * (Focusrite's Clarett 2Pre device XML): shared offsets/commands, the first 4 of the 8PreX output
- * gains, 2 combo-jack preamps with the Line/Inst encoding (Line=1, Inst=2 — Mic is auto-detected by the
- * jack, not a software mode; see clarett_mode_li. The alsa-map's enum values carry the mapping).
- * Channel counts 4 playback / 14 record are HARDWARE-CONFIRMED (GET_7.2=0x04 / GET_7.3=0x0e in the boot
- * trace). Detected by its (4,14) geometry (clarett_detect_model). The PRE-mailbox surface really
- * is undifferentiated — every MMIO reg / config read / PCI config byte is identical to the 8PreX, and
- * these TB2 units expose no DROM device_name — which is why detection has to wait until the device is
- * armed enough to answer GET_7.1.
- * PCM uses the per-direction descriptor path (shared with the 8PreX): on hardware the engine dereferences
- * the ring base as a descriptor table (descriptor mode
- * is the engine's default and is not flipped by the stream-config FCP handshake we can replay). Asymmetric
- * TX 4ch / RX 14ch: periods 0x40 / 0xe0, descriptor fragments 0x100 / 0x700 (clarett_frag_bytes). The 2Pre's
- * descriptor geometry is INFERRED; see clarett.h.
+ * Clarett 2Pre (Thunderbolt). Shares the 8PreX's config offsets and commands; the first 4 of the
+ * 8PreX output gains; 2 combo-jack preamps with the Line/Inst encoding (Line=1, Inst=2 — Mic is
+ * auto-detected by the jack, not a software mode; see clarett_mode_li). Streams 4 playback / 14 record,
+ * which is also how it is detected (clarett_detect_model). Asymmetric TX 4ch / RX 14ch: periods
+ * 0x40 / 0xe0, descriptor fragments 0x100 / 0x380 (clarett_frag_bytes).
  */
 /* Names mirror scarlett2's Clarett 2Pre USB line_out_descrs (Monitor L/R, Headphones L/R);
  * the "Line NN" number is 1-based output index, matching scarlett2's "Line %02d (%s)". */
@@ -2251,8 +2039,8 @@ static const struct clarett_preamp clarett_2pre_preamps[] = {
 	{ clarett_mode_li, clarett_mode_li_vals, 2 },
 };
 
-/* Per-channel stream-routing CONFIG_PUSH ids, captured verbatim from the 2Pre rate-change handshake:
- * 4 TX (playback) + 14 RX (record) channels, re-pushed at PCM prepare. */
+/* Per-channel stream-routing CONFIG_PUSH ids: 4 TX (playback) + 14 RX (record) channels, pushed at
+ * PCM prepare. */
 static const u8 clarett_2pre_stream_tx[] = { 0x2b, 0x2c, 0x2d, 0x2e };
 static const u8 clarett_2pre_stream_rx[] = {
 	0x0d, 0x0e, 0x15, 0x16, 0x27, 0x28, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
@@ -2269,14 +2057,13 @@ static const struct clarett_model clarett_2pre = {
 	.mode_label = "Level",
 	.capture_channels = 14,			/* record-outputs pin count (12 record + 2 loopback) */
 	.playback_channels = 4,			/* playback pin count */
-	.rx_live_mid = 10,			/* [XML] ADAT 5-8 -> ch10-13 (pin-m=0x0) gone at double speed */
+	.rx_live_mid = 10,			/* ADAT 5-8 -> ch10-13 gone at double speed */
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
-	.rx_live_high = 8,			/* + ADAT 3-4 -> ch8-9 (pin-h=0x0) gone at quad */
-	.max_rate = 192000,			/* HW-CONFIRMED double + quad speed: analogue capture on ch0 reads
-						 * the correct pitch at 96k and 192k, full 14ch width preserved, no drift
-						 * or glitches. Width is rate-independent (no SMUX shrink). */
-	.stream_frag = 0,			/* legacy engine-start probe unused on the 2Pre; PCM uses
+	.rx_live_high = 8,			/* + ADAT 3-4 -> ch8-9 gone at quad */
+	.max_rate = 192000,			/* double + quad speed verified (correct pitch at 96k and 192k,
+						 * full width). */
+	.stream_frag = 0,			/* stream_probe unused on the 2Pre; PCM uses
 						 * clarett_frag_bytes() per direction */
 	.stream_tx_ids = clarett_2pre_stream_tx,
 	.n_stream_tx_ids = ARRAY_SIZE(clarett_2pre_stream_tx),
@@ -2285,31 +2072,26 @@ static const struct clarett_model clarett_2pre = {
 };
 
 /*
- * Clarett 4Pre (Thunderbolt). Control plane from Focusrite's Clarett 4Pre device XML [XML],
- * cross-checked against a live FC boot-to-stream capture [TRACE]. Auto-detected after the
- * arm by its (8,20) geometry, live-confirmed (clarett_detect_model).
+ * Clarett 4Pre (Thunderbolt). Detected by its (8,20) geometry (clarett_detect_model).
  *
- *   [TRACE] channel counts 8 playback / 20 record (GET_7.2=0x08 / GET_7.3=0x14, read 6x; XML-consistent:
- *           8 Playback pins, 18 record + 2 loopback = 20 record-output pins).
- *   [TRACE] stream-routing CONFIG_PUSH ids — captured verbatim from the in-session rate handshake
- *           (#674-#702): 8 TX after GET_7.2, 20 RX after GET_7.3, in wire order.
- *   [XML]   inputs: only Analogue 1-2 have a mode (Line=1/Inst=2; Mic is auto-detected by the combo
+ *   channel counts 8 playback / 20 record (18 record + 2 loopback).
+ *   stream-routing CONFIG_PUSH ids: 8 TX after GET_7.2, 20 RX after GET_7.3, in wire order.
+ *   inputs: only Analogue 1-2 have a mode (Line=1/Inst=2; Mic is auto-detected by the combo
  *           XLR/TRS jack, not a software option — see clarett_mode_li), at mode@166/167 cmd 6;
  *           Analogue 1-4 each have Air at air@174..177 cmd 7; Analogue 5-8 have no preamp controls.
- *           So n_analogue=4 (the Air-capable inputs); 3-4 are air-only (n_modes=0). The Analogue-1
- *           mode/air encoding is additionally [TRACE]-confirmed (the "Line In 1" toggles in this capture).
- *   [XML]   output gains (cmd 1, 8-bit): Monitor 1-2 @ 32/33, Line 3-4 @ 36/37, Headphone 2 L/R @ 40/41.
+ *           So n_analogue=4 (the Air-capable inputs); 3-4 are air-only (n_modes=0).
+ *   output gains (cmd 1, 8-bit): Monitor 1-2 @ 32/33, Line 3-4 @ 36/37, Headphone 2 L/R @ 40/41.
  *           S/PDIF outputs carry no gain. Six gains total (no 44/45 pair on this model).
  */
 /* Names mirror scarlett2's Clarett 4Pre USB line_out_descrs (Monitor L/R, Headphones 1 L/R,
- * Headphones 2 L/R). [XML] offsets. */
+ * Headphones 2 L/R). */
 static const struct clarett_out_gain clarett_4pre_gains[] = {
 	{ "Line 01 (Monitor L)", 32 }, { "Line 02 (Monitor R)", 33 },
 	{ "Line 03 (Headphones 1 L)", 36 }, { "Line 04 (Headphones 1 R)", 37 },
 	{ "Line 05 (Headphones 2 L)", 40 }, { "Line 06 (Headphones 2 R)", 41 },
 };
 
-/* [XML] Analogue 1-2 Line/Inst (combo jack auto-detects Mic; Analogue-1 also [TRACE]-confirmed); 3-4 air-only (n_modes=0). */
+/* Analogue 1-2 Line/Inst (combo jack auto-detects Mic); 3-4 air-only (n_modes=0). */
 static const struct clarett_preamp clarett_4pre_preamps[] = {
 	{ clarett_mode_li, clarett_mode_li_vals, 2 },
 	{ clarett_mode_li, clarett_mode_li_vals, 2 },
@@ -2317,8 +2099,8 @@ static const struct clarett_preamp clarett_4pre_preamps[] = {
 	{ NULL, NULL, 0 },
 };
 
-/* [TRACE] per-channel stream-routing CONFIG_PUSH ids, captured from the 4Pre rate handshake:
- * 8 TX (playback) + 20 RX (record), re-pushed at PCM prepare. */
+/* Per-channel stream-routing CONFIG_PUSH ids: 8 TX (playback) + 20 RX (record), pushed at PCM
+ * prepare. */
 static const u8 clarett_4pre_stream_tx[] = { 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32 };
 static const u8 clarett_4pre_stream_rx[] = {
 	0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
@@ -2335,15 +2117,14 @@ static const struct clarett_model clarett_4pre = {
 	.in_prefix = "Line In",			/* match scarlett2 Clarett 4Pre USB */
 	.mode_label = "Level",
 	.has_spdif_source = true,
-	.capture_channels = 20,			/* [TRACE] GET_7.3=0x14 record-outputs pin count */
-	.playback_channels = 8,			/* [TRACE] GET_7.2=0x08 playback pin count */
-	.rx_live_mid = 16,			/* [XML] ADAT 5-8 -> ch16-19 (pin-m=0x0) gone at double speed */
+	.capture_channels = 20,			/* record-outputs pin count */
+	.playback_channels = 8,			/* playback pin count */
+	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
-	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 (pin-h=0x0) gone at quad */
-	.max_rate = 192000,			/* HW-CONFIRMED double + quad speed for CAPTURE: analogue on ch0 reads
-						 * correct pitch at 96k and 192k, full 20ch width, no glitches. Rate-
-						 * independent geometry (no SMUX shrink). Single-speed playback confirmed. */
+	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 gone at quad */
+	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
+						 * and 192k, full width); playback verified at single speed. */
 	.stream_frag = 0,			/* PCM uses clarett_frag_bytes() per direction (asymmetric) */
 	.stream_tx_ids = clarett_4pre_stream_tx,
 	.n_stream_tx_ids = ARRAY_SIZE(clarett_4pre_stream_tx),
@@ -2352,13 +2133,9 @@ static const struct clarett_model clarett_4pre = {
 };
 
 /*
- * Clarett 8Pre (Thunderbolt) — a DISTINCT model from the 8PreX (do not confuse). Control plane from
- * Focusrite's Clarett 8Pre device XML [XML], with derived stream-routing ids. Config access is
- * hardware-verified on an 8Pre and the full mixer registers. What remains UNVERIFIED is
- * PCM streaming on real 8Pre hardware: the channel counts are [XML]-derived rather than traced, and no
- * capture/playback has been run end-to-end on an 8Pre (unlike the confirmed 2Pre/4Pre/8PreX).
+ * Clarett 8Pre (Thunderbolt) — a DISTINCT model from the 8PreX (do not confuse).
  *
- * Differences from the 8PreX [XML] — these are physical: the 8Pre uses combo XLR/TRS jacks (the jack
+ * Differences from the 8PreX — these are physical: the 8Pre uses combo XLR/TRS jacks (the jack
  * auto-detects Mic when an XLR is inserted), whereas the 8PreX has SEPARATE XLR + 1/4" ports per input
  * (so its mode must be software-selected). Hence:
  *   - inputs: all 8 carry Air @ 174..181 (cmd 7), but only Analogue 1-2 have a mode (Line=1/Inst=2 for
@@ -2369,7 +2146,7 @@ static const struct clarett_model clarett_4pre = {
  *     mirror scarlett2's Clarett 8Pre USB line_out_descrs (Monitor L/R, Line 03-06 unlabelled,
  *     Headphones 1/2), so it gets its own gain table rather than reusing the 8PreX's.
  */
-static const struct clarett_preamp clarett_8pre_preamps[] = {	/* [XML] 1-2 Line/Inst, 3-8 air-only */
+static const struct clarett_preamp clarett_8pre_preamps[] = {	/* 1-2 Line/Inst, 3-8 air-only */
 	{ clarett_mode_li, clarett_mode_li_vals, 2 },
 	{ clarett_mode_li, clarett_mode_li_vals, 2 },
 	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
@@ -2386,8 +2163,8 @@ static const struct clarett_out_gain clarett_8pre_gains[] = {
 };
 
 /*
- * Per-channel stream-routing CONFIG_PUSH ids, DERIVED from the same model-independent global source-id
- * enumeration as the 8PreX (see clarett_8prex_stream_tx). The 8Pre's physical input layout is identical
+ * Per-channel stream-routing CONFIG_PUSH ids, from the same model-independent source-id enumeration as
+ * the 8PreX (see clarett_8prex_stream_tx). The 8Pre's physical input layout is identical
  * to the 4Pre (Analogue 1-8, S/PDIF 1-2, ADAT 1-8, Loopback mid-block), so its RX ids come out equal to
  * the 4Pre's; TX is Playback 1-20 -> 0x2b..0x3e.
  */
@@ -2412,20 +2189,14 @@ static const struct clarett_model clarett_8pre = {
 	.in_prefix = "Line In",			/* match scarlett2 Clarett 8Pre USB */
 	.mode_label = "Level",
 	.has_spdif_source = true,
-	.capture_channels = 20,			/* 18 record + 2 loopback. Width HW-confirmed: capture clocks at
-						 * full 20ch with analogue-1 on ch0; per-channel map beyond analogue [XML]. */
-	.playback_channels = 20,		/* [XML] Playback 1-20 (untraced) */
-	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 (pin-m=0x0) gone at double speed. HW-CONFIRMED:
-						 * ADAT 1-4 read clean on ch12-15 at 96k, ch16-19 held stale ring content
-						 * until this cap was applied. */
+	.capture_channels = 20,			/* 18 record + 2 loopback */
+	.playback_channels = 20,		/* Playback 1-20 */
+	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
-	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 (pin-h=0x0) gone at quad [XML]. Untested:
-						 * the 8Pre USB has no ADAT output at quad speed to feed it. */
-	.max_rate = 192000,			/* HW-CONFIRMED double + quad speed for CAPTURE: analogue on ch0 reads
-						 * the correct pitch at 96k and 192k, full 20ch width, no glitches.
-						 * Rate-independent geometry (no SMUX shrink), as on the 2Pre. Playback at
-						 * high speed follows the shared engine but is not separately verified here. */
+	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 gone at quad */
+	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
+						 * and 192k, full width). */
 	.stream_frag = 0,
 	.stream_tx_ids = clarett_8pre_stream_tx,
 	.n_stream_tx_ids = ARRAY_SIZE(clarett_8pre_stream_tx),
@@ -2434,13 +2205,9 @@ static const struct clarett_model clarett_8pre = {
 };
 
 /*
- * Focusrite Red 8Line — the first non-Clarett member of the line, and the first model whose entry is
- * deliberately CONTROL-PLANE EMPTY. It shares PCI id 1cb5:0002 with every Clarett, so the id_table
- * already matches it and this entry exists purely so clarett_detect_model() stops refusing it.
- *
- * Geometry is HARDWARE-MEASURED: GET_7.1 answered playback=64 capture=60 on a real unit. The [XML]
- * independently predicts exactly that — 64 <playback> elements, and 58 <record> + 2 <loopback> = 60
- * capture channels — which is the strongest confirmation available for a pair read out by DMA.
+ * Focusrite Red 8Line — the first non-Clarett model, and one whose entry is deliberately CONTROL-PLANE
+ * EMPTY. It shares PCI id 1cb5:0002 with every Clarett, so the id_table already matches it; this entry
+ * gives clarett_detect_model() its geometry: playback=64, capture=60 (58 record + 2 loopback).
  *
  * WHAT IS DELIBERATELY LEFT NULL/ZERO, AND WHY. The Red's control plane is NOT a wider Clarett:
  *  - out_gains: the Red's output gains are 16-bit values on a 2-byte stride (gain @24, 26, 28, ...,
@@ -2450,14 +2217,14 @@ static const struct clarett_model clarett_8pre = {
  *  - the preamp/naming fields (n_analogue, analogue, in_prefix, mode_label, has_spdif_source): dead
  *    since the in-kernel control layer was removed, and the Red's preamps carry phantom, phase,
  *    stereo-link and separate mic/line/inst gains that this struct cannot describe anyway.
- *  - meter_sources: the Red's front-panel meter bridge has never been observed.
- *  - stream_tx_ids/rx_ids: the per-channel CONFIG_PUSH burst is uncaptured, as on the 8PreX. Zero
- *    skips it.
+ *  - meter_sources: the Red's front-panel meter bridge is not mapped.
+ *  - stream_tx_ids/rx_ids: the per-channel CONFIG_PUSH ids are unknown for this model. Zero skips
+ *    the burst.
  * The control plane therefore reaches userspace only through the FCP hwdep, and there is no
  * fcp-server map pair for this slug yet.
  *
- * max_rate is 0 (44.1/48 kHz only) ON PURPOSE: not one byte of this model's DATA PLANE has been
- * exercised. Raise it only after a hardware pitch-check, per the field comment on max_rate.
+ * max_rate is 0 (44.1/48 kHz only) ON PURPOSE: the higher rates are unverified on this model. Raise
+ * it only after a pitch check on hardware, per the field comment on max_rate.
  */
 static const struct clarett_clock_src red_8line_clock_srcs[] = {
 	{ "Internal",  CLARETT_CLOCK_INTERNAL },
@@ -2472,18 +2239,18 @@ static const struct clarett_clock_src red_8line_clock_srcs[] = {
 static const struct clarett_model red_8line = {
 	.name = "Red 8Line",
 	.slug = "red-8line",
-	.capture_channels = 60,			/* HW-MEASURED via GET_7.1; [XML] 58 record + 2 loopback agrees */
-	.playback_channels = 64,		/* HW-MEASURED via GET_7.1; [XML] 64 <playback> agrees */
+	.capture_channels = 60,			/* 58 record + 2 loopback */
+	.playback_channels = 64,		/* Playback 1-64 */
 	/*
-	 * S/MUX, [XML] <record-outputs> pin-m/pin-h, same cascade rule as the Clarett models ("0x0" = gone
-	 * at that speed AND above). The Red differs in KIND, though: rather than simply losing channels it
+	 * S/MUX: a channel gone at one speed stays gone at every higher speed, as on the Clarett
+	 * models. The Red differs in KIND, though: rather than simply losing channels it
 	 * RE-PINS survivors (a slot carrying ADAT 5 at single speed carries ADAT 9 at double and Dante 1 at
 	 * quad), and only the tail actually goes away. Both dead sets are still contiguous tails, which is
 	 * what these two counts require. UNTESTED — and unreachable while max_rate is 0.
 	 */
-	.rx_live_mid = 52,			/* [XML] Dante 25-32 (pin-m=0x0) gone at double speed */
-	.rx_live_high = 32,			/* [XML] + Dante 5-24 (pin-h=0x0) gone at quad speed */
-	.max_rate = 0,				/* single speed only until the data plane is exercised */
+	.rx_live_mid = 52,			/* Dante 25-32 gone at double speed */
+	.rx_live_high = 32,			/* + Dante 5-24 gone at quad speed */
+	.max_rate = 0,				/* single speed only until higher rates are verified */
 	.clock_srcs = red_8line_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_8line_clock_srcs),
 	.stream_frag = 0,
