@@ -2220,8 +2220,8 @@ static const struct clarett_model clarett_8pre = {
  *  - meter_sources: the Red's front-panel meter bridge is not mapped.
  *  - stream_tx_ids/rx_ids: the per-channel CONFIG_PUSH ids are unknown for this model. Zero skips
  *    the burst.
- * The control plane therefore reaches userspace only through the FCP hwdep, and there is no
- * fcp-server map pair for this slug yet.
+ * The control plane therefore reaches userspace only through the FCP hwdep, where fcp-server's
+ * red-8line map pair describes it.
  *
  * max_rate is 0 (44.1/48 kHz only) ON PURPOSE: the higher rates are unverified on this model. Raise
  * it only after a pitch check on hardware, per the field comment on max_rate.
