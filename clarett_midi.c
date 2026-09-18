@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Focusrite Clarett (Thunderbolt) — DIN MIDI (ALSA rawmidi).
+ * Focusrite Clarett/Red (Thunderbolt) ALSA driver — DIN MIDI (ALSA rawmidi).
  *
  * The MIDI transport is register PIO through a single memory-mapped MIDI UART at BAR0 REG_MIDI_DATA
  * (0x58c) — NOT the FCP mailbox, NOT the audio DMA ring. The framing is:

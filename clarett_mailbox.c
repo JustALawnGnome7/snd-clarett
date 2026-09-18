@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Clarett (Thunderbolt) — FCP mailbox transport.
+ * Focusrite Clarett/Red (Thunderbolt) ALSA driver — FCP mailbox transport.
  *
  * One transaction: fill the request mailbox (cmd/size+seq/error/pad/data), ring the
  * doorbell, wait for the DONE bit in the IRQ-0 cause register and for the response

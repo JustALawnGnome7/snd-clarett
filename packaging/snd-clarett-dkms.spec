@@ -22,7 +22,7 @@
 Name:           %{module_name}-dkms
 Version:        0.1.1
 Release:        1%{?dist}
-Summary:        Focusrite Clarett (Thunderbolt) audio interface kernel module (DKMS)
+Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
 License:        GPL-2.0-only
 URL:            https://github.com/JustALawnGnome7/snd-clarett
@@ -40,9 +40,9 @@ Requires:       kernel-devel
 Requires:       alsa-lib
 
 %description
-An ALSA driver for the Focusrite Clarett Thunderbolt audio interfaces — Clarett 2Pre,
-4Pre, 8Pre and 8PreX — as a single module, with the model detected at probe from the
-device's own reported stream geometry.
+An ALSA driver for Focusrite's Clarett and Red Thunderbolt audio interfaces. One module
+covers the Clarett 2Pre, 4Pre, 8Pre and 8PreX and the Red 8Line, and detects the model at
+probe from the stream geometry the device reports.
 
 The module provides PCM capture and playback, DIN MIDI, and an FCP hwdep transport; the
 mixer, routing and preamp controls are created in userspace by fcp-server over that

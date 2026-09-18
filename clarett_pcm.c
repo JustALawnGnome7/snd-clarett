@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Focusrite Clarett (Thunderbolt) — PCM data plane (full duplex).
+ * Focusrite Clarett/Red (Thunderbolt) ALSA driver — PCM data plane (full duplex).
  *
  * The hardware is ONE full-duplex DMA engine over two ring blocks in a single contiguous coherent buffer
  * (c->stream_buf): block 0 (0x200 = TX/playback) then block 1 (0x300 = RX/capture). It raises a period on

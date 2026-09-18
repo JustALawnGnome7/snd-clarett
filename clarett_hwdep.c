@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Clarett FCP hwdep — the transport seam for Geoffrey Bennett's user-space `fcp-server`.
+ * Focusrite Clarett/Red (Thunderbolt) ALSA driver — FCP hwdep, the transport seam for
+ * Geoffrey Bennett's user-space `fcp-server`.
  *
  * Presents the same hwdep ABI as the mainline USB FCP driver (sound/usb/fcp.c), so the unmodified
  * fcp-server can drive this Thunderbolt device: the kernel is a thin transport (relay FCP commands

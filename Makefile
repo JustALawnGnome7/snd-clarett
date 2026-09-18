@@ -1,4 +1,4 @@
-# Out-of-tree build for the Clarett Thunderbolt driver.
+# Out-of-tree build for the Focusrite Clarett/Red (Thunderbolt) ALSA driver.
 #   make                  # build snd-clarett.ko against the running kernel
 #   make KDIR=...         # build against a specific kernel tree
 #   make modules_install  # install + depmod, so `modprobe snd-clarett` works (needs root)

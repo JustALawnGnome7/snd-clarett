@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Focusrite Clarett (Thunderbolt) ALSA driver — shared definitions.
+ * Focusrite Clarett/Red (Thunderbolt) ALSA driver — shared definitions.
  *
  * Register map, FCP framing and control offsets/commands come from clean-room
  * reverse engineering of the device's host interface.
