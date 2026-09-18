@@ -226,6 +226,19 @@ while it runs — find the card's name with `pactl list cards short`, then:
 pactl set-card-profile <card name> off         # pro-audio gives it back to PipeWire
 ```
 
+### Device names in PipeWire and the desktop
+
+Every model shares one PCI ID, which `pci.ids` names just "Clarett", and WirePlumber prefers
+that name over the card's own. So without help every unit shows up as *"Clarett
+Multichannel"*. `wireplumber/51-clarett-naming.conf` renames each card after the model the
+driver detected ("Clarett 2Pre", "Red 8Line", …), which also tells two units apart. The DKMS
+and RPM routes install it; otherwise:
+
+```sh
+sudo make wireplumber-install    # sudo make wireplumber-uninstall removes it
+systemctl --user restart wireplumber
+```
+
 ### MIDI
 
 The interface's DIN MIDI ports appear as a standard ALSA rawmidi device.

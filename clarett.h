@@ -402,7 +402,12 @@ struct clarett_clock_src {
 };
 
 struct clarett_model {
-	const char *name;			/* human-readable model name ("Clarett 8PreX") */
+	/*
+	 * Human-readable model name ("Clarett 8PreX"), also the card shortname. The rules in
+	 * wireplumber/51-clarett-naming.conf match on it verbatim, so a new or renamed model needs
+	 * its rule there too.
+	 */
+	const char *name;
 	/*
 	 * Stable machine-readable model slug ("clarett-8prex"), exposed at /proc/asound/cardN/clarett.
 	 * The whole Thunderbolt line shares PCI id 1cb5:0002, so the PCI id cannot select a per-model

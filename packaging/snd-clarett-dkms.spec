@@ -63,9 +63,11 @@ endorsed by Focusrite.
 %install
 mkdir -p %{buildroot}%{_usrsrc}/%{module_name}-%{version}
 cp -a . %{buildroot}%{_usrsrc}/%{module_name}-%{version}/
-# DKMS builds and installs modules and nothing else, so the ALSA card configuration is
-# installed by the package in its own right.
+# DKMS builds and installs modules and nothing else, so the ALSA card configuration and the
+# WirePlumber naming drop-in are installed by the package in its own right.
 install -D -m 644 alsa/Clarett.conf %{buildroot}%{_datadir}/alsa/cards/Clarett.conf
+install -D -m 644 wireplumber/51-clarett-naming.conf \
+    %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %post
 # --rpm_safe_upgrade keeps an upgrade from tearing down the module the outgoing package's
@@ -82,3 +84,4 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %doc README.md DEVELOPMENT.md
 %{_usrsrc}/%{module_name}-%{version}
 %{_datadir}/alsa/cards/Clarett.conf
+%{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
