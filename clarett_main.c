@@ -1776,9 +1776,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		err = 0;
 	}
 
-	/* The driver name is an interface, not a label: alsa-lib loads cards/<driver>.conf for
-	 * every card, so renaming this silently stops alsa/Clarett.conf from loading — and with it
-	 * the card's front: device and its entry in ALSA's device list. */
 	strscpy(card->driver, "Clarett", sizeof(card->driver));
 	/* Mirror snd-usb-audio's naming: brand-free product name in the shortname
 	 * (== api.alsa.card.name), manufacturer only in the longname. The USB

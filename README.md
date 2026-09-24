@@ -138,7 +138,7 @@ Do not install the akmod and DKMS versions together — both land in depmod's se
 which one loads is undefined (`modinfo -n snd-clarett` names the winner).
 
 Every packaged route loads the module automatically when the interface appears, and installs
-the ALSA and WirePlumber configuration described under *Using it*.
+the WirePlumber configuration described under *Using it*.
 
 ### Secure Boot
 
@@ -189,19 +189,7 @@ driver cannot identify the device it refuses to register and says so in the kern
 Capture and playback are standard ALSA PCM devices. **There is no default route** — playback
 is silent until you wire a PCM source to a physical output in the router (alsa-scarlett-gui).
 
-### Device lists in applications
-
-Applications that build their device list from ALSA's name hints — JUCE-based ones among
-them — show the interface as *"Clarett 8PreX, Clarett 8PreX; Front output / input"* (the ALSA
-device `front:CARD=<id>,DEV=0`). That entry comes from `alsa/Clarett.conf`, which alsa-lib
-reads only from `/usr/share/alsa/cards/`. The packaged routes install it; after `make load` or
-`make modules_install`, install it once with:
-
-```sh
-sudo make alsa-install      # sudo make alsa-uninstall removes it
-```
-
-Without it the card still works as `hw:<card>,0`, but those applications do not list it.
+### Opening the card directly
 
 The device supports one playback and one capture stream, so while PipeWire holds the card an
 application opening it directly gets *"Device or resource busy"*. Either run the application

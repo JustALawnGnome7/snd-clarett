@@ -71,14 +71,10 @@ endorsed by Focusrite.
 # Not optional decoration: kmodtool puts `Requires: %%{name}-common` on every kmod and akmod
 # subpackage it generates, so without this the packages build but will not install.
 %package -n %{name}-common
-Summary:          Documentation and ALSA/WirePlumber configuration shared by every %{kmod_name} package
-# alsa-lib owns the directory the card configuration goes into.
-Requires:         alsa-lib
+Summary:          Documentation and WirePlumber configuration shared by every %{kmod_name} package
 
 %description -n %{name}-common
-Documentation for the %{kmod_name} kernel module, and the ALSA card configuration that gives
-each interface a standard front device — without it, applications that list devices from
-ALSA's name hints do not show the card at all — and the WirePlumber rules that name each
+Documentation for the %{kmod_name} kernel module, and the WirePlumber rules that name each
 card by model in PipeWire and the desktop. Shared by the per-kernel kmod packages and by the
 akmod, and installed as a dependency of those; there is no reason to install it on its own.
 
@@ -87,7 +83,6 @@ akmod, and installed as a dependency of those; there is no reason to install it 
 %license %{kmod_name}-%{version}/LICENSES/Linux-syscall-note.txt
 %doc %{kmod_name}-%{version}/README.md
 %doc %{kmod_name}-%{version}/DEVELOPMENT.md
-%{_datadir}/alsa/cards/Clarett.conf
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %prep
@@ -112,9 +107,7 @@ done
 
 %install
 # Unconditional, and outside the loop below: an akmod build compiles nothing and runs no
-# per-kernel iteration, but its -common package still has to carry the configuration files.
-install -D -m 644 %{kmod_name}-%{version}/alsa/Clarett.conf \
-    %{buildroot}%{_datadir}/alsa/cards/Clarett.conf
+# per-kernel iteration, but its -common package still has to carry the configuration file.
 install -D -m 644 %{kmod_name}-%{version}/wireplumber/51-clarett-naming.conf \
     %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 

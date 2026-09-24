@@ -4,7 +4,6 @@
 #   make modules_install  # install + depmod, so `modprobe snd-clarett` works (needs root)
 #   make load             # load in place, pulling in the ALSA modules it needs
 #   make dkms-install     # register with DKMS so it rebuilds on every kernel upgrade
-#   make alsa-install     # install alsa/Clarett.conf, so ALSA lists the card (needs root)
 #   make wireplumber-install  # per-model names in PipeWire/GNOME (needs root)
 #   make dist             # source tarball, the input to the RPM packaging
 #   make rpm-akmod        # build the akmod RPM (rebuilds itself for each new kernel)
@@ -53,21 +52,15 @@ PKGNAME := snd-clarett
 CLARETT_VERSION := $(shell sed -n 's/^PACKAGE_VERSION="\(.*\)"$$/\1/p' $(CURDIR)/dkms.conf)
 
 # LICENSES/ (holding the Linux-syscall-note exception that clarett_fcp_uapi.h's SPDX tag refers
-# to), alsa/ and wireplumber/ are directories, so anything consuming DISTFILES has to recurse —
+# to) and wireplumber/ are directories, so anything consuming DISTFILES has to recurse —
 # hence `cp -r` below.
 DISTFILES := $(CLARETT_SRCS) $(CLARETT_HDRS) Makefile dkms.conf \
-             LICENSE LICENSES README.md DEVELOPMENT.md alsa wireplumber
+             LICENSE LICENSES README.md DEVELOPMENT.md wireplumber
 TARBALL   := $(PKGNAME)-$(CLARETT_VERSION).tar.gz
 DKMS_SRC  := /usr/src/$(PKGNAME)-$(CLARETT_VERSION)
 
-# alsa-lib loads cards/<driver>.conf only from its own compiled-in data directory, so this
-# deliberately follows no PREFIX: a copy under /usr/local/share/alsa is never read. Override
-# it for a distribution that relocates alsa-lib's data; DESTDIR stages as usual.
-ALSA_CARDS_DIR ?= /usr/share/alsa/cards
-ALSA_CONF      := alsa/Clarett.conf
-
-# Unlike alsa-lib, WirePlumber searches the XDG data directories, and /usr/local/share is in their
-# default, so the drop-in does follow PREFIX. Packages use /usr.
+# WirePlumber searches the XDG data directories, and /usr/local/share is in their default, so
+# the drop-in follows PREFIX. Packages use /usr.
 PREFIX     ?= /usr/local
 WP_CONFDIR ?= $(PREFIX)/share/wireplumber/wireplumber.conf.d
 WP_DROPIN  := wireplumber/51-clarett-naming.conf
@@ -93,7 +86,7 @@ KVER       ?= $(shell uname -r)
 # module, and the missing one only surfaces later as "Unknown symbol" from insmod.
 MODDEPS = $(shell modinfo -F depends $(CURDIR)/snd-clarett.ko 2>/dev/null | tr ',' ' ')
 
-.PHONY: all clean modules_install load unload version dist alsa-install alsa-uninstall \
+.PHONY: all clean modules_install load unload version dist \
         wireplumber-install wireplumber-uninstall dkms-install dkms-uninstall rpm-akmod rpm-kmod
 
 all:
@@ -121,17 +114,9 @@ load:
 unload:
 	rmmod snd_clarett
 
-# The card config is userspace data, but it lives with the driver rather than in the top-level
-# install because alsa-lib keys it on the name the driver registers the card under
-# (card->driver) — nothing fcp-server or the maps know about. DKMS and both RPMs install it
-# too; this target is for the `make load` / `modules_install` routes. Needs root.
-alsa-install:
-	install -D -m 644 $(ALSA_CONF) $(DESTDIR)$(ALSA_CARDS_DIR)/$(notdir $(ALSA_CONF))
-
-alsa-uninstall:
-	rm -f $(DESTDIR)$(ALSA_CARDS_DIR)/$(notdir $(ALSA_CONF))
-
-# Same reasoning: the rules match the card names this driver registers. Needs root.
+# The drop-in is userspace data, but it lives with the driver because its rules match the card
+# names this driver registers. DKMS and both RPMs install it too; this target is for the
+# `make load` / `modules_install` routes. Needs root.
 wireplumber-install:
 	install -D -m 644 $(WP_DROPIN) $(DESTDIR)$(WP_CONFDIR)/$(notdir $(WP_DROPIN))
 	@echo "Restart WirePlumber to apply: systemctl --user restart wireplumber"
@@ -163,13 +148,13 @@ dkms-install:
 	dkms build -m $(PKGNAME) -v $(CLARETT_VERSION)
 	dkms install -m $(PKGNAME) -v $(CLARETT_VERSION) --force
 	@# dkms installs modules and nothing else, so the userspace config goes in separately.
-	$(MAKE) --no-print-directory alsa-install wireplumber-install
+	$(MAKE) --no-print-directory wireplumber-install
 	@echo "installed: modprobe snd-clarett now works, and rebuilds on kernel upgrade"
 
 dkms-uninstall:
 	-dkms remove -m $(PKGNAME) -v $(CLARETT_VERSION) --all
 	rm -rf $(DKMS_SRC)
-	$(MAKE) --no-print-directory alsa-uninstall wireplumber-uninstall
+	$(MAKE) --no-print-directory wireplumber-uninstall
 
 # --- RPM packaging (Fedora / RPM Fusion kmodtool) ----------------------------
 #
