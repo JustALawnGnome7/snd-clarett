@@ -1212,8 +1212,8 @@ MODULE_PARM_DESC(monitor_poll,
  * flash on every movement of the knob would wear the NVRAM. Writes are also change-gated, so a
  * stationary knob costs nothing at all.
  *
- * `cfg` is the monitor region as fetched by clarett_monitor_poll — offset MONITOR_CFG_OFFSET, length
- * MONITOR_CFG_LEN, which spans the gains, the HW-enable bits and the knob alike.
+ * `cfg` is the monitor region as fetched by clarett_monitor_poll — offset MONITOR_CFG_OFFSET, at least
+ * MONITOR_CFG_LEN long, which spans the gains, the HW-enable bits and the knob alike.
  */
 static bool hw_gain_follow = true;
 module_param(hw_gain_follow, bool, 0644);
@@ -1305,25 +1305,29 @@ void clarett_meter_source_follow(struct clarett *c, u8 source)
 
 static void clarett_monitor_poll(struct clarett *c)
 {
-	u8 buf[MONITOR_CFG_LEN];
+	u8 buf[MONITOR_CFG_MAX_LEN];
+	u32 len = c->model->monitor_cfg_len ? : MONITOR_CFG_LEN;
 	u8 req[8];		/* GET_DATA {u32 offset, u32 len} */
 	bool changed, first;
 	int err;
 
+	if (WARN_ON_ONCE(len > sizeof(buf)))
+		len = sizeof(buf);
+
 	clarett_put_le32(req, MONITOR_CFG_OFFSET);
-	clarett_put_le32(req + 4, MONITOR_CFG_LEN);
+	clarett_put_le32(req + 4, len);
 
 	/* clarett_fcp_cmd (not clarett_get_data) so the payload is copied out under mbox_lock —
 	 * reading c->resp_buf here would race the next command. */
-	err = clarett_fcp_cmd(c, FCP_GET_DATA, req, sizeof(req), buf, sizeof(buf));
+	err = clarett_fcp_cmd(c, FCP_GET_DATA, req, sizeof(req), buf, len);
 	if (err) {
 		dev_dbg(&c->pci->dev, "monitor poll: GET_DATA failed: %d\n", err);
 		return;
 	}
 
 	first = !c->mon_snap_valid;
-	changed = !first && memcmp(c->mon_snap, buf, sizeof(buf));
-	memcpy(c->mon_snap, buf, sizeof(buf));
+	changed = !first && memcmp(c->mon_snap, buf, len);
+	memcpy(c->mon_snap, buf, len);
 	c->mon_snap_valid = true;
 
 	if (!first && !changed)
@@ -2251,6 +2255,12 @@ static const struct clarett_model red_8line = {
 	.clock_srcs = red_8line_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_8line_clock_srcs),
 	.stream_frag = 0,
+	/*
+	 * The three front-panel knob groups (monitor, headphones 1, headphones 2) keep their gains at
+	 * 112/116/120 and their mute/dim at 124/126/128, so the watched region runs to 129 — the
+	 * Clarett default stops at 115 and would miss every one of them but the monitor gain.
+	 */
+	.monitor_cfg_len = 130 - MONITOR_CFG_OFFSET,
 };
 
 static const struct pci_device_id clarett_ids[] = {

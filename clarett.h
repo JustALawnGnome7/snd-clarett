@@ -126,7 +126,8 @@ struct snd_rawmidi_substream;
 
 /* Monitoring config region re-read on a notification. */
 #define MONITOR_CFG_OFFSET       24
-#define MONITOR_CFG_LEN          92
+#define MONITOR_CFG_LEN          92      /* default: 24..115, the Clarett's gains, HW bits and knob */
+#define MONITOR_CFG_MAX_LEN      106     /* largest per-model region (clarett_model.monitor_cfg_len) */
 #define MONITOR_VOLUME_OFFSET    112     /* the front-panel knob's level; read-only reflection */
 #define MONITOR_ACTIVATE         2       /* DATA_CMD code shared by the monitor controls:
                                           * mute@24 / dim@28 are 1-bit fields that toggle 0/1
@@ -392,6 +393,12 @@ struct clarett_model {
 	const u8 *stream_rx_ids;
 	u8 n_stream_tx_ids;
 	u8 n_stream_rx_ids;
+	/*
+	 * Bytes from MONITOR_CFG_OFFSET that clarett_monitor_poll watches for front-panel changes while
+	 * streaming (when the 0x400 relay is gated off). Must cover every config byte a front-panel
+	 * control can move. 0 = MONITOR_CFG_LEN; at most MONITOR_CFG_MAX_LEN.
+	 */
+	u8 monitor_cfg_len;
 };
 
 /*
@@ -478,7 +485,7 @@ struct clarett {
 	 * knob live while streaming (clarett_monitor_poll; the 0x400 relay is gated off by stream_on).
 	 * Touched only from the meter worker, so no lock of its own.
 	 */
-	u8 mon_snap[MONITOR_CFG_LEN];
+	u8 mon_snap[MONITOR_CFG_MAX_LEN];
 	bool mon_snap_valid;
 	struct completion mbox_done;		/* completed by the vec0 ISR on mailbox DONE */
 	u32 mbox_cause;				/* 0x100 value the ISR consumed with DONE set */
