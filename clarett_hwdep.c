@@ -204,7 +204,7 @@ static int clarett_hwdep_meter_get(struct snd_kcontrol *kctl,
 			c->hwdep_meter_polled = jiffies ? jiffies : 1;	/* 0 means "never" */
 	}
 	if (!err) {
-		for (i = 0; i < c->hwdep_meter_channels; i++) {
+		for (i = 0; i < min(c->hwdep_meter_channels, CLARETT_METER_MAX_CHANNELS); i++) {
 			int idx = c->hwdep_meter_map[i];
 			u32 v = idx < 0 ? 0 : (le32_to_cpu(c->hwdep_meter_levels[idx]) & 0xffff);
 
@@ -282,7 +282,13 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 			 c->hwdep_n_meter_slots, map.meter_slots);
 		return -EINVAL;
 	}
-	if (map.map_size < 1 || map.map_size > 255 ||
+	/*
+	 * map_size is the Level Meter control's value count, and an INTEGER control carries at most
+	 * CLARETT_METER_MAX_CHANNELS values (snd_ctl_elem_value.value.integer.value[]); the .get writes one
+	 * per channel, so a larger map would write past that array. meter_slots only sizes the GET_METER
+	 * read, which lands in resp_buf, so it may exceed it.
+	 */
+	if (map.map_size < 1 || map.map_size > CLARETT_METER_MAX_CHANNELS ||
 	    map.meter_slots < 1 || map.meter_slots > 255 ||
 	    map.meter_slots * sizeof(__le32) > resp_cap)	/* GET_METER response must fit resp_buf */
 		return -EINVAL;

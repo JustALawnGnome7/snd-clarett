@@ -444,6 +444,9 @@ struct clarett_meter_source {
 
 #define CLARETT_N_METERS         48    /* GET_METER returns 48 u32 levels (num_meters=0x30)  */
 #define CLARETT_METER_MAX        4095  /* meter level range 0..4095 (matches scarlett2)       */
+/* Most channels the Level Meter control can expose: an INTEGER control's value array. */
+#define CLARETT_METER_MAX_CHANNELS \
+	((int)ARRAY_SIZE(((struct snd_ctl_elem_value *)NULL)->value.integer.value))
 
 struct clarett;
 
