@@ -720,6 +720,28 @@ static inline u32 clarett_frag_bytes(u8 channels)
 	return (u32)channels * 4 * CLARETT_FRAG_FRAMES;
 }
 /*
+ * The playback engine reads at most CLARETT_TX_FRAG_MAX_BYTES per descriptor, then moves to the next one.
+ * Every Clarett TX fragment fits (8PreX 0x700), so they keep 16 frames; the Red 8Line's 64 channels make
+ * 0x1000, and with 16-frame fragments the engine played the first 8 frames of each and skipped the rest,
+ * walking the ring at twice the rate it was filled (a digital-loopback ramp shows exactly that). So a wide
+ * TX stream halves its fragment until it fits. Capture is not capped: the Red's 0xf00 RX fragment is read
+ * whole.
+ */
+#define CLARETT_TX_FRAG_MAX_BYTES	0x800
+
+static inline u32 clarett_tx_frag_frames(u8 channels)
+{
+	u32 frames = CLARETT_FRAG_FRAMES;
+
+	while (frames > 1 && (u32)channels * 4 * frames > CLARETT_TX_FRAG_MAX_BYTES)
+		frames /= 2;
+	return frames;
+}
+static inline u32 clarett_tx_frag_bytes(u8 channels)
+{
+	return (u32)channels * 4 * clarett_tx_frag_frames(channels);
+}
+/*
  * Effective RX IRQ cadence (descriptors between periodic IRQ markers). CLARETT_IRQ_DESCS (16) is the
  * default; the dyn_period path (clarett_pcm.c) overrides c->irq_descs per-stream from the negotiated ALSA
  * period so a DAW can pick a smaller buffer. A zero field reads as the default, so it is safe before probe
@@ -806,7 +828,7 @@ static inline size_t clarett_pcm_tbl_bytes(void)
  */
 static inline size_t clarett_pcm_tx_samples(const struct clarett *c)
 {
-	return (size_t)CLARETT_STREAM_NDESC * clarett_frag_bytes(c->model->playback_channels);
+	return (size_t)CLARETT_STREAM_NDESC * clarett_tx_frag_bytes(c->model->playback_channels);
 }
 static inline size_t clarett_pcm_tx_dev_bytes(const struct clarett *c)
 {

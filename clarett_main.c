@@ -1673,7 +1673,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	/* TX fragment slot stride, mirror of rx_slot (a contiguous TX ring garbles playback on
 	 * models whose fragment is not a power of two). Default page-safe pow2. */
 	{
-		u32 frag = clarett_frag_bytes(c->model->playback_channels);
+		u32 frag = clarett_tx_frag_bytes(c->model->playback_channels);
 
 		c->tx_slot = tx_frag_pad < 0 ? roundup_pow_of_two(frag)
 			   : tx_frag_pad == 0 ? frag

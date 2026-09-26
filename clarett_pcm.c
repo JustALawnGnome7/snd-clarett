@@ -362,10 +362,11 @@ static void clarett_rx_drain(struct clarett *c, u8 *alsa, u32 apos, u32 pos, u32
  * Fill nframes of playback audio into the TX device area (starting at hardware ring frame `pos`) from the
  * contiguous ALSA playback buffer (starting at that stream's own frame `apos`). Exact mirror of
  * clarett_rx_drain with source/destination swapped: the TX area is NDESC fragment SLOTS of c->tx_slot
- * bytes; ring frame f lives in slot (f/FRAG_FRAMES) at byte (f%FRAG_FRAMES)*frame within that slot. When
- * tx_slot == audio-bytes/fragment this degenerates to a linear copy; when padded it scatters per fragment
- * across the gaps. FRAG_FRAMES divides
- * the ring, so a chunk clipped to the fragment boundary also handles the ring wrap.
+ * bytes; ring frame f lives in slot (f/ff) at byte (f%ff)*frame within that slot, where ff is the TX fragment
+ * (16 frames, fewer on a stream too wide for the engine's per-descriptor read — clarett_tx_frag_frames()).
+ * When tx_slot == audio-bytes/fragment this degenerates to a linear copy; when padded it scatters per
+ * fragment across the gaps. ff divides the ring, so a chunk clipped to the fragment boundary also handles
+ * the ring wrap.
  *
  * `abuf` is the ALSA buffer in frames, a power-of-two divisor of the ring rather than the ring itself, so
  * the source wraps one or more times across a single fill and is clipped separately. Filling a runway
@@ -378,15 +379,16 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos
 	u8 *ring = clarett_tx_area(c);
 	u32 frame = (u32)c->model->playback_channels * 4;
 	u32 slot  = c->tx_slot;
-	u32 ring_frames = CLARETT_STREAM_NDESC * CLARETT_FRAG_FRAMES;
+	u32 ff    = clarett_tx_frag_frames(c->model->playback_channels);	/* 16, or fewer on a wide stream */
+	u32 ring_frames = CLARETT_STREAM_NDESC * ff;
 
 	while (nframes) {
-		u32 fio   = pos % CLARETT_FRAG_FRAMES;			/* frame within its fragment */
-		u32 chunk = min(nframes, CLARETT_FRAG_FRAMES - fio);	/* up to the fragment (and ring) boundary */
+		u32 fio   = pos % ff;					/* frame within its fragment */
+		u32 chunk = min(nframes, ff - fio);			/* up to the fragment (and ring) boundary */
 
 		chunk = min(chunk, abuf - apos);			/* and up to the ALSA buffer wrap */
 
-		memcpy(ring + (size_t)(pos / CLARETT_FRAG_FRAMES) * slot + (size_t)fio * frame,
+		memcpy(ring + (size_t)(pos / ff) * slot + (size_t)fio * frame,
 		       alsa + (size_t)apos * frame,
 		       (size_t)chunk * frame);
 		pos += chunk;
@@ -1029,7 +1031,7 @@ static void clarett_build_rings(struct clarett *c)
 	size_t tbl     = clarett_pcm_tbl_bytes();
 
 	size_t tx_ring = clarett_pcm_tx_ring(c);
-	u32 tx_frag = clarett_frag_bytes(c->model->playback_channels);
+	u32 tx_frag = clarett_tx_frag_bytes(c->model->playback_channels);
 	u32 tx_slot = c->tx_slot;		/* TX descriptor stride: audio bytes, or a padded slot */
 	u32 rx_slot = c->rx_slot;		/* RX descriptor stride: audio bytes, or a padded slot */
 	__le64 *tx_tbl = (__le64 *)c->stream_buf;
