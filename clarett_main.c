@@ -1179,20 +1179,21 @@ static void clarett_notify_work(struct work_struct *work)
  * clarett_irq), and with PipeWire holding a PCM open more or less permanently, that is most of the
  * time. So read the monitor region at the meter rate and relay only when the bytes actually CHANGE.
  * Cost is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
- * the unit relays nothing at all. The region (24, len 92) covers the monitor mute/dim flags, the
- * master volume pair at 32/33, the HW-enable bits and the knob.
+ * the unit relays nothing at all. The Clarett region (24, len 92) covers the monitor mute/dim flags,
+ * the master volume pair at 32/33, the HW-enable bits and the knob; a model can widen it
+ * (clarett_model.monitor_cfg_len) to reach its other front-panel controls.
  *
- * The poll runs whether or not audio is streaming: the relay it feeds is only needed while streaming
- * (outside a stream the 0x400 relay is live and does that job), but clarett_hw_gain_follow() hangs
- * off the same change detection and has to track the knob at all times.
+ * The poll runs whether or not audio is streaming, and relays a real change either way: the 0x400
+ * relay is live outside a stream but is not known to fire for every front-panel control, and
+ * clarett_hw_gain_follow() hangs off the same change detection and has to track the knob at all times.
  */
 static bool monitor_poll = true;
 module_param(monitor_poll, bool, 0644);
 MODULE_PARM_DESC(monitor_poll,
-		 "Poll the monitor config region and act when it changes: relay a notification while "
-		 "streaming, so the front-panel knob keeps tracking (the 0x400 relay is gated off for the "
-		 "duration of a stream), and drive hw_gain_follow. Default on; with 0 the knob does not "
-		 "update in userspace for as long as any PCM is open.");
+		 "Poll the monitor config region and act when it changes: relay a notification, so "
+		 "front-panel controls keep tracking (the 0x400 relay is gated off for the duration of a "
+		 "stream), and drive hw_gain_follow. Default on; with 0 the knob does not update in "
+		 "userspace for as long as any PCM is open.");
 
 /*
  * Keep the SW gain of every output under HARDWARE control equal to the front-panel knob.
@@ -1329,6 +1330,21 @@ static void clarett_monitor_poll(struct clarett *c)
 
 	first = !c->mon_snap_valid;
 	changed = !first && memcmp(c->mon_snap, buf, len);
+	if (changed) {
+		/* Which bytes moved: "@off old->new", first few only. */
+		char why[96];
+		int n = 0, shown = 0;
+		u32 i;
+
+		why[0] = 0;
+		for (i = 0; i < len && shown < 6; i++)
+			if (c->mon_snap[i] != buf[i]) {
+				n += scnprintf(why + n, sizeof(why) - n, " @%u %02x->%02x",
+					       MONITOR_CFG_OFFSET + i, c->mon_snap[i], buf[i]);
+				shown++;
+			}
+		dev_dbg(&c->pci->dev, "monitor poll: region changed:%s\n", why);
+	}
 	memcpy(c->mon_snap, buf, len);
 	c->mon_snap_valid = true;
 
@@ -1336,10 +1352,12 @@ static void clarett_monitor_poll(struct clarett *c)
 		return;
 
 	if (changed) {
-		dev_dbg(&c->pci->dev, "monitor poll: region changed\n");
-		/* Only while streaming: outside one the 0x400 relay is live and notifies for us. */
-		if (READ_ONCE(c->stream_on))
-			clarett_hwdep_notify(c, NOTIFY_MON_PRIMARY);
+		/*
+		 * Streaming or not. While streaming the 0x400 relay is gated off and this is the only path;
+		 * when idle the relay is live, but it is not known to fire for every front-panel control (the
+		 * Red's Meter Source), and a duplicate costs fcp-server one re-read on a real change only.
+		 */
+		clarett_hwdep_notify(c, NOTIFY_MON_PRIMARY);
 	}
 
 	/* Also on the FIRST poll: the stored SW gains of HW-controlled outputs are whatever the last
@@ -2259,10 +2277,11 @@ static const struct clarett_model red_8line = {
 	.stream_frag = 0,
 	/*
 	 * The three front-panel knob groups (monitor, headphones 1, headphones 2) keep their gains at
-	 * 112/116/120 and their mute/dim at 124/126/128, so the watched region runs to 129 — the
-	 * Clarett default stops at 115 and would miss every one of them but the monitor gain.
+	 * 112/116/120 and their mute/dim at 124/126/128, and the front panel's Meter Source selector is
+	 * at 268, so the watched region runs to 268 — the Clarett default stops at 115 and would miss
+	 * every one of them but the monitor gain.
 	 */
-	.monitor_cfg_len = 130 - MONITOR_CFG_OFFSET,
+	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 };
 
 static const struct pci_device_id clarett_ids[] = {
