@@ -32,6 +32,12 @@ MODULE_PARM_DESC(legacy_mbox_cycle,
  * command's echoed opcode in resp_buf, and only then acks. A response that never arrives is
  * never acked.
  *
+ * The header is not the whole response. A long reply lands in pieces, header first, and one
+ * copied out the moment the echo matched could still hold the previous command's bytes past the
+ * first piece (a 245-byte GET_DATA read back intermittently zeroed from about 130 bytes in). So
+ * the payload area is poisoned before submit too, and after the echo the wait continues until
+ * the last bytes the header's size field promises are no longer poison (clarett_resp_tail_wait).
+ *
  * resp_trace: one log line per command — DONE latency, response-landing latency, echoed
  * seq, FCP status word (resp+8), size. (GET_METER adds ~24 lines/s; meter_poll_ms=0 for a
  * readable log.)
@@ -102,6 +108,43 @@ static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit, 
 }
 
 /*
+ * Payload poison, and the wait for the tail of the response it makes possible. Posted writes from
+ * the device land in order, so once the last payload bytes the header announces are no longer
+ * poison, everything before them has landed too. Real data can equal the poison, so the wait is
+ * bounded; on expiry the bytes are taken as they are (the old behaviour) and counted.
+ */
+#define CLARETT_RESP_POISON	0xa5
+#define CLARETT_RESP_TAIL_US	2000
+
+static void clarett_resp_tail_wait(struct clarett *c)
+{
+	const u8 *r = c->resp_buf;
+	ktime_t until = ktime_add_us(ktime_get(), CLARETT_RESP_TAIL_US);
+	size_t size, end, from, i;
+
+	dma_rmb();
+	size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
+	if (!size)
+		return;		/* not every command fills the size field: nothing to wait for */
+	end = min_t(size_t, FCP_RESP_DATA_OFF + size, c->resp_size);
+	from = max_t(size_t, end >= 4 ? end - 4 : 0, FCP_RESP_DATA_OFF);
+
+	for (;;) {
+		dma_rmb();
+		for (i = from; i < end; i++)
+			if (r[i] != CLARETT_RESP_POISON)
+				return;
+		if (ktime_after(ktime_get(), until)) {
+			dev_dbg(&c->pci->dev,
+				"response tail still poison after %d us (size %zu); taking it as landed\n",
+				CLARETT_RESP_TAIL_US, size);
+			return;
+		}
+		cpu_relax();
+	}
+}
+
+/*
  * Core mailbox transaction. If resp_out/resp_len are given, the response *payload* (the bytes after
  * the 16-byte echoed header) is copied out under mbox_lock on success — race-free, unlike reading
  * c->resp_buf after the call. clarett_fcp() is the response-less wrapper; clarett_fcp_cmd() is the
@@ -138,6 +181,9 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	/* zero the response header so clarett_resp_wait can't match a stale echo of a
 	 * repeated opcode */
 	memset(c->resp_buf, 0, FCP_RESP_DATA_OFF);
+	/* and poison the payload, so clarett_resp_tail_wait can tell when the tail has landed */
+	memset((u8 *)c->resp_buf + FCP_RESP_DATA_OFF, CLARETT_RESP_POISON,
+	       c->resp_size - FCP_RESP_DATA_OFF);
 	dma_wmb();
 
 	clarett_wl(c, REG_MBOX + MBOX_CMD, CMD_EXEC_FLAG | opcode);
@@ -228,6 +274,8 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 			resp_echo = clarett_resp_wait(c, CMD_EXEC_FLAG | opcode,
 						      t_submit, &land_us);
 			if (resp_echo) {
+				/* The header has landed; the rest of a long reply may not have. */
+				clarett_resp_tail_wait(c);
 				/* The device reports command-level failures in the FCP status word
 				 * (resp+8), NOT the mailbox error register — a rejected write/commit
 				 * lands a nonzero status here while DONE and the echo both look fine.
