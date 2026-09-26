@@ -764,6 +764,8 @@ static int clarett_stream_service(void *data)
 			atomic_inc(&c->stream_periods);
 			clarett_pcm_tick(c, step * CLARETT_CTR_FRAMES);	/* advance by real captured frames (no-op if idle) */
 		}
+		/* Between period events: copy playback audio the app wrote since the tick (.ack). */
+		clarett_pcm_tx_refill(c);
 		if (time_after(jiffies, next_log)) {
 			/*
 			 * DEFAULT-QUIET: a stream is open for as long as PipeWire holds the card, so an

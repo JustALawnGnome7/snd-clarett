@@ -590,7 +590,8 @@ struct clarett {
 	struct mutex pcm_lock;			/* guards the tick's ring<->ALSA copies vs hw_free teardown */
 	bool pcm_running;			/* capture trigger START..STOP: gate period delivery */
 	bool play_running;			/* playback trigger START..STOP: gate period delivery */
-	u64 pcm_frames;				/* engine frame clock since arm (shared by both directions) */
+	atomic_t tx_dirty;			/* app wrote playback frames since the last fill (.ack) */
+	u64 pcm_frames;			/* engine frame clock since arm (shared by both directions) */
 	/*
 	 * Where each direction joined that shared clock (its frame 0). The engine free-runs from the arm,
 	 * but ALSA zeroes hw_ptr at every prepare() — so a direction that attaches to an already-armed
@@ -930,6 +931,7 @@ int clarett_create_pcm(struct clarett *c);
  * in the SET_CLOCK payload alongside the rate — see the comment on the control in clarett_pcm.c. */
 int clarett_add_clock_control(struct clarett *c);
 void clarett_pcm_tick(struct clarett *c, u32 add_frames);
+void clarett_pcm_tx_refill(struct clarett *c);	/* servicer: refill TX if the app wrote since the tick */
 
 /* midi.c */
 int clarett_create_midi(struct clarett *c);	/* register the DIN MIDI rawmidi (no-op if enable_midi off) */

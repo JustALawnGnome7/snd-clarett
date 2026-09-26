@@ -474,6 +474,57 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
 }
 
 /*
+ * Playback fill: refresh the whole runway ahead of the engine (from GUARD past the read position to just
+ * before it), so a lagged tick can never underfill and the current read is never torn. Caller holds
+ * pcm_lock. Runs on every period tick AND whenever the app has written since the last fill (.ack ->
+ * tx_dirty -> clarett_pcm_tx_refill).
+ *
+ * The tick alone is not enough. It runs BEFORE period_elapsed, so it copies ALSA frames the app has not
+ * yet refilled, and the app's new audio for the region just past the next tick's guard window only lands
+ * after this fill. With two periods that region is exactly what the engine plays next, so without a
+ * refill on the app's write it played one ring lap stale at every tick. Refilling mid-period
+ * from pcm_frames (up to a period behind the engine) only rewrites frames the engine has already
+ * passed or is about to play with the data they already hold, so it cannot tear anything.
+ */
+static void clarett_play_fill(struct clarett *c)
+{
+	struct snd_pcm_substream *ps = c->pcm_play_sub;
+	u32 frame, ring, abuf, guard;
+	u64 q, aq;
+	u32 start, astart;
+
+	atomic_set(&c->tx_dirty, 0);	/* before the copy: an .ack that lands during it re-arms */
+	if (!ps || !ps->runtime->dma_area || !READ_ONCE(c->play_running))
+		return;
+
+	frame = (u32)c->model->playback_channels * 4;
+	ring  = clarett_tx_ring_bytes(c) / frame;
+	abuf  = ps->runtime->buffer_size;		/* <= ring, and divides it */
+	guard = clamp_t(u32, READ_ONCE(tx_guard), CLARETT_FRAG_FRAMES, abuf / 2);
+	if (ring <= guard)
+		return;
+
+	q = c->pcm_frames + guard;
+	aq = c->pcm_frames + guard - c->play_base;
+	start = do_div(q, ring);		/* hardware ring position */
+	astart = do_div(aq, abuf);		/* same frame in the ALSA buffer */
+
+	/* Still the whole runway: with abuf dividing the ring the fill tiles the buffer, so a lagged tick
+	 * reads audio at most one buffer stale instead of a whole ring pass. */
+	clarett_tx_fill(c, ps->runtime->dma_area, astart, start, ring - guard, abuf);
+}
+
+/* Servicer, between period events: refill if the app has written since the last fill. */
+void clarett_pcm_tx_refill(struct clarett *c)
+{
+	if (!atomic_read(&c->tx_dirty))
+		return;
+	mutex_lock(&c->pcm_lock);
+	clarett_play_fill(c);
+	mutex_unlock(&c->pcm_lock);
+}
+
+/*
  * Called from the servicer kthread on every 0x300 period event with the number of frames the engine
  * advanced since the last event (the 0x300 counter delta * CLARETT_CTR_FRAMES — self-calibrating to the
  * real hardware period). One engine clock drives BOTH directions of the full-duplex ring:
@@ -523,25 +574,7 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 		clarett_rx_drain(c, cs->runtime->dma_area, apos, pos, n, abuf);
 	}
 
-	/* Playback fill: refresh the whole runway ahead of the engine (from GUARD past the read position to
-	 * just before it), so a lagged tick can never underfill and the current read is never torn. */
-	if (ps && ps->runtime->dma_area && READ_ONCE(c->play_running)) {
-		u32 frame = (u32)c->model->playback_channels * 4;
-		u32 ring  = clarett_tx_ring_bytes(c) / frame;
-		u32 abuf  = ps->runtime->buffer_size;		/* <= ring, and divides it */
-		u32 guard = clamp_t(u32, READ_ONCE(tx_guard), CLARETT_FRAG_FRAMES, abuf / 2);
-
-		if (ring > guard) {
-			u64 q = c->pcm_frames + guard;
-			u64 aq = c->pcm_frames + guard - c->play_base;
-			u32 start = do_div(q, ring);		/* hardware ring position */
-			u32 astart = do_div(aq, abuf);		/* same frame in the ALSA buffer */
-
-			/* Still the whole runway: with abuf dividing the ring the fill tiles the buffer, so a
-			 * lagged tick reads audio at most one buffer stale instead of a whole ring pass. */
-			clarett_tx_fill(c, ps->runtime->dma_area, astart, start, ring - guard, abuf);
-		}
-	}
+	clarett_play_fill(c);
 
 	c->pcm_frames += add_frames;
 
@@ -684,7 +717,9 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 	int err;
 
 	runtime->hw = clarett_pcm_hw;
-	runtime->hw.rates            = clarett_rate_caps(c, &runtime->hw.rate_min, &runtime->hw.rate_max);
+	if (play)
+		runtime->hw.info |= SNDRV_PCM_INFO_SYNC_APPLPTR;	/* .ack must see every appl_ptr move */
+	runtime->hw.rates           = clarett_rate_caps(c, &runtime->hw.rate_min, &runtime->hw.rate_max);
 	runtime->hw.channels_min     = chans;
 	runtime->hw.channels_max     = chans;
 	/* Ceiling: the ring, unless max_buffer lowers it. What an app that pins only the period actually
@@ -978,6 +1013,7 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		if (play) {
 			c->play_last_period = period;
 			WRITE_ONCE(c->play_running, true);
+			atomic_set(&c->tx_dirty, 1);	/* fill the prefilled buffer now, not a tick later */
 		} else {
 			c->pcm_last_period = period;
 			WRITE_ONCE(c->pcm_running, true);
@@ -1006,6 +1042,22 @@ static snd_pcm_uframes_t clarett_pcm_pointer(struct snd_pcm_substream *ss)
 	return do_div(frames, ss->runtime->buffer_size);
 }
 
+/*
+ * Atomic context (stream lock held), called whenever the app moves appl_ptr. Only flag it: the copy is
+ * up to a ring of audio and needs pcm_lock, so the servicer does it on its next poll
+ * (clarett_pcm_tx_refill), within a few hundred microseconds. Playback advertises
+ * SNDRV_PCM_INFO_SYNC_APPLPTR so mmap clients report appl_ptr through the kernel and this fires for them
+ * too.
+ */
+static int clarett_pcm_ack(struct snd_pcm_substream *ss)
+{
+	struct clarett *c = snd_pcm_substream_chip(ss);
+
+	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		atomic_set(&c->tx_dirty, 1);
+	return 0;
+}
+
 static const struct snd_pcm_ops clarett_pcm_ops = {
 	.open      = clarett_pcm_open,
 	.close     = clarett_pcm_close,
@@ -1014,6 +1066,7 @@ static const struct snd_pcm_ops clarett_pcm_ops = {
 	.prepare   = clarett_pcm_prepare,
 	.trigger   = clarett_pcm_trigger,
 	.pointer   = clarett_pcm_pointer,
+	.ack       = clarett_pcm_ack,
 };
 
 /*
