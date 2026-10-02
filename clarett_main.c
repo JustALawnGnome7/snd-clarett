@@ -1748,11 +1748,15 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	 * reloads, so without this /proc/asound/cardN/clarett would claim the default until something
 	 * streams. Userspace (fcp-server, picking the per-rate meter layout) then reads the rate for free
 	 * instead of polling the mailbox for it.
+	 *
+	 * The CONFIGURED rate, not the measured one: on an external clock source with nothing locked,
+	 * FCP_SYNC_RATE reports 192000 while the device's routing and meter tables still follow the rate
+	 * it was set to.
 	 */
 	{
 		u8 r[4];
 
-		if (!clarett_fcp_cmd(c, FCP_SYNC_RATE, NULL, 0, r, sizeof(r)))
+		if (!clarett_fcp_cmd(c, FCP_SYNC_RATE_CFG, NULL, 0, r, sizeof(r)))
 			WRITE_ONCE(c->cur_rate, clarett_get_le32(r));
 		if (!READ_ONCE(c->cur_rate))
 			WRITE_ONCE(c->cur_rate, CLARETT_DEFAULT_RATE);

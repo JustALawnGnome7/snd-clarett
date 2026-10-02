@@ -243,16 +243,24 @@ struct snd_rawmidi_substream;
  * The stream handshake issues SYNC_READ and SYNC_RATE; they enable nothing, but their answers are worth
  * logging (a device reporting unlocked would explain a dead engine).
  *
- * FCP_SYNC_RATE is a LIVE rate readback that PERSISTS while nothing is streaming and across a driver
- * reload, so probe seeds cur_rate from it and /proc/asound/cardN/clarett is truthful before the first
- * stream.
+ * The rate readbacks PERSIST while nothing is streaming and across a driver reload, so probe seeds
+ * cur_rate from the configured one (FCP_SYNC_RATE_CFG, below) and /proc/asound/cardN/clarett is
+ * truthful before the first stream.
  *
- * FCP_SYNC_READ is NOT a clean 0/1 lock flag: it returns 1 or 3 depending on model and stream state, so
- * it looks like a bitfield whose upper bit is undecoded. fcp-server collapses it with !!, which keeps
- * the exposed "Sync Status" sane.
+ * FCP_SYNC_READ is a bitfield: bit 0 = locked, bit 1 = the sync state changed since the last read (a
+ * latch set by a clock event, such as the SET_CLOCK at every arm, and cleared by reading it). Measured on
+ * a Red 8Line and a Clarett 4Pre: Internal reads 1 idle and streaming; an external source with no signal
+ * reads 0; the first read after a stream starts reads 3 (2 if unlocked) and every later read 1 (0).
+ * Whether a caller sees the latch depends on whether the event lands before or after this handshake's
+ * own read, which is why it seemed to vary by model. A lock indicator must test bit 0, not "non-zero".
+ *
+ * The rate queries differ the same way: 0x006002 returns the configured rate, while FCP_SYNC_RATE
+ * (0x006005) returns the rate the clock is actually running at -- equal when locked, but 192000 on an
+ * external source with no signal.
  */
 #define FCP_SYNC_READ            0x006004   /* lock status bitfield */
-#define FCP_SYNC_RATE            0x006005   /* u32 rate, live */
+#define FCP_SYNC_RATE            0x006005   /* u32 rate the clock is running at */
+#define FCP_SYNC_RATE_CFG        0x006002   /* u32 configured rate */
 
 /*
  * Session and identity opcodes, not fully decoded: CONFIG_PUSH registers config items by id, and
@@ -815,7 +823,7 @@ static inline u64 clarett_tick_late_us(const struct clarett *c)
 {
 	/* Both fall back to a 48 kHz, step-0xd default, so it stays sane before the first counter
 	 * delta has been measured. cur_rate is seeded at probe from
-	 * FCP_SYNC_RATE and re-published at each stream handshake, so it is live here. */
+	 * FCP_SYNC_RATE_CFG and re-published at each stream handshake, so it is live here. */
 	u32 rate = READ_ONCE(c->cur_rate) ? READ_ONCE(c->cur_rate) : CLARETT_DEFAULT_RATE;
 	u32 step = c->stream_ctr_step ? c->stream_ctr_step : 0xd;
 	u64 nominal = div_u64((u64)step * CLARETT_CTR_FRAMES * USEC_PER_SEC, rate);
