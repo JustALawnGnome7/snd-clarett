@@ -616,6 +616,29 @@ static int clarett_rule_lock_period(struct snd_pcm_hw_params *params, struct snd
 }
 
 /*
+ * Duplex rate lock: the engine is one full-duplex stream with a single sample clock, so once the other
+ * direction is configured (clarett_pcm_hw_params -> c->lock_rate), this direction may only take the same
+ * rate. Without it a client asking for 96 kHz would be granted it and then attach to an engine another
+ * client had armed at 48 kHz, playing or recording at the wrong speed. Keyed on the OTHER direction only,
+ * so a lone client can still renegotiate its own rate.
+ */
+static int clarett_rule_lock_rate(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_pcm_substream *ss = rule->private;
+	struct clarett *c = snd_pcm_substream_chip(ss);
+	u32 other = READ_ONCE(c->lock_rate[!ss->stream]);
+	struct snd_interval *r = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval t;
+
+	if (!other)
+		return 0;
+	snd_interval_any(&t);
+	t.min = t.max = other;
+	t.integer = 1;
+	return snd_interval_refine(r, &t);
+}
+
+/*
  * Most periods the ALSA buffer may hold — except where the period is so small that this many of them fall
  * below CLARETT_MIN_BUFFER_FRAMES, where the floor wins (a 16-frame period may have 8).
  *
@@ -720,6 +743,12 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 	runtime->hw.period_bytes_max = buf / 2;			/* periods_min = 2 */
 	runtime->hw.periods_max      = buf / min_period;
 
+	/* Lock both directions to one rate. */
+	err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE, clarett_rule_lock_rate, ss,
+				  SNDRV_PCM_HW_PARAM_RATE, -1);
+	if (err < 0)
+		return err;
+
 	if (dyn_period) {
 		/*
 		 * The buffer is a power-of-two FRAME count between CLARETT_MIN_BUFFER_FRAMES and the ring.
@@ -768,13 +797,15 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 }
 
 /*
- * Pin the session's shared period the first time a direction is configured (dyn_period only). The other
- * direction's open() rule reads this and is constrained to match, so both arm the one marker cadence.
+ * Pin the session's shared period the first time a direction is configured (dyn_period only), and record
+ * this direction's rate. The other direction's open() rules read these and constrain it to match, so both
+ * arm the one marker cadence at the one sample rate.
  */
 static int clarett_pcm_hw_params(struct snd_pcm_substream *ss, struct snd_pcm_hw_params *params)
 {
 	struct clarett *c = snd_pcm_substream_chip(ss);
 
+	WRITE_ONCE(c->lock_rate[ss->stream], params_rate(params));
 	if (dyn_period)
 		WRITE_ONCE(c->lock_period, params_period_size(params));
 	return 0;
@@ -791,6 +822,7 @@ static void clarett_pcm_detach(struct clarett *c, struct snd_pcm_substream *ss)
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
 
 	mutex_lock(&c->pcm_lock);
+	WRITE_ONCE(c->lock_rate[ss->stream], 0);
 	if (play) {
 		c->pcm_play_sub = NULL;
 		WRITE_ONCE(c->play_running, false);
@@ -911,8 +943,20 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	bool arm;
 	dma_addr_t r0, r1;
+	u32 other;
 
 	mutex_lock(&c->pcm_lock);
+	/*
+	 * Backstop for clarett_rule_lock_rate: two directions configured at the same instant can each see
+	 * the other unset and pass the rule. Refuse to attach at a rate the engine is not running at.
+	 */
+	other = c->lock_rate[!ss->stream];
+	if (c->stream_on && other && other != ss->runtime->rate) {
+		mutex_unlock(&c->pcm_lock);
+		dev_dbg(&c->pci->dev, "%s at %u Hz refused: the engine runs at %u Hz\n",
+			play ? "playback" : "capture", ss->runtime->rate, other);
+		return -EINVAL;
+	}
 	arm = !c->stream_on;
 	if (arm) {
 		/*

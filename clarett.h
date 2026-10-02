@@ -563,6 +563,9 @@ struct clarett {
 					 * dyn_period derives it from the negotiated ALSA period (clarett_irq_descs). */
 	u32 lock_period;		/* dyn_period: frame count both directions share this session (0 = none).
 					 * The first configured direction pins it; the other is constrained to match. */
+	u32 lock_rate[2];		/* sample rate each direction (SNDRV_PCM_STREAM_*) is configured at;
+					 * 0 = not configured. The engine runs at one rate, so the other direction
+					 * is constrained to match (clarett_rule_lock_rate). */
 	void *stream_buf;		/* coherent streaming ring buffer */
 	dma_addr_t stream_dma;
 	size_t stream_size;
