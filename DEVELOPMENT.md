@@ -236,9 +236,6 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `enable_midi` (default on) — register the DIN MIDI rawmidi.
 - `clock_source` (per card, runtime-writable) — the sample clock source; the same value as the
   `Clock Source` control.
-- `max_rate` — override the highest advertised sample rate for every model
-  (`48000`/`96000`/`192000`). `0` (default) uses each model's verified limit. When raising it on an
-  unverified model, check pitch with a known tone before trusting a rate.
 - `max_buffer` — optional hard ceiling on the ALSA buffer, in frames (`0`, the default, leaves it to
   the per-period rule).
 - `notify_ms` (default 50) — rate limit for the notification relay.

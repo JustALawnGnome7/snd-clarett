@@ -367,8 +367,9 @@ struct clarett_model {
 	u32 max_rate;				/* highest verified sample rate; 0 = single speed (48k) only.
 						 * The stream WIDTH is rate-independent (the frame stride never
 						 * shrinks), so raising this just advertises the higher SET_CLOCK rates.
-						 * Raise it per model only after a pitch check on hardware (the max_rate
-						 * module param overrides it for testing). */
+						 * Raise it per model only after a pitch check on hardware: the
+						 * transport sends SET_CLOCK for any rate, so testing a new model's
+						 * higher rates means raising this and rebuilding. */
 	/*
 	 * ADAT S/MUX: the frame stays capture_channels wide at every rate, but the device stops WRITING the
 	 * ADAT channels that S/MUX removes (8 -> 4 -> 2 per port at single/double/quad speed). Those slots

@@ -68,18 +68,6 @@ MODULE_PARM_DESC(dyn_period,
 		 "A DAW controls the period only once PipeWire has released the card.");
 
 /*
- * Override the highest sample rate the PCM advertises. Default 0 = use the per-model verified cap
- * (clarett_model.max_rate). Set this to opt an unverified model into the higher rates for testing: the
- * transport sends SET_CLOCK for any rate and the stream width is rate-independent, but confirm with a
- * known tone (correct pitch on the analogue channel) before trusting a rate.
- */
-static unsigned int max_rate;
-module_param(max_rate, uint, 0444);
-MODULE_PARM_DESC(max_rate,
-		 "Override the highest advertised sample rate for ALL models: 48000, 96000, or 192000. "
-		 "0 (default) uses each model's verified cap. 44.1 and 48 kHz are always offered.");
-
-/*
  * Clock source sent with SET_CLOCK at each stream arm: 24=Internal, 0=ADAT, 3=S/PDIF on every model
  * (see clarett.h). The 8PreX alone adds 1=ADAT 2 and 2=Wordclock, both untested. Default Internal. Set
  * to 0 to slave to an incoming ADAT clock (needed to receive a digital ADAT input cleanly). This is the
@@ -230,7 +218,7 @@ int clarett_add_clock_control(struct clarett *c)
 
 /*
  * Constant capability template; the per-model geometry fields (channels, buffer/period bytes,
- * periods_max) and the rate set (rates/rate_min/rate_max, per the max_rate cap) are filled in
+ * periods_max) and the rate set (rates/rate_min/rate_max, per the model's max_rate) are filled in
  * clarett_pcm_open().
  */
 static const struct snd_pcm_hardware clarett_pcm_hw = {
@@ -676,12 +664,12 @@ static int clarett_rule_period_by_buffer(struct snd_pcm_hw_params *params, struc
 
 /*
  * Advertised rate set. 44.1 and 48 kHz (single speed) are always offered; 88.2/96 (double) and 176.4/192
- * (quad) are added up to the effective cap — the max_rate module override if set, else the model's
- * verified clarett_model.max_rate. All six are SET_CLOCK enums the device lists.
+ * (quad) are added up to the model's verified clarett_model.max_rate. All six are SET_CLOCK enums the
+ * device lists.
  */
 static unsigned int clarett_rate_caps(struct clarett *c, unsigned int *rmin, unsigned int *rmax)
 {
-	unsigned int cap = max_rate ? max_rate : c->model->max_rate;
+	unsigned int cap = c->model->max_rate;
 	unsigned int rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000;
 
 	*rmin = 44100;
