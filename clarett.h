@@ -220,10 +220,11 @@ struct snd_rawmidi_substream;
  */
 #define CLARETT_CLOCK_ADAT       0	/* "ADAT 1" on the 8PreX */
 /*
- * 8PreX only, and unverified: on that model Sync Status reports a lock if EITHER ADAT receiver has one,
- * so it cannot confirm which port each value selects.
+ * 8PreX only. Verified with an ADAT signal on one port at a time: with port 2 (ADAT 9-16 In) fed, 1
+ * locks and 0 does not; with port 1 (ADAT 1-8 In) fed, the reverse. A lock indicator must test bit 0 of
+ * FCP_SYNC_READ for this: the word's change latch otherwise reads as a lock.
  */
-#define CLARETT_CLOCK_ADAT2      1	/* 8PreX only, unverified */
+#define CLARETT_CLOCK_ADAT2      1	/* 8PreX: the second ADAT port */
 #define CLARETT_CLOCK_WORDCLOCK  2	/* 8PreX only, untested */
 #define CLARETT_CLOCK_SPDIF      3	/* all models */
 /* Red range only, both unverified. Encodings are per-model: the Red's 4 is unrelated to the 2Pre's. */
