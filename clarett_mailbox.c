@@ -14,7 +14,19 @@
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/string.h>
+#include <linux/version.h>
+#include <linux/workqueue.h>
 #include "clarett.h"
+
+/*
+ * system_wq is deprecated from 6.17, which warns on first use and points at the unbound
+ * system_dfl_wq. The deferred flash save has no CPU affinity to keep, so it belongs there.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+#define CLARETT_SAVE_WQ	system_dfl_wq
+#else
+#define CLARETT_SAVE_WQ	system_unbound_wq
+#endif
 
 static bool legacy_mbox_cycle;
 module_param(legacy_mbox_cycle, bool, 0444);
@@ -444,7 +456,7 @@ int clarett_data_cmd(struct clarett *c, u32 activate)
 void clarett_schedule_persist(struct clarett *c)
 {
 	if (READ_ONCE(c->ctl_ready))
-		mod_delayed_work(system_wq, &c->save_work,
+		mod_delayed_work(CLARETT_SAVE_WQ, &c->save_work,
 				 msecs_to_jiffies(CLARETT_SAVE_DELAY_MS));
 }
 
