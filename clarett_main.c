@@ -2243,9 +2243,6 @@ static const struct clarett_model clarett_8pre = {
  *    the burst.
  * The control plane therefore reaches userspace only through the FCP hwdep, where fcp-server's
  * red-8line map pair describes it.
- *
- * max_rate is 0 (44.1/48 kHz only) ON PURPOSE: the higher rates are unverified on this model. Raise
- * it only after a pitch check on hardware, per the field comment on max_rate.
  */
 static const struct clarett_clock_src red_8line_clock_srcs[] = {
 	{ "Internal",  CLARETT_CLOCK_INTERNAL },
@@ -2267,11 +2264,18 @@ static const struct clarett_model red_8line = {
 	 * models. The Red differs in KIND, though: rather than simply losing channels it
 	 * RE-PINS survivors (a slot carrying ADAT 5 at single speed carries ADAT 9 at double and Dante 1 at
 	 * quad), and only the tail actually goes away. Both dead sets are still contiguous tails, which is
-	 * what these two counts require. UNTESTED — and unreachable while max_rate is 0.
+	 * what these two counts require. They match the vendor's own per-rate routing tables, which route
+	 * exactly 52 and 32 capture slots at double and quad speed.
 	 */
-	.rx_live_mid = 52,			/* Dante 25-32 gone at double speed */
-	.rx_live_high = 32,			/* + Dante 5-24 gone at quad speed */
-	.max_rate = 0,				/* single speed only until higher rates are verified */
+	.rx_live_mid = 52,			/* ADAT 1-4 + 9-12, all 32 Dante: 8 slots fewer */
+	.rx_live_high = 32,			/* ADAT 1-2 + 9-10, Dante 1-16 */
+	/*
+	 * Double and quad speed verified: correct capture pitch at 96k and 192k, and a digital-loopback
+	 * ramp through a playback channel that survives each speed arrives sample-exact. Playback drops
+	 * its tail too (Playback 63-64 at double speed, 37-64 at quad); the device just ignores those
+	 * channels, so nothing needs blanking on that side.
+	 */
+	.max_rate = 192000,
 	.clock_srcs = red_8line_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_8line_clock_srcs),
 	.stream_frag = 0,

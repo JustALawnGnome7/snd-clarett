@@ -2,8 +2,8 @@
 
 Out-of-tree ALSA driver for Focusrite's Thunderbolt audio interfaces — the **Clarett** and
 **Red** ranges — as a single module, with the model detected at probe. Supported today: the
-**Clarett 2Pre**, **4Pre**, **8Pre** and **8PreX**, and the **Red 8Line** (single-speed sample
-rates for now; see *Known limitations*). The other Red models are expected to share the same interface, so
+**Clarett 2Pre**, **4Pre**, **8Pre** and **8PreX**, and the **Red 8Line**, all at 44.1-192 kHz.
+The other Red models are expected to share the same interface, so
 adding one is mostly a matter of a model entry here and a device map for `fcp-server`.
 
 **Status: working.** Mixer control plane (through `fcp-server`), PCM capture and playback
@@ -235,8 +235,10 @@ sudo rm /var/lib/alsa/asound.state
 
 ## Known limitations
 
-- **Red 8Line: 44.1/48 kHz only, and no level meters.** The higher sample rates are not enabled
-  until they are verified on hardware, and the Red's meter layout is not mapped yet.
+- **Above 48 kHz, level meters and router names follow the 48 kHz layout.** At double and quad
+  speed the interface drops some ADAT (and, on the Red, Dante) channels and renumbers the rest,
+  but `fcp-server` does not know the sample rate, so some meters show another channel's level and
+  the router still lists channels that no longer exist. The audio itself is unaffected.
 - **Periodic audible glitches on some hosts** come from the host firmware stalling the whole
   machine for tens of milliseconds while a Thunderbolt device streams, not from the driver. The
   kernel log shows them as `stream-svc:` lines with a large `readmax`.

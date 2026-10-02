@@ -168,10 +168,9 @@ it.
 - **Buffer size is bounded per stream by the period**: at most `CLARETT_MAX_PERIODS` (4) periods,
   with a floor of `CLARETT_MIN_BUFFER_FRAMES` (128), and always a power of two, so it divides the
   4096-frame hardware ring. `max_buffer` adds an optional hard ceiling.
-- **Sample rates** 44.1-192 kHz on the Clarett models, 44.1/48 kHz on the Red 8Line until its
-  higher rates are verified. The stream width does not change with rate. At double and quad speed
-  the ADAT channels S/MUX removes still arrive in the stream with junk in them, so the servicer
-  blanks that dead tail of the capture frame every period.
+- **Sample rates** 44.1-192 kHz on every supported model. The stream width does not change with
+  rate. At double and quad speed the channels S/MUX removes still arrive in the stream with junk
+  in them, so the servicer blanks that dead tail of the capture frame every period.
 - **Clock source** is the `Clock Source` ALSA control, backed by the per-card `clock_source[]`
   parameter. It is sent with the sample rate in `SET_CLOCK` at every arm. Changing it while idle
   applies immediately; while streaming it waits for the next arm. `Sync Status` (from `fcp-server`)
