@@ -595,6 +595,8 @@ struct clarett {
 	bool pcm_running;			/* capture trigger START..STOP: gate period delivery */
 	bool play_running;			/* playback trigger START..STOP: gate period delivery */
 	atomic_t tx_dirty;			/* app wrote playback frames since the last fill (.ack) */
+	bool tx_silence;			/* STOP: the next fill silences the TX ring (close may be late) */
+	bool play_primed;			/* START: cleared; the first fill checks the anchor is still ahead */
 	u64 pcm_frames;			/* engine frame clock since arm (shared by both directions) */
 	/*
 	 * Where each direction joined that shared clock (its frame 0). The engine free-runs from the arm,
@@ -604,7 +606,9 @@ struct clarett {
 	 * also the rotation between ALSA buffer offsets and hardware ring offsets in the tick's copies.
 	 */
 	u64 pcm_base;				/* capture: value of pcm_frames when it attached */
-	u64 play_base;				/* playback: value of pcm_frames when it attached */
+	u64 play_base;				/* playback: the engine frame where ALSA frame 0 plays. Set at
+						 * prepare, moved at START one period ahead (it may lie ahead of
+						 * pcm_frames; .pointer holds 0 until the engine gets there). */
 	u64 pcm_last_period;			/* last capture period index reported via period_elapsed */
 	u64 play_last_period;			/* last playback period index reported via period_elapsed */
 

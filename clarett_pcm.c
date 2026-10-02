@@ -361,6 +361,8 @@ static void clarett_rx_drain(struct clarett *c, u8 *alsa, u32 apos, u32 pos, u32
  * longer than the buffer therefore TILES it around the ring, which is what keeps the whole-runway strategy
  * below correct: ring frame f is always sourced from the buffer frame that is due to play when the engine
  * reaches f, because both advance by the same delta and abuf divides the ring.
+ *
+ * A NULL `alsa` writes silence instead (apos/abuf still bound the chunks, harmlessly).
  */
 static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos, u32 nframes, u32 abuf)
 {
@@ -376,9 +378,13 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos
 
 		chunk = min(chunk, abuf - apos);			/* and up to the ALSA buffer wrap */
 
-		memcpy(ring + (size_t)(pos / ff) * slot + (size_t)fio * frame,
-		       alsa + (size_t)apos * frame,
-		       (size_t)chunk * frame);
+		if (alsa)
+			memcpy(ring + (size_t)(pos / ff) * slot + (size_t)fio * frame,
+			       alsa + (size_t)apos * frame,
+			       (size_t)chunk * frame);
+		else
+			memset(ring + (size_t)(pos / ff) * slot + (size_t)fio * frame, 0,
+			       (size_t)chunk * frame);
 		pos += chunk;
 		if (pos == ring_frames)
 			pos = 0;
@@ -414,8 +420,8 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos
  * full-buffer client, guards from 16 to 96 frames behave the same.
  *
  * Clamped per fill to half the ALSA buffer, so the guard is satisfied by any app that keeps its buffer
- * even half full, and floored at one fragment. If skipping appears at a small buffer, the honest fix is
- * to bound the fill by the app's appl_ptr instead of assuming a lead.
+ * even half full, and floored at one fragment. The fill copies only what the app has written
+ * (appl_ptr), so frames it has not supplied yet play as silence, never as a lap of old audio.
  */
 static unsigned int tx_guard = CLARETT_TX_GUARD_FRAMES;
 module_param(tx_guard, uint, 0644);
@@ -474,32 +480,96 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
  * from pcm_frames (up to a period behind the engine) only rewrites frames the engine has already
  * passed or is about to play with the data they already hold, so it cannot tear anything.
  */
+/* Frames ahead of the engine's read position that the fill leaves alone (the fragment being read). */
+static u32 clarett_play_guard(u32 abuf)
+{
+	return clamp_t(u32, READ_ONCE(tx_guard), CLARETT_FRAG_FRAMES, abuf / 2);
+}
+
 static void clarett_play_fill(struct clarett *c)
 {
 	struct snd_pcm_substream *ps = c->pcm_play_sub;
-	u32 frame, ring, abuf, guard;
-	u64 q, aq;
+	u32 frame, ring, abuf, guard, n, written;
+	u64 from, q, aq;
 	u32 start, astart;
 
 	atomic_set(&c->tx_dirty, 0);	/* before the copy: an .ack that lands during it re-arms */
-	if (!ps || !ps->runtime->dma_area || !READ_ONCE(c->play_running))
+	if (!ps || !ps->runtime->dma_area)
+		return;
+	/*
+	 * Stopped (drained or dropped): the fill has kept a whole runway of the ALSA buffer queued ahead of
+	 * the engine, and close, which silences the ring for good, can come a ring pass later — long enough
+	 * at 192 kHz for the engine to wrap back into the last period and play it again. Silence it now.
+	 * A drain only stops once the engine has read every frame, so nothing the app wrote is cut. Done
+	 * before the running test so a quick restart (xrun recovery) still gets a silent ring first: the
+	 * fill below leaves the frames before the stream's anchor untouched.
+	 */
+	if (READ_ONCE(c->tx_silence)) {
+		WRITE_ONCE(c->tx_silence, false);
+		clarett_zero_tx(c);
+	}
+	if (!smp_load_acquire(&c->play_running))
 		return;
 
 	frame = (u32)c->model->playback_channels * 4;
 	ring  = clarett_tx_ring_bytes(c) / frame;
 	abuf  = ps->runtime->buffer_size;		/* <= ring, and divides it */
-	guard = clamp_t(u32, READ_ONCE(tx_guard), CLARETT_FRAG_FRAMES, abuf / 2);
+	guard = clarett_play_guard(abuf);
 	if (ring <= guard)
 		return;
 
-	q = c->pcm_frames + guard;
-	aq = c->pcm_frames + guard - c->play_base;
+	/*
+	 * The whole runway, from the guard to just behind the read position — but only as far as the app has
+	 * actually written (appl_ptr); the rest is silence. Copying past appl_ptr would queue whatever the
+	 * buffer held a lap earlier, and the engine plays that whenever the app falls behind or stops: when
+	 * a stream ends, the last period again, one buffer later. Right after START the anchor lies ahead of
+	 * the runway's start; begin there, leaving the frames before frame 0 silent.
+	 */
+	/*
+	 * First fill after START. If the engine has already reached the guard window of frame 0 — START
+	 * landed just before a period event and the servicer only got here after it — frame 0 can no longer
+	 * be written in time. Push the anchor on by whole periods (staying on an event boundary) while
+	 * .pointer still reports 0, so hw_ptr never steps backwards. Rare, and it costs one period of start
+	 * latency instead of the stream's first frames.
+	 */
+	if (!c->play_primed) {
+		c->play_primed = true;
+		while (c->pcm_frames <= c->play_base && c->pcm_frames + guard > c->play_base)
+			WRITE_ONCE(c->play_base, c->play_base + ps->runtime->period_size);
+	}
+
+	from = c->pcm_frames + guard;
+	n = ring - guard;
+	if (c->play_base > from) {
+		u64 lead = c->play_base - from;
+
+		if (lead >= n)
+			return;
+		from = c->play_base;
+		n -= lead;
+	}
+	{
+		snd_pcm_uframes_t boundary = ps->runtime->boundary;
+		snd_pcm_uframes_t appl = READ_ONCE(ps->runtime->control->appl_ptr);
+		u64 spos;
+		snd_pcm_uframes_t ahead;
+
+		div64_u64_rem(from - c->play_base, boundary, &spos);	/* this stream's frame at `from` */
+		ahead = appl >= spos ? appl - spos : appl + boundary - spos;
+		if (ahead > abuf)		/* the app is behind the engine (underrun): nothing to copy */
+			ahead = 0;
+		written = min_t(u32, n, ahead);
+	}
+	q = from;
+	aq = from - c->play_base;
 	start = do_div(q, ring);		/* hardware ring position */
 	astart = do_div(aq, abuf);		/* same frame in the ALSA buffer */
 
-	/* Still the whole runway: with abuf dividing the ring the fill tiles the buffer, so a lagged tick
-	 * reads audio at most one buffer stale instead of a whole ring pass. */
-	clarett_tx_fill(c, ps->runtime->dma_area, astart, start, ring - guard, abuf);
+	clarett_tx_fill(c, ps->runtime->dma_area, astart, start, written, abuf);
+	if (written < n) {
+		q = from + written;
+		clarett_tx_fill(c, NULL, 0, do_div(q, ring), n - written, abuf);
+	}
 }
 
 /* Servicer, between period events: refill if the app has written since the last fill. */
@@ -562,9 +632,11 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 		clarett_rx_drain(c, cs->runtime->dma_area, apos, pos, n, abuf);
 	}
 
-	clarett_play_fill(c);
-
 	c->pcm_frames += add_frames;
+
+	/* Fill from where the engine is NOW: run before the advance, the runway would start a whole event
+	 * behind the read position and stop short of what the engine reads next. */
+	clarett_play_fill(c);
 
 	/* Deliver period boundaries only between trigger START and STOP (the *_running gates). Period indices
 	 * are counted on each direction's own clock (pcm_frames - base), matching what .pointer reports. */
@@ -576,7 +648,7 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 			cap_elapsed = true;
 		}
 	}
-	if (ps && READ_ONCE(c->play_running)) {
+	if (ps && READ_ONCE(c->play_running) && c->pcm_frames >= c->play_base) {
 		u64 period = div_u64(c->pcm_frames - c->play_base, ps->runtime->period_size);
 
 		if (period != c->play_last_period) {
@@ -1037,25 +1109,40 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 {
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
-	u64 base = play ? c->play_base : c->pcm_base;
-	u64 period = div_u64(c->pcm_frames - base, ss->runtime->period_size);
+	u64 now = READ_ONCE(c->pcm_frames);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		if (play) {
-			c->play_last_period = period;
-			WRITE_ONCE(c->play_running, true);
+			/*
+			 * Frame 0 plays one period after the clock START sees, not where prepare attached.
+			 * pcm_frames only advances at period events, so between them it lags the engine by up
+			 * to a period: anything anchored at or near it has already gone past the read position
+			 * by the first fill, and those frames would be counted as played without ever being
+			 * heard. One period on is the next event boundary, so it is always still ahead of the
+			 * engine, and keeping the anchor ON an event boundary keeps this stream's period
+			 * boundaries on events too (off them, each period_elapsed would arrive up to a period
+			 * late, and a two-period client would refill behind the engine). Until the engine gets
+			 * there .pointer reports 0, so the wait shows up in the delay.
+			 */
+			WRITE_ONCE(c->play_base, now + ss->runtime->period_size);
+			c->play_last_period = 0;
+			c->play_primed = false;
+			smp_store_release(&c->play_running, true);	/* anchor visible before running */
 			atomic_set(&c->tx_dirty, 1);	/* fill the prefilled buffer now, not a tick later */
 		} else {
-			c->pcm_last_period = period;
+			c->pcm_last_period = div_u64(now - c->pcm_base, ss->runtime->period_size);
 			WRITE_ONCE(c->pcm_running, true);
 		}
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
-		if (play)
+		if (play) {
 			WRITE_ONCE(c->play_running, false);
-		else
+			WRITE_ONCE(c->tx_silence, true);
+			atomic_set(&c->tx_dirty, 1);	/* the servicer silences the ring on its next poll */
+		} else {
 			WRITE_ONCE(c->pcm_running, false);
+		}
 		return 0;
 	default:
 		return -EINVAL;
@@ -1067,8 +1154,13 @@ static snd_pcm_uframes_t clarett_pcm_pointer(struct snd_pcm_substream *ss)
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	u64 base = play ? READ_ONCE(c->play_base) : READ_ONCE(c->pcm_base);
-	u64 frames = READ_ONCE(c->pcm_frames) - base;
+	u64 now = READ_ONCE(c->pcm_frames);
+	u64 frames;
 
+	/* Playback anchored ahead of the engine (START): nothing has played yet. */
+	if (now < base)
+		return 0;
+	frames = now - base;
 	/* Position on THIS stream's clock (frames since it attached), % buffer_size — 64-bit-safe
 	 * (do_div takes a u32 divisor; buffer_size fits easily). */
 	return do_div(frames, ss->runtime->buffer_size);
