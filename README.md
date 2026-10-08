@@ -215,7 +215,8 @@ systemctl --user restart wireplumber
 
 ### MIDI
 
-The interface's DIN MIDI ports appear as a standard ALSA rawmidi device.
+The interface's DIN MIDI ports appear as a standard ALSA rawmidi device. The Red range has no
+MIDI ports, so a Red gets no MIDI device.
 
 ## Settings persistence
 

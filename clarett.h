@@ -366,6 +366,9 @@ struct clarett_model {
 	 * device has a selectable S/PDIF input — 4Pre/8Pre/8PreX. The 2Pre has optical only (one
 	 * option), so it gets no control, matching scarlett2 (which omits it for the 2Pre). */
 	bool has_spdif_source;
+	/* DIN MIDI in/out jacks. Every Clarett has them; the Red range has none, although the Red 8Line's
+	 * register UART is present and answers like a Clarett's, so a port created on it would lead nowhere. */
+	bool has_midi;
 	/* Hardware-meter source selector (8PreX only; others have one or no source). */
 	const struct clarett_meter_source *meter_sources;
 	int n_meter_sources;

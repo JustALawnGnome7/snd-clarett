@@ -1788,8 +1788,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		err = 0;
 	}
 
-	/* DIN MIDI (rawmidi over the 0x58c register UART). Line-wide, so not model-gated; no-op if
-	 * enable_midi is off. Non-fatal — a failure just leaves the card without MIDI. */
+	/* DIN MIDI (rawmidi over the 0x58c register UART), on models with MIDI jacks (has_midi); no-op
+	 * otherwise or if enable_midi is off. Non-fatal — a failure just leaves the card without MIDI. */
 	err = clarett_create_midi(c);
 	if (err)
 		dev_warn(&pci->dev, "MIDI create failed (%d); continuing without MIDI\n", err);
@@ -2018,6 +2018,7 @@ static const struct clarett_model clarett_8prex = {
 	.in_prefix = "Line In",			/* match the USB models' input naming */
 	.mode_label = "Mode",			/* but keep "Mode": Mic/Line/Inst is richer than "Level" */
 	.has_spdif_source = true,
+	.has_midi = true,
 	.meter_sources = clarett_8prex_meter_sources,
 	.n_meter_sources = ARRAY_SIZE(clarett_8prex_meter_sources),
 	.capture_channels = STREAM_CHANS,
@@ -2080,6 +2081,7 @@ static const struct clarett_model clarett_2pre = {
 	.analogue = clarett_2pre_preamps,
 	.in_prefix = "Line In",			/* match scarlett2 Clarett 2Pre USB */
 	.mode_label = "Level",
+	.has_midi = true,
 	.capture_channels = 14,			/* record-outputs pin count (12 record + 2 loopback) */
 	.playback_channels = 4,			/* playback pin count */
 	.rx_live_mid = 10,			/* ADAT 5-8 -> ch10-13 gone at double speed */
@@ -2142,6 +2144,7 @@ static const struct clarett_model clarett_4pre = {
 	.in_prefix = "Line In",			/* match scarlett2 Clarett 4Pre USB */
 	.mode_label = "Level",
 	.has_spdif_source = true,
+	.has_midi = true,
 	.capture_channels = 20,			/* record-outputs pin count */
 	.playback_channels = 8,			/* playback pin count */
 	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
@@ -2214,6 +2217,7 @@ static const struct clarett_model clarett_8pre = {
 	.in_prefix = "Line In",			/* match scarlett2 Clarett 8Pre USB */
 	.mode_label = "Level",
 	.has_spdif_source = true,
+	.has_midi = true,
 	.capture_channels = 20,			/* 18 record + 2 loopback */
 	.playback_channels = 20,		/* Playback 1-20 */
 	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
@@ -2243,6 +2247,7 @@ static const struct clarett_model clarett_8pre = {
  *    since the in-kernel control layer was removed, and the Red's preamps carry phantom, phase,
  *    stereo-link and separate mic/line/inst gains that this struct cannot describe anyway.
  *  - meter_sources: the Red's front-panel meter bridge is not mapped.
+ *  - has_midi: the Red range has no MIDI jacks, so no rawmidi device is created for it.
  *  - stream_tx_ids/rx_ids: the per-channel CONFIG_PUSH ids are unknown for this model. Zero skips
  *    the burst.
  * The control plane therefore reaches userspace only through the FCP hwdep, where fcp-server's

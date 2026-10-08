@@ -18,8 +18,9 @@
  *       REG_MIDI_DATA to empty, then writes MIDI_IRQ_ACK_VAL to REG_MIDI_ACK to clear the interrupt.
  *
  * This is the simplest possible transport — no DMA, no descriptor rings, no mailbox round-trips — and it is
- * independent of the FCP control session, so MIDI works regardless of control-plane state. DIN MIDI is
- * line-wide across the Clarett Thunderbolt range (the 2Pre carries it too), so the rawmidi is not model-gated.
+ * independent of the FCP control session, so MIDI works regardless of control-plane state. Every Clarett
+ * Thunderbolt model has DIN MIDI (the 2Pre included); the Red range has none, so the rawmidi is created only
+ * where clarett_model.has_midi is set.
  *
  * Open questions, none affecting correctness: which MSI vector carries the MIDI RX interrupt (the ISR
  * drains on ANY vector); whether the pre-TX REG_MIDI_STATUS read is a required ready-gate (a large SysEx
@@ -210,7 +211,7 @@ int clarett_create_midi(struct clarett *c)
 	char name[40];
 	int err;
 
-	if (!enable_midi)
+	if (!enable_midi || !c->model->has_midi)
 		return 0;
 
 	/* device index 0 in the rawmidi namespace (independent of the PCM device index); 1 out + 1 in. */
