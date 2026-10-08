@@ -220,10 +220,16 @@ int clarett_add_clock_control(struct clarett *c)
  * Constant capability template; the per-model geometry fields (channels, buffer/period bytes,
  * periods_max) and the rate set (rates/rate_min/rate_max, per the model's max_rate) are filled in
  * clarett_pcm_open().
+ *
+ * BATCH: .pointer is the servicer's frame count, which advances once per IRQ period (a whole ALSA
+ * period under dyn_period), not continuously. Without the flag, a timer-scheduled client (PipeWire's
+ * non-Pro-Audio profiles) keeps less than a period queued, the pointer jumps past it, and playback
+ * underruns every period. With it, PipeWire and PulseAudio budget for the jump.
  */
 static const struct snd_pcm_hardware clarett_pcm_hw = {
 	.info             = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
-			    SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+			    SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+			    SNDRV_PCM_INFO_BATCH,
 	.formats          = SNDRV_PCM_FMTBIT_S32_LE,	/* interleaved, 24-bit MSB-justified */
 	.periods_min      = 2,
 };
