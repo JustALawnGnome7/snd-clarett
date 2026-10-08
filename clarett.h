@@ -457,9 +457,17 @@ struct clarett_meter_source {
 
 #define CLARETT_N_METERS         48    /* GET_METER returns 48 u32 levels (num_meters=0x30)  */
 #define CLARETT_METER_MAX        4095  /* meter level range 0..4095 (matches scarlett2)       */
-/* Most channels the Level Meter control can expose: an INTEGER control's value array. */
+/* Most channels one Level Meter control can expose: an INTEGER control's value array. */
 #define CLARETT_METER_MAX_CHANNELS \
 	((int)ARRAY_SIZE(((struct snd_ctl_elem_value *)NULL)->value.integer.value))
+/*
+ * A map wider than that is split across several "Level Meter" controls that share the name and
+ * differ in ALSA index (0, 1, ...), each covering the next CLARETT_METER_MAX_CHANNELS channels with its
+ * own slice of the labels. A client that only knows the first control still reads the first 128
+ * channels correctly. Two parts cover the 255 slots the meter map can address.
+ */
+#define CLARETT_METER_PARTS	2
+#define CLARETT_METER_MAX_MAP	(CLARETT_METER_PARTS * CLARETT_METER_MAX_CHANNELS - 1)	/* 255 */
 
 struct clarett;
 
@@ -529,10 +537,10 @@ struct clarett {
 	struct delayed_work meter_work;
 
 	/*
-	 * FCP hwdep level meter. fcp-server creates the "Level Meter"
-	 * control via FCP_IOCTL_SET_METER_MAP: hwdep_meter_map[i] indexes the device's raw meter array
+	 * FCP hwdep level meter. fcp-server creates the "Level Meter" control(s) via
+	 * FCP_IOCTL_SET_METER_MAP: hwdep_meter_map[i] indexes the device's raw meter array
 	 * (or -1 = no source) for output channel i; hwdep_meter_levels is the GET_METER scratch buffer
-	 * (hwdep_n_meter_slots u32s). hwdep_meter_labels_tlv carries the channel-name TLV set by
+	 * (hwdep_n_meter_slots u32s). hwdep_meter_labels_tlv[p] carries part p's channel-name TLV, set by
 	 * FCP_IOCTL_SET_METER_LABELS. All devm-allocated (freed at detach). Mirrors sound/usb/fcp.c. */
 	struct mutex hwdep_lock;		/* serialises the hwdep meter ioctls vs the control callbacks */
 	/*
@@ -544,14 +552,16 @@ struct clarett {
 	atomic_t hwdep_notify_event;
 	struct delayed_work hwdep_notify_dwork;	/* coalesces relay wakes (0x400 heartbeat ~13.4 Hz) */
 	bool hwdep_ready;			/* dwork INIT'd: gates cancel (probe-error paths never got here) */
-	struct snd_kcontrol *hwdep_meter_ctl;
+	/* One "Level Meter" control per CLARETT_METER_MAX_CHANNELS channels, ALSA index = part. */
+	struct snd_kcontrol *hwdep_meter_ctl[CLARETT_METER_PARTS];
+	int hwdep_meter_parts;		/* controls created: DIV_ROUND_UP(channels, per-part max) */
 	s16 *hwdep_meter_map;
 	__le32 *hwdep_meter_levels;	/* GET_METER scratch + cache (rate-limited; see clarett_hwdep_meter_get) */
 	unsigned long hwdep_meter_polled;	/* jiffies of the last GET_METER; 0 = never */
-	int hwdep_meter_channels;	/* map_size: channels the control exposes */
+	int hwdep_meter_channels;	/* map_size: channels across all parts */
 	int hwdep_n_meter_slots;	/* device raw meter count */
-	unsigned int *hwdep_meter_labels_tlv;
-	unsigned int hwdep_meter_labels_tlv_size;
+	unsigned int *hwdep_meter_labels_tlv[CLARETT_METER_PARTS];	/* each part's own labels */
+	unsigned int hwdep_meter_labels_tlv_size[CLARETT_METER_PARTS];
 
 	/* Data-plane engine state, shared by the PCM path and the stream_probe diagnostic. */
 	bool stream_on;

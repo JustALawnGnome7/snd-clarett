@@ -164,14 +164,32 @@ out:
  * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT. The reply is 48 u32 words, one per slot, and
  * each word carries the same 16-bit level (0..4095) in both halves — e.g. 0x020a020a = 522. Read
  * only the low half: the whole word is ~8000x full scale. num_meters is assumed to count slots 1:1.
+ *
+ * MORE THAN 128 CHANNELS. An INTEGER control holds at most CLARETT_METER_MAX_CHANNELS values, and a
+ * Red has more metered destinations than that, so a wider map is split into several controls named
+ * "Level Meter" with ALSA index 0, 1, ...: part p carries channels [p * 128, p * 128 + 128). Each part
+ * gets its own slice of the labels, so a client that only reads index 0 still sees the first 128
+ * channels correctly labelled. All parts share one GET_METER cache, so a second part costs no extra
+ * device traffic. kctl->private_value holds the part number.
  */
+static int clarett_hwdep_meter_part_first(int part)
+{
+	return part * CLARETT_METER_MAX_CHANNELS;
+}
+
+static int clarett_hwdep_meter_part_count(const struct clarett *c, int part)
+{
+	return min(c->hwdep_meter_channels - clarett_hwdep_meter_part_first(part),
+		   CLARETT_METER_MAX_CHANNELS);
+}
+
 static int clarett_hwdep_meter_info(struct snd_kcontrol *kctl,
 				    struct snd_ctl_elem_info *ui)
 {
 	struct clarett *c = kctl->private_data;
 
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
-	ui->count = c->hwdep_meter_channels;
+	ui->count = clarett_hwdep_meter_part_count(c, kctl->private_value);
 	ui->value.integer.min = 0;
 	ui->value.integer.max = CLARETT_METER_MAX;
 	ui->value.integer.step = 1;
@@ -182,6 +200,7 @@ static int clarett_hwdep_meter_get(struct snd_kcontrol *kctl,
 				   struct snd_ctl_elem_value *uc)
 {
 	struct clarett *c = kctl->private_data;
+	int first = clarett_hwdep_meter_part_first(kctl->private_value);
 	int i, err = 0, n = c->hwdep_n_meter_slots;
 
 	mutex_lock(&c->hwdep_lock);
@@ -204,8 +223,8 @@ static int clarett_hwdep_meter_get(struct snd_kcontrol *kctl,
 			c->hwdep_meter_polled = jiffies ? jiffies : 1;	/* 0 means "never" */
 	}
 	if (!err) {
-		for (i = 0; i < min(c->hwdep_meter_channels, CLARETT_METER_MAX_CHANNELS); i++) {
-			int idx = c->hwdep_meter_map[i];
+		for (i = 0; i < clarett_hwdep_meter_part_count(c, kctl->private_value); i++) {
+			int idx = c->hwdep_meter_map[first + i];
 			u32 v = idx < 0 ? 0 : (le32_to_cpu(c->hwdep_meter_levels[idx]) & 0xffff);
 
 			uc->value.integer.value[i] = min(v, (u32)CLARETT_METER_MAX);
@@ -220,16 +239,17 @@ static int clarett_hwdep_meter_tlv(struct snd_kcontrol *kctl, int op_flag,
 				   unsigned int size, unsigned int __user *tlv)
 {
 	struct clarett *c = kctl->private_data;
+	int part = kctl->private_value;
 	int ret = 0;
 
 	if (op_flag != SNDRV_CTL_TLV_OP_READ)
 		return -EINVAL;
 
 	mutex_lock(&c->hwdep_lock);
-	if (c->hwdep_meter_labels_tlv_size) {
-		if (size > c->hwdep_meter_labels_tlv_size)
-			size = c->hwdep_meter_labels_tlv_size;
-		if (copy_to_user(tlv, c->hwdep_meter_labels_tlv, size))
+	if (c->hwdep_meter_labels_tlv_size[part]) {
+		if (size > c->hwdep_meter_labels_tlv_size[part])
+			size = c->hwdep_meter_labels_tlv_size[part];
+		if (copy_to_user(tlv, c->hwdep_meter_labels_tlv[part], size))
 			ret = -EFAULT;
 		else
 			ret = size;
@@ -257,7 +277,7 @@ static int clarett_hwdep_validate_map(const s16 *map, int map_size, int slots)
 	return 0;
 }
 
-/* FCP_IOCTL_SET_METER_MAP: install the channel->slot map, creating the control on first call. */
+/* FCP_IOCTL_SET_METER_MAP: install the channel->slot map, creating the controls on first call. */
 static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map __user *arg)
 {
 	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
@@ -268,11 +288,11 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 	if (copy_from_user(&map, arg, sizeof(map)))
 		return -EFAULT;
 
-	/* Geometry is frozen once the control exists (fcp.c does the same: an ALSA control's channel
+	/* Geometry is frozen once the controls exist (fcp.c does the same: an ALSA control's channel
 	 * count cannot change live). A map that changed size — e.g. after editing fcp-server-data — is
-	 * rejected until the control is recreated, which means a driver reload. Say so: the bare EINVAL
+	 * rejected until the controls are recreated, which means a driver reload. Say so: the bare EINVAL
 	 * surfaces in fcp-server only as "Cannot set meter map: Invalid argument". */
-	if (c->hwdep_meter_ctl &&
+	if (c->hwdep_meter_parts &&
 	    (map.map_size != c->hwdep_meter_channels ||
 	     map.meter_slots != c->hwdep_n_meter_slots)) {
 		dev_warn(&c->pci->dev,
@@ -283,12 +303,11 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 		return -EINVAL;
 	}
 	/*
-	 * map_size is the Level Meter control's value count, and an INTEGER control carries at most
-	 * CLARETT_METER_MAX_CHANNELS values (snd_ctl_elem_value.value.integer.value[]); the .get writes one
-	 * per channel, so a larger map would write past that array. meter_slots only sizes the GET_METER
-	 * read, which lands in resp_buf, so it may exceed it.
+	 * map_size is the total channel count across the Level Meter parts; each part is an INTEGER control
+	 * holding at most CLARETT_METER_MAX_CHANNELS values. meter_slots only sizes the GET_METER read,
+	 * which lands in resp_buf, so it may exceed that.
 	 */
-	if (map.map_size < 1 || map.map_size > CLARETT_METER_MAX_CHANNELS ||
+	if (map.map_size < 1 || map.map_size > CLARETT_METER_MAX_MAP ||
 	    map.meter_slots < 1 || map.meter_slots > 255 ||
 	    map.meter_slots * sizeof(__le32) > resp_cap)	/* GET_METER response must fit resp_buf */
 		return -EINVAL;
@@ -305,35 +324,57 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 		goto out_free;
 
 	mutex_lock(&c->hwdep_lock);
-	if (!c->hwdep_meter_ctl) {
+	if (!c->hwdep_meter_parts) {
+		int parts = DIV_ROUND_UP(map.map_size, CLARETT_METER_MAX_CHANNELS);
 		s16 *new_map = devm_kmalloc_array(&c->pci->dev, map.map_size,
 						  sizeof(s16), GFP_KERNEL);
 		__le32 *levels = devm_kmalloc_array(&c->pci->dev, map.meter_slots,
 						    sizeof(__le32), GFP_KERNEL);
-		struct snd_kcontrol *kctl = NULL;
 
-		if (new_map && levels)
-			kctl = snd_ctl_new1(&clarett_hwdep_meter_tmpl, c);
-		if (!kctl) {
+		if (!new_map || !levels) {
 			devm_kfree(&c->pci->dev, levels);	/* NULL-safe */
 			devm_kfree(&c->pci->dev, new_map);
 			err = -ENOMEM;
 			goto out_unlock;
 		}
-		/* Geometry must be visible before the control is added (info() reads it). */
+		/* Geometry must be visible before the controls are added (info() reads it). */
 		c->hwdep_meter_channels = map.map_size;
 		c->hwdep_n_meter_slots = map.meter_slots;
 		c->hwdep_meter_map = new_map;
 		c->hwdep_meter_levels = levels;
-		err = snd_ctl_add(c->card, kctl);	/* frees kctl on failure */
-		if (err) {
+		memcpy(c->hwdep_meter_map, tmp, map.map_size * sizeof(s16));
+		while (c->hwdep_meter_parts < parts) {
+			int p = c->hwdep_meter_parts;
+			struct snd_kcontrol *kctl = snd_ctl_new1(&clarett_hwdep_meter_tmpl, c);
+
+			if (!kctl) {
+				err = -ENOMEM;
+				break;
+			}
+			kctl->id.index = p;
+			kctl->private_value = p;
+			err = snd_ctl_add(c->card, kctl);	/* frees kctl on failure */
+			if (err)
+				break;
+			c->hwdep_meter_ctl[p] = kctl;
+			c->hwdep_meter_parts++;
+		}
+		/*
+		 * A later part failing leaves the earlier ones working: they are already published and stay
+		 * correct, so only the channels past them go unmetered. Only a failure on part 0 is fatal.
+		 */
+		if (err && c->hwdep_meter_parts) {
+			dev_warn(&c->pci->dev, "Level Meter part %d not created (%d); channels from %d unmetered\n",
+				 c->hwdep_meter_parts, err,
+				 clarett_hwdep_meter_part_first(c->hwdep_meter_parts));
+			err = 0;
+		} else if (err) {
 			c->hwdep_meter_map = NULL;
 			c->hwdep_meter_levels = NULL;
 			devm_kfree(&c->pci->dev, levels);
 			devm_kfree(&c->pci->dev, new_map);
-			goto out_unlock;
 		}
-		c->hwdep_meter_ctl = kctl;
+		goto out_unlock;
 	} else if (map.map_size != c->hwdep_meter_channels ||
 		   map.meter_slots != c->hwdep_n_meter_slots) {
 		/* Re-mapping an existing control is supported (fcp-server re-pushes when the device
@@ -351,68 +392,102 @@ out_free:
 	return err;
 }
 
-/* FCP_IOCTL_SET_METER_LABELS: attach (or clear, size 0) the channel-name TLV on the meter control. */
+/* Drop part `p`'s labels TLV and stop advertising TLV read on it. Caller holds hwdep_lock. */
+static void clarett_hwdep_meter_clear_labels(struct clarett *c, int p)
+{
+	struct snd_kcontrol *kctl = c->hwdep_meter_ctl[p];
+
+	if (!c->hwdep_meter_labels_tlv[p])
+		return;
+	kctl->vd[0].access &= ~(SNDRV_CTL_ELEM_ACCESS_TLV_READ | SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK);
+	snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
+	devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv[p]);
+	c->hwdep_meter_labels_tlv[p] = NULL;
+	c->hwdep_meter_labels_tlv_size[p] = 0;
+}
+
+/*
+ * Give part `p` the labels in data[0..len) (NUL-separated, one per channel of that part) as its
+ * FCP_CHANNEL_LABELS TLV. Caller holds hwdep_lock.
+ */
+static int clarett_hwdep_meter_set_labels(struct clarett *c, int p, const char *data, size_t len)
+{
+	struct snd_kcontrol *kctl = c->hwdep_meter_ctl[p];
+	unsigned int data_size = ALIGN(len, sizeof(unsigned int));
+	unsigned int tlv_size = sizeof(unsigned int) * 2 + data_size;	/* type + length + payload */
+	unsigned int *tlv = devm_kzalloc(&c->pci->dev, tlv_size, GFP_KERNEL);
+
+	if (!tlv)
+		return -ENOMEM;
+	tlv[0] = SNDRV_CTL_TLVT_FCP_CHANNEL_LABELS;
+	tlv[1] = data_size;
+	memcpy(&tlv[2], data, len);
+
+	if (!c->hwdep_meter_labels_tlv[p]) {	/* first labels: advertise TLV read */
+		kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ | SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK;
+		snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
+	} else {
+		devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv[p]);
+	}
+	c->hwdep_meter_labels_tlv[p] = tlv;
+	c->hwdep_meter_labels_tlv_size[p] = tlv_size;
+	return 0;
+}
+
+/*
+ * FCP_IOCTL_SET_METER_LABELS: attach (or clear, size 0) the channel-name TLVs. fcp-server sends one
+ * NUL-separated blob for every channel; each Level Meter part gets the slice for its own channels, so
+ * every control's labels line up with its values on their own.
+ */
+#define CLARETT_METER_LABELS_MAX	8192	/* blob ceiling; a full 255-channel map stays well inside */
+
 static int clarett_hwdep_set_meter_labels(struct clarett *c, struct fcp_meter_labels __user *arg)
 {
 	struct fcp_meter_labels labels;
-	unsigned int *tlv, tlv_size, data_size;
-	int err = 0;
+	const char *pos, *end;
+	char *blob = NULL;
+	int p, err = 0;
 
 	if (copy_from_user(&labels, arg, sizeof(labels)))
 		return -EFAULT;
+	if (labels.labels_size > CLARETT_METER_LABELS_MAX)
+		return -EINVAL;
+	if (labels.labels_size) {
+		blob = memdup_user(arg->labels, labels.labels_size);
+		if (IS_ERR(blob))
+			return PTR_ERR(blob);
+	}
 
 	mutex_lock(&c->hwdep_lock);
-	if (!c->hwdep_meter_ctl) {	/* map (hence the control) must be set first */
+	if (!c->hwdep_meter_parts) {	/* map (hence the controls) must be set first */
 		err = -EINVAL;
 		goto out;
 	}
 
-	if (!labels.labels_size) {	/* clear */
-		if (c->hwdep_meter_labels_tlv) {
-			c->hwdep_meter_ctl->vd[0].access &=
-				~(SNDRV_CTL_ELEM_ACCESS_TLV_READ |
-				  SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK);
-			snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO,
-				       &c->hwdep_meter_ctl->id);
-			devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv);
-			c->hwdep_meter_labels_tlv = NULL;
-			c->hwdep_meter_labels_tlv_size = 0;
-		}
+	if (!blob) {			/* clear */
+		for (p = 0; p < c->hwdep_meter_parts; p++)
+			clarett_hwdep_meter_clear_labels(c, p);
 		goto out;
 	}
 
-	if (labels.labels_size > 4096) {
-		err = -EINVAL;
-		goto out;
-	}
-	data_size = ALIGN(labels.labels_size, sizeof(unsigned int));
-	tlv_size = sizeof(unsigned int) * 2 + data_size;	/* type + length words + payload */
-	tlv = devm_kzalloc(&c->pci->dev, tlv_size, GFP_KERNEL);
-	if (!tlv) {
-		err = -ENOMEM;
-		goto out;
-	}
-	tlv[0] = SNDRV_CTL_TLVT_FCP_CHANNEL_LABELS;
-	tlv[1] = data_size;
-	if (copy_from_user(&tlv[2], arg->labels, labels.labels_size)) {
-		devm_kfree(&c->pci->dev, tlv);
-		err = -EFAULT;
-		goto out;
-	}
+	/* Walk the blob label by label; each part takes the run covering its channels. */
+	pos = blob;
+	end = blob + labels.labels_size;
+	for (p = 0; p < c->hwdep_meter_parts && pos < end; p++) {
+		const char *start = pos;
+		int n;
 
-	if (!c->hwdep_meter_labels_tlv) {	/* first labels: advertise TLV read */
-		c->hwdep_meter_ctl->vd[0].access |=
-			SNDRV_CTL_ELEM_ACCESS_TLV_READ |
-			SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK;
-		snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO,
-			       &c->hwdep_meter_ctl->id);
-	} else {
-		devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv);
+		for (n = 0; n < clarett_hwdep_meter_part_count(c, p) && pos < end; n++)
+			pos += strnlen(pos, end - pos) + 1;
+		if (pos > end)			/* last label unterminated: keep what fits */
+			pos = end;
+		err = clarett_hwdep_meter_set_labels(c, p, start, pos - start);
+		if (err)
+			goto out;
 	}
-	c->hwdep_meter_labels_tlv = tlv;
-	c->hwdep_meter_labels_tlv_size = tlv_size;
 out:
 	mutex_unlock(&c->hwdep_lock);
+	kfree(blob);
 	return err;
 }
 
