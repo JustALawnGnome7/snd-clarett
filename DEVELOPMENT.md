@@ -144,6 +144,16 @@ model: Clarett 8PreX
 slug: clarett-8prex
 ```
 
+The slug is also in the card's components string, as `Clarett:<slug>` — the same place
+snd-usb-audio puts a USB card's `USB<vid>:<pid>` — readable through the ALSA control API
+(`snd_ctl_card_info_get_components()`), with `alsactl info <card>`, and from UCM as
+`${CardComponents}`:
+
+```
+$ alsactl info 4 | grep components
+  components: Clarett:clarett-8prex
+```
+
 The slug is the key `fcp-server` selects its per-model map by. Unlike `card->id` it is never mangled
 for uniqueness, so it is a stable contract. The model name is also the card's shortname
 (`api.alsa.card.name`), which `wireplumber/51-clarett-naming.conf` matches on — a new or renamed

@@ -360,7 +360,8 @@ struct clarett_model {
 	 */
 	const char *name;
 	/*
-	 * Stable machine-readable model slug ("clarett-8prex"), exposed at /proc/asound/cardN/clarett.
+	 * Stable machine-readable model slug ("clarett-8prex"), exposed at /proc/asound/cardN/clarett
+	 * and as the card component "Clarett:<slug>".
 	 * The whole Thunderbolt line shares PCI id 1cb5:0002, so the PCI id cannot select a per-model
 	 * control map; userspace (fcp-server) keys its model-specific maps on this slug instead. Unlike
 	 * card->id it is never mangled for uniqueness, so it is a reliable contract. Keep it stable.

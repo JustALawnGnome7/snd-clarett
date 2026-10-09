@@ -1815,6 +1815,18 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		 "Focusrite %s at %s, fw app 0x%08x", c->model->name, pci_name(pci),
 		 c->fw_app);
 
+	/* The model slug again, in the card's components string ("Clarett:clarett-8prex"), where
+	 * snd-usb-audio puts a USB card's "USB<vid>:<pid>": readable through the control API
+	 * (snd_ctl_card_info_get_components(), `alsactl info`) and by UCM as ${CardComponents}. */
+	{
+		char comp[48];
+
+		snprintf(comp, sizeof(comp), "Clarett:%s", c->model->slug);
+		err = snd_component_add(card, comp);
+		if (err < 0)
+			goto err_free;
+	}
+
 	/* Expose the stable per-model slug at /proc/asound/cardN/clarett (see clarett_proc_read).
 	 * Best-effort: the entry's lifetime is the card's; a failure only costs userspace its model
 	 * auto-detect, not function, so it is not fatal to probe. */
