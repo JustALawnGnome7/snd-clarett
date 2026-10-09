@@ -218,18 +218,34 @@ struct snd_rawmidi_substream;
  * source by Sync Status, not by the audio: S/PDIF and ADAT keep arriving on their capture channels
  * whatever the clock source says, even while unlocked.
  */
-#define CLARETT_CLOCK_ADAT       0	/* "ADAT 1" on the 8PreX */
+#define CLARETT_CLOCK_ADAT       0	/* "ADAT 1" on the 8PreX and Red 8Line */
 /*
- * 8PreX only. Verified with an ADAT signal on one port at a time: with port 2 (ADAT 9-16 In) fed, 1
- * locks and 0 does not; with port 1 (ADAT 1-8 In) fed, the reverse. A lock indicator must test bit 0 of
- * FCP_SYNC_READ for this: the word's change latch otherwise reads as a lock.
+ * 8PreX and Red 8Line, each verified with an ADAT signal on one port at a time: with port 2 (ADAT 9-16
+ * In) fed, 1 locks and 0 does not; with port 1 (ADAT 1-8 In) fed, the reverse. A lock indicator must
+ * test bit 0 of FCP_SYNC_READ for this: the word's change latch otherwise reads as a lock.
  */
-#define CLARETT_CLOCK_ADAT2      1	/* 8PreX: the second ADAT port */
-#define CLARETT_CLOCK_WORDCLOCK  2	/* 8PreX only, untested */
+#define CLARETT_CLOCK_ADAT2      1	/* the second ADAT port */
+/*
+ * 8PreX and Red 8Line. Verified with a BNC word clock from each unit into the other: the receiver locks
+ * on 2 while S/PDIF and ADAT (nothing connected) stay unlocked, and drops to unlocked when the cable is
+ * pulled.
+ */
+#define CLARETT_CLOCK_WORDCLOCK  2
 #define CLARETT_CLOCK_SPDIF      3	/* all models */
-/* Red range only, both unverified. Encodings are per-model: the Red's 4 is unrelated to the 2Pre's. */
-#define CLARETT_CLOCK_DANTE      4	/* Red only, unverified */
-#define CLARETT_CLOCK_LOOPSYNC   5	/* Red only, unverified */
+/*
+ * Red range only. Encodings are per-model: the Red's 4 is unrelated to the 2Pre's. Verified on the Red
+ * 8Line: on 4 the unit switches its Dante module from following the unit's clock to its own, and with
+ * another Dante device as PTP leader the unit's sample clock moves to that device's (about 3 ppm away
+ * from Internal's, repeatably). Sync Status cannot show it: a Dante module that loses its leader
+ * elects itself and stays locked, even with the network cable pulled.
+ */
+#define CLARETT_CLOCK_DANTE      4
+/*
+ * Red only: the Pro Tools Loop Sync In BNC, separate from Word Clock In. Verified on the Red 8Line with a
+ * word clock fed into Loop Sync In: it locks on 5 (Pro Tools mode off) while Wordclock and S/PDIF stay
+ * unlocked, and drops to unlocked when the cable is pulled.
+ */
+#define CLARETT_CLOCK_LOOPSYNC   5
 #define CLARETT_CLOCK_INTERNAL   24
 #define CLARETT_DEFAULT_RATE     48000
 

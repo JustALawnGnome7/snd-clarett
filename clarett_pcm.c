@@ -69,7 +69,7 @@ MODULE_PARM_DESC(dyn_period,
 
 /*
  * Clock source sent with SET_CLOCK at each stream arm: 24=Internal, 0=ADAT, 3=S/PDIF on every model
- * (see clarett.h). The 8PreX alone adds 1=ADAT 2 and 2=Wordclock, both untested. Default Internal. Set
+ * (see clarett.h). The 8PreX alone adds 1=ADAT 2 and 2=Wordclock, both verified. Default Internal. Set
  * to 0 to slave to an incoming ADAT clock (needed to receive a digital ADAT input cleanly). This is the
  * value behind the "Clock Source" control below.
  *

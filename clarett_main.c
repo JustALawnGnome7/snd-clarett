@@ -1991,8 +1991,7 @@ static const u8 clarett_8prex_stream_rx[] = {
 /*
  * Selectable clock sources for the "Clock Source" control, Internal first. Values are the SET_CLOCK
  * enums (clarett.h): Internal 24, S/PDIF 3, ADAT 0, shared by the whole line. The 8PreX adds its
- * second ADAT port (1, verified) and its wordclock input (2, untested, but a real connector, so it is
- * offered).
+ * second ADAT port (1) and its wordclock input (2), both verified.
  */
 static const struct clarett_clock_src clarett_clock_srcs[] = {
 	{ "Internal", CLARETT_CLOCK_INTERNAL },
