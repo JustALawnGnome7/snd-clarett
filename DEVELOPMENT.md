@@ -137,14 +137,7 @@ a `clarett_model` entry keyed on the logged pair.
 | Clarett 8PreX | 28 / 28 | `clarett-8prex` |
 | Red 8Line | 64 / 60 | `red-8line` |
 
-The detected model is published at `/proc/asound/card<N>/clarett`:
-
-```
-model: Clarett 8PreX
-slug: clarett-8prex
-```
-
-The slug is also in the card's components string, as `Clarett:<slug>` — the same place
+The slug is published in the card's components string, as `Clarett:<slug>` — the same place
 snd-usb-audio puts a USB card's `USB<vid>:<pid>` — readable through the ALSA control API
 (`snd_ctl_card_info_get_components()`), with `alsactl info <card>`, and from UCM as
 `${CardComponents}`:
@@ -158,6 +151,14 @@ The slug is the key `fcp-server` selects its per-model map by. Unlike `card->id`
 for uniqueness, so it is a stable contract. The model name is also the card's shortname
 (`api.alsa.card.name`), which `wireplumber/51-clarett-naming.conf` matches on — a new or renamed
 model needs its rule there too.
+
+`/proc/asound/card<N>/clarett` carries the model name and the current sample rate, which
+`fcp-server` reads to choose the meter layout for the speed:
+
+```
+model: Clarett 8PreX
+rate: 48000
+```
 
 The Thunderbolt DROM names the model as well, but is not used: whether a Thunderbolt 2 unit is
 enumerated as a kernel-managed Thunderbolt device at all depends on the host firmware, so it cannot

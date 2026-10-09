@@ -1514,17 +1514,15 @@ static void clarett_card_free(struct snd_card *card)
 }
 
 /*
- * /proc/asound/cardN/clarett — the stable per-model identity for userspace. The whole Thunderbolt
- * line shares PCI id 1cb5:0002, so a device-map consumer (fcp-server) cannot key a model-specific
- * map on the PCI id; it keys on `slug` here instead. `model` is the human name; `slug` is the
- * machine key (never mangled, unlike card->id). Kept minimal and greppable on purpose.
+ * /proc/asound/cardN/clarett — the detected model's name and the current sample rate, which
+ * fcp-server reads to pick the meter layout for the speed. The machine-readable model key is the
+ * card's "Clarett:<slug>" component, not this file. Kept minimal and greppable on purpose.
  */
 static void clarett_proc_read(struct snd_info_entry *entry, struct snd_info_buffer *buf)
 {
 	struct clarett *c = entry->private_data;
 
 	snd_iprintf(buf, "model: %s\n", c->model->name);
-	snd_iprintf(buf, "slug: %s\n", c->model->slug);
 	snd_iprintf(buf, "rate: %u\n", READ_ONCE(c->cur_rate));
 }
 
@@ -1815,9 +1813,10 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		 "Focusrite %s at %s, fw app 0x%08x", c->model->name, pci_name(pci),
 		 c->fw_app);
 
-	/* The model slug again, in the card's components string ("Clarett:clarett-8prex"), where
+	/* The model slug, in the card's components string ("Clarett:clarett-8prex"), where
 	 * snd-usb-audio puts a USB card's "USB<vid>:<pid>": readable through the control API
-	 * (snd_ctl_card_info_get_components(), `alsactl info`) and by UCM as ${CardComponents}. */
+	 * (snd_ctl_card_info_get_components(), `alsactl info`) and by UCM as ${CardComponents}.
+	 * fcp-server keys its per-model maps on it. */
 	{
 		char comp[48];
 
@@ -1827,9 +1826,9 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 			goto err_free;
 	}
 
-	/* Expose the stable per-model slug at /proc/asound/cardN/clarett (see clarett_proc_read).
-	 * Best-effort: the entry's lifetime is the card's; a failure only costs userspace its model
-	 * auto-detect, not function, so it is not fatal to probe. */
+	/* /proc/asound/cardN/clarett: model name and current rate (see clarett_proc_read).
+	 * Best-effort: the entry's lifetime is the card's; a failure only costs fcp-server its
+	 * per-rate meter layout, not function, so it is not fatal to probe. */
 	if (snd_card_ro_proc_new(card, "clarett", c, clarett_proc_read))
 		dev_warn(&pci->dev, "could not create /proc/asound/.../clarett model entry\n");
 
