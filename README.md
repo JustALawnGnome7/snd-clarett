@@ -3,8 +3,9 @@
 Out-of-tree ALSA driver for Focusrite's Thunderbolt audio interfaces — the **Clarett** and
 **Red** ranges — as a single module, with the model detected at probe. Supported today: the
 **Clarett 2Pre**, **4Pre**, **8Pre** and **8PreX**, and the **Red 8Line**, all at 44.1-192 kHz.
-The other Red models are expected to share the same interface, so
-adding one is mostly a matter of a model entry here and a device map for `fcp-server`.
+The **Red 16Line**, **4Pre** and **8Pre** have model entries and device maps built from their
+descriptors, but have not yet been tested on hardware; if you have one,
+[TESTING-RED.md](TESTING-RED.md) lists the checks to run and what to report.
 
 **Status: working.** Mixer control plane (through `fcp-server`), PCM capture and playback
 at 44.1–192 kHz, and DIN MIDI, all confirmed on real hardware. Control changes take physical

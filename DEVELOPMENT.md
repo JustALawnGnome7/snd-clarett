@@ -136,6 +136,21 @@ a `clarett_model` entry keyed on the logged pair.
 | Clarett 8Pre | 20 / 20 | `clarett-8pre` |
 | Clarett 8PreX | 28 / 28 | `clarett-8prex` |
 | Red 8Line | 64 / 60 | `red-8line` |
+| Red 16Line (untested) | 64 / 64 | `red-16line` |
+| Red 4Pre (untested) | 64 / 60 | `red-4pre` |
+| Red 8Pre (untested) | 64 / 64 | `red-8pre` |
+
+The Red models pair up by geometry: the 4Pre reports the 8Line's pair and the 8Pre the 16Line's.
+Within a pair the unit's own Thunderbolt controller decides (`tb_gen`, `clarett_unit_tb_gen()`): the
+Pre models are Thunderbolt 2 units and the Line models Thunderbolt 3. That controller is always the
+endpoint's immediate upstream bridge — through a dock, an adapter or another unit's daisy-chain port,
+all of which sit further up the chain — so the test holds on any host. If the bridge is not a known
+Intel Thunderbolt controller (a virtual machine, say), the Line model is assumed and a warning says so.
+A Red logs which controller identified it:
+
+```
+snd_clarett 0000:07:00.0: Red 8Line: identified by its Thunderbolt 3 controller 8086:15d3 (0x000 = 0x042003fc)
+```
 
 The slug is published in the card's components string, as `Clarett:<slug>` — the same place
 snd-usb-audio puts a USB card's `USB<vid>:<pid>` — readable through the ALSA control API

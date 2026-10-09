@@ -386,6 +386,13 @@ struct clarett_model {
 	/* DIN MIDI in/out jacks. Every Clarett has them; the Red range has none, although the Red 8Line's
 	 * register UART is present and answers like a Clarett's, so a port created on it would lead nowhere. */
 	bool has_midi;
+	/*
+	 * Thunderbolt generation of the unit's own controller, for models whose stream geometry another
+	 * model shares: the Red 4Pre and 8Pre (Thunderbolt 2) report the same pair as the Red 8Line and
+	 * 16Line (Thunderbolt 3). 0 = not needed (the geometry alone identifies the model). See
+	 * clarett_unit_tb_gen().
+	 */
+	u8 tb_gen;
 	/* Hardware-meter source selector (8PreX only; others have one or no source). */
 	const struct clarett_meter_source *meter_sources;
 	int n_meter_sources;
