@@ -313,7 +313,12 @@ static void clarett_set_rx_live(struct clarett *c, unsigned int rate)
  *
  * `abuf` is the ALSA buffer in frames, which is NOT the ring: it is a power-of-two divisor of it, so the
  * destination wraps one or more times per ring pass and has to be clipped separately from the source.
+ *
+ * On models with clarett_model.rx_loopback_at set, each frame is reordered on the way: the loopback pair
+ * moves to the end and the channels after it move down two, so ALSA channel n is the router's PCM n.
  */
+#define CLARETT_LOOPBACK_BYTES	(2 * 4)
+
 static void clarett_rx_drain(struct clarett *c, u8 *alsa, u32 apos, u32 pos, u32 nframes, u32 abuf)
 {
 	u8 *ring = clarett_rx_area(c);
@@ -322,21 +327,40 @@ static void clarett_rx_drain(struct clarett *c, u8 *alsa, u32 apos, u32 pos, u32
 	u32 ring_frames = CLARETT_STREAM_NDESC * CLARETT_FRAG_FRAMES;
 	u32 dead = READ_ONCE(c->rx_dead_bytes);		/* S/MUX-removed tail; see clarett_set_rx_live() */
 	u32 live = READ_ONCE(c->rx_live_bytes);
+	u32 lb   = (u32)c->model->rx_loopback_at * 4;	/* loopback pair's byte offset in a device frame */
+
+	/* With the reorder, the dead device tail lands two channels lower in the ALSA frame (the loopback
+	 * pair, always live, now follows it). */
+	if (lb)
+		live -= CLARETT_LOOPBACK_BYTES;
 
 	while (nframes) {
 		u32 fio   = pos % CLARETT_FRAG_FRAMES;			/* frame within its fragment */
 		u32 chunk = min(nframes, CLARETT_FRAG_FRAMES - fio);	/* up to the fragment (and ring) boundary */
+		u8 *src, *dst;
 
 		chunk = min(chunk, abuf - apos);			/* and up to the ALSA buffer wrap */
+		src = ring + (size_t)(pos / CLARETT_FRAG_FRAMES) * slot + (size_t)fio * frame;
+		dst = alsa + (size_t)apos * frame;
 
-		memcpy(alsa + (size_t)apos * frame,
-		       ring + (size_t)(pos / CLARETT_FRAG_FRAMES) * slot + (size_t)fio * frame,
-		       (size_t)chunk * frame);
+		if (!lb) {
+			memcpy(dst, src, (size_t)chunk * frame);
+		} else {
+			u32 tail = frame - lb - CLARETT_LOOPBACK_BYTES;	/* channels after the pair */
+			u8 *s = src, *d = dst;
+			u32 i;
+
+			for (i = 0; i < chunk; i++, s += frame, d += frame) {
+				memcpy(d, s, lb);
+				memcpy(d + lb, s + lb + CLARETT_LOOPBACK_BYTES, tail);
+				memcpy(d + lb + tail, s + lb, CLARETT_LOOPBACK_BYTES);
+			}
+		}
 
 		/* Blank the channels S/MUX removed at this rate: the engine still drops a sparse residue in
 		 * them, which a full-width capture would otherwise record as an impulse train. */
 		if (dead) {
-			u8 *d = alsa + (size_t)apos * frame + live;
+			u8 *d = dst + live;
 			u32 i;
 
 			for (i = 0; i < chunk; i++, d += frame)

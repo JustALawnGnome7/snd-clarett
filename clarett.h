@@ -417,6 +417,14 @@ struct clarett_model {
 	 */
 	u8 rx_live_mid;				/* capture channels written at 88.2/96 kHz */
 	u8 rx_live_high;			/* capture channels written at 176.4/192 kHz */
+	/*
+	 * Device capture channel of the first of the two loopback channels; 0 = leave the stream order alone.
+	 * The device puts loopback after the fixed inputs and before ADAT, so the channels S/MUX removes stay
+	 * a tail of the frame. The router names the pair last (PCM 19-20 on a 4Pre), so clarett_rx_drain()
+	 * moves it to the end of each frame and shifts the channels after it down two, which makes ALSA
+	 * capture channel n the router's PCM n. rx_live_{mid,high} still count DEVICE channels.
+	 */
+	u8 rx_loopback_at;
 	const struct clarett_clock_src *clock_srcs;	/* selectable clock sources, Internal first */
 	u8 n_clock_srcs;
 	u32 stream_frag;			/* engine-start diagnostic only (uniform per-descriptor DMA bytes);

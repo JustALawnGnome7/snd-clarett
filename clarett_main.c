@@ -2117,6 +2117,7 @@ static const struct clarett_model clarett_8prex = {
 	.clock_srcs = clarett_8prex_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_8prex_clock_srcs),
 	.rx_live_high = 16,			/* + ch16-19 gone at quad */
+	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width); playback verified at single speed. */
 	.stream_frag = STREAM_SIZE_VAL,
@@ -2178,6 +2179,7 @@ static const struct clarett_model clarett_2pre = {
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
 	.rx_live_high = 8,			/* + ADAT 3-4 -> ch8-9 gone at quad */
+	.rx_loopback_at = 4,			/* after analogue 1-2 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified (correct pitch at 96k and 192k,
 						 * full width). */
 	.stream_frag = 0,			/* stream_probe unused on the 2Pre; PCM uses
@@ -2241,6 +2243,7 @@ static const struct clarett_model clarett_4pre = {
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
 	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 gone at quad */
+	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width); playback verified at single speed. */
 	.stream_frag = 0,			/* PCM uses clarett_frag_bytes() per direction (asymmetric) */
@@ -2314,6 +2317,7 @@ static const struct clarett_model clarett_8pre = {
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
 	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 gone at quad */
+	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width). */
 	.stream_frag = 0,

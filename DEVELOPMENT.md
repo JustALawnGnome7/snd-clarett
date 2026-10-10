@@ -197,6 +197,11 @@ it.
 - **Sample rates** 44.1-192 kHz on every supported model. The stream width does not change with
   rate. At double and quad speed the channels S/MUX removes still arrive in the stream with junk
   in them, so the servicer blanks that dead tail of the capture frame every period.
+- **Capture channel order matches the router's PCM names.** The Claretts send the loopback pair
+  after the fixed inputs and before ADAT (so S/MUX only ever removes a tail), while the router
+  numbers it last (PCM 19-20 on a 4Pre or 8Pre). The capture copy moves the pair to the end of
+  each frame (`clarett_model.rx_loopback_at`), so ALSA capture channel n is the router's PCM n at
+  every rate. The Red range's maps name capture channels in stream order and need no reordering.
 - **Clock source** is the `Clock Source` ALSA control, backed by the per-card `clock_source[]`
   parameter. It is sent with the sample rate in `SET_CLOCK` at every arm. Changing it while idle
   applies immediately; while streaming it waits for the next arm. `Sync Status` (from `fcp-server`)
