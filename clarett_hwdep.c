@@ -86,6 +86,12 @@ static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 	    clarett_get_le32(data) != FCP_ACTIVATE_PERSIST)
 		clarett_schedule_persist(c);
 
+	/* A committed SW/HW switch: the device raises no event for it, so bring the newly HW-controlled
+	 * output's stored SW gain to the knob now (clarett_hw_gain_follow). */
+	if (cmd.opcode == FCP_DATA_CMD && cmd.req_size >= 4 &&
+	    clarett_get_le32(data) == HWEN_ACTIVATE)
+		clarett_schedule_follow(c);
+
 	if (cmd.resp_size && copy_to_user(arg->data, data, cmd.resp_size))
 		err = -EFAULT;
 out:
@@ -539,9 +545,16 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  */
 static uint notify_ms = 50;
 module_param(notify_ms, uint, 0644);
+
 MODULE_PARM_DESC(notify_ms,
 		 "Minimum ms between notification wakes to userspace (default 50; 0 = every "
 		 "notification). Raise it to cut mailbox traffic while a front-panel control moves.");
+
+/* The relay's rate limit, shared by the hw_gain_follow trigger (clarett_schedule_follow). */
+unsigned int clarett_hwdep_notify_ms(void)
+{
+	return READ_ONCE(notify_ms);
+}
 
 /* Coalesced wake: fires ~notify_ms after the FIRST notification of a burst — see the rate-limit
  * note in clarett_hwdep_notify() for why it must not be the last one. */

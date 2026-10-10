@@ -590,6 +590,7 @@ struct clarett {
 
 	/* Periodic GET_METER heartbeat. See FCP_GET_METER / clarett_meter_work(). */
 	struct delayed_work meter_work;
+	struct delayed_work follow_work;	/* hw_gain_follow, run on an event (clarett_schedule_follow) */
 
 	/*
 	 * FCP hwdep level meter. fcp-server creates the "Level Meter" control(s) via
@@ -998,6 +999,8 @@ void clarett_schedule_persist(struct clarett *c);
 /* Write the selected meter source's per-band channel tables (@136/146/156) and commit; see the
  * definition. Called from the hwdep CMD path when fcp-server writes the selector byte @184. */
 void clarett_meter_source_follow(struct clarett *c, u8 source);
+void clarett_schedule_follow(struct clarett *c);
+unsigned int clarett_hwdep_notify_ms(void);
 
 /* BAR0 access wrappers. */
 void clarett_wl(struct clarett *c, u32 off, u32 val);

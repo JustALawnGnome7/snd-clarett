@@ -1288,6 +1288,8 @@ static void clarett_notify_work(struct work_struct *work)
 	 * re-reads whatever it owns. The driver keeps no control state to refresh, and re-reading the
 	 * monitor region here would only add mailbox traffic competing with fcp-server's own reads. */
 	clarett_hwdep_notify(c, ev);
+	if (ev & (NOTIFY_EV_MONITOR | NOTIFY_EV_DIM_MUTE))
+		clarett_schedule_follow(c);
 
 	dev_dbg(&c->pci->dev, "async notification handled: 0x%x\n", ev);
 }
@@ -1426,16 +1428,15 @@ void clarett_meter_source_follow(struct clarett *c, u8 source)
 		dev_dbg(&c->pci->dev, "meter-source follow: %s (0x%02x)\n", ms->name, source);
 }
 
-static void clarett_monitor_poll(struct clarett *c)
+/* Fetch the monitor config region into buf (MONITOR_CFG_MAX_LEN). Returns its length, or <0. */
+static int clarett_monitor_fetch(struct clarett *c, u8 *buf)
 {
-	u8 buf[MONITOR_CFG_MAX_LEN];
 	u32 len = c->model->monitor_cfg_len ? : MONITOR_CFG_LEN;
 	u8 req[8];		/* GET_DATA {u32 offset, u32 len} */
-	bool changed, first;
 	int err;
 
-	if (WARN_ON_ONCE(len > sizeof(buf)))
-		len = sizeof(buf);
+	if (WARN_ON_ONCE(len > MONITOR_CFG_MAX_LEN))
+		len = MONITOR_CFG_MAX_LEN;
 
 	clarett_put_le32(req, MONITOR_CFG_OFFSET);
 	clarett_put_le32(req + 4, len);
@@ -1443,8 +1444,41 @@ static void clarett_monitor_poll(struct clarett *c)
 	/* clarett_fcp_cmd (not clarett_get_data) so the payload is copied out under mbox_lock —
 	 * reading c->resp_buf here would race the next command. */
 	err = clarett_fcp_cmd(c, FCP_GET_DATA, req, sizeof(req), buf, len);
-	if (err) {
-		dev_dbg(&c->pci->dev, "monitor poll: GET_DATA failed: %d\n", err);
+	return err ? err : len;
+}
+
+/*
+ * hw_gain_follow on an event, rather than on every monitor_poll tick. Scheduled when a relayed
+ * notification carries the monitor or dim/mute bit, once when the card comes up (the stored SW gains
+ * are whatever the last session left), and when fcp-server commits a SW/HW switch, which the device
+ * does not announce. Delayed by notify_ms and a no-op while already queued, so a knob raising events
+ * ~46 times a second costs at most one region read per notify_ms.
+ */
+static void clarett_follow_work(struct work_struct *work)
+{
+	struct clarett *c = container_of(work, struct clarett, follow_work.work);
+	u8 buf[MONITOR_CFG_MAX_LEN];
+
+	if (hw_gain_follow && clarett_monitor_fetch(c, buf) > 0)
+		clarett_hw_gain_follow(c, buf);
+}
+
+void clarett_schedule_follow(struct clarett *c)
+{
+	if (hw_gain_follow && READ_ONCE(c->ctl_ready))
+		schedule_delayed_work(&c->follow_work,
+				      msecs_to_jiffies(clarett_hwdep_notify_ms()));
+}
+
+static void clarett_monitor_poll(struct clarett *c)
+{
+	u8 buf[MONITOR_CFG_MAX_LEN];
+	bool changed, first;
+	int len;
+
+	len = clarett_monitor_fetch(c, buf);
+	if (len < 0) {
+		dev_dbg(&c->pci->dev, "monitor poll: GET_DATA failed: %d\n", len);
 		return;
 	}
 
@@ -1611,6 +1645,7 @@ static void clarett_card_free(struct snd_card *card)
 
 	WRITE_ONCE(c->ctl_ready, false);	/* stop the ISR queueing new notify work */
 	cancel_delayed_work_sync(&c->meter_work);
+	cancel_delayed_work_sync(&c->follow_work);
 	/* Flush a pending debounced persist so a change made within the last CLARETT_SAVE_DELAY_MS
 	 * still reaches NVRAM. Done here — after the meter worker is stopped (it shares the mailbox
 	 * resp_buf) but while the MSI completion path is still hooked — so the DATA_CMD completes
@@ -1627,6 +1662,7 @@ static void clarett_card_free(struct snd_card *card)
 	 * more notify after the cancel above; re-cancel now that free_irq has synced them all
 	 * (a straggler that already started runs its GET on the poll fallback — harmless). */
 	cancel_work_sync(&c->notify_work);
+	cancel_delayed_work_sync(&c->follow_work);	/* notify_work may have queued one */
 	/* Last, because notify_work is what re-arms it: the debounced hwdep relay wake. c is freed
 	 * the moment this returns to snd_card_free, and a live timer into freed memory would panic
 	 * the host on a surprise removal (device powered off). */
@@ -1677,6 +1713,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	INIT_WORK(&c->notify_work, clarett_notify_work);
 	INIT_DELAYED_WORK(&c->save_work, clarett_save_work);
 	INIT_DELAYED_WORK(&c->meter_work, clarett_meter_work);
+	INIT_DELAYED_WORK(&c->follow_work, clarett_follow_work);
 	atomic_set(&c->notify_bits, 0);
 	atomic_set(&c->cmd_inflight, 0);
 	atomic_set(&c->mbox_phase, 0);
@@ -1888,6 +1925,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	err = 0;
 
 	WRITE_ONCE(c->ctl_ready, true);	/* controls exist; the ISR notify path may fire */
+	clarett_schedule_follow(c);	/* sync the stored SW gains of HW outputs to the knob */
 
 	/* PCM. Owns the engine, so it excludes stream_probe. Every model uses the per-direction
 	 * descriptor path (geometry derived from channel counts), so no per-model gate is needed. */
@@ -2007,6 +2045,7 @@ static void clarett_remove(struct pci_dev *pci)
 	 */
 	WRITE_ONCE(c->ctl_ready, false);	/* no new notify work from the ISR */
 	cancel_delayed_work_sync(&c->meter_work);
+	cancel_delayed_work_sync(&c->follow_work);
 	clarett_engine_stop(c);
 
 	/* Blocks: disconnect → wait for the last userspace handle to close (the final
@@ -2036,6 +2075,7 @@ static void clarett_shutdown(struct pci_dev *pci)
 		return;
 	c = card->private_data;
 	cancel_delayed_work_sync(&c->meter_work);
+	cancel_delayed_work_sync(&c->follow_work);
 	clarett_hwdep_free(c);		/* no-op unless the hwdep path armed the relay */
 	/* Persist a just-made change before the reboot tears the device down (mailbox still up). */
 	if (cancel_delayed_work_sync(&c->save_work))
