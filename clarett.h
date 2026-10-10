@@ -466,14 +466,6 @@ struct clarett_model {
 #define FCP_RESP_ERR_OK          0x00
 
 #define CLARETT_MBOX_TIMEOUT_MS  100
-/*
- * Interval between readiness attempts. A device caught mid-wake does not latch the pre-mailbox init,
- * and nothing done afterwards over the mailbox recovers it; what does is a long stretch left completely
- * alone followed by a fresh init. So each retry waits this long untouched, replays the init and asks
- * once. Neither half works alone: re-asking without re-initialising fails at any spacing, and
- * re-initialising every few seconds fails too.
- */
-#define CLARETT_READY_RETRY_MS		30000u
 #define CLARETT_MAX_PAYLOAD      64      /* clarett_set_data single-write cap (small configs) */
 #define CLARETT_MBOX_DATA_MAX    1024    /* mailbox data region past MBOX_DATA; SET_MUX = 412 */
 #define CLARETT_CONFIG_SIZE      256     /* shadow of the device config/app space       */
@@ -552,8 +544,8 @@ struct clarett {
 	 * acking an unlanded response makes the device refuse the session — leaving the device
 	 * holding that command unretired and answering it in place of every later one, which is exactly
 	 * what a stale echoed seq means. clarett_fcp() cannot report this through its return value
-	 * without turning a response-less-but-successful SET into a failure, so the readiness poll reads
-	 * it here when deciding how to report a device that never became ready.
+	 * without turning a response-less-but-successful SET into a failure, so probe reads it here when
+	 * deciding how to report a device that never became ready.
 	 */
 	bool mbox_wedged;
 	/*

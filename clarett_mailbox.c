@@ -339,7 +339,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	}
 
 	/*
-	 * Wedge detection, for the readiness poll. No response at all, or one echoing a sequence number
+	 * Wedge detection, for probe's report of a device that never became ready. No response at all, or one echoing a sequence number
 	 * that is not ours, both mean the device is still answering an earlier unretired command.
 	 */
 	if (!resp_echo) {
