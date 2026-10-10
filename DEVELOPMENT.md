@@ -109,18 +109,21 @@ mixer untouched.
 
 Probe sequence:
 
-1. **Settle.** `settle_ms` (default 3 s) leaves a freshly attached device completely untouched. A
-   first mailbox command issued too early wedges the mailbox until the unit is power-cycled. How
-   early is too early varies: a Red 8Line answers with no wait at all, while a Clarett 8Pre has
-   answered 656 ms after the PCI enable on one power-up and refused at 1000 ms on another. No
-   register shows when the device becomes ready, so the wait is fixed, with margin.
+1. **Ask, and retransmit until answered.** A freshly powered unit can lose its first mailbox
+   command: DONE is raised but no response arrives, and the device keeps expecting that command's
+   sequence number, refusing anything sent with a later one. Re-sending with the **same** number is
+   answered, so the mailbox never advances the sequence number past an unanswered command, and
+   probe re-asks every `ready_retry_ms` (250 ms) until the device answers or `ready_timeout_ms`
+   (10 s) runs out. A Red 8Line answers the first attempt (~25 ms after the PCI enable); a Clarett
+   8Pre loses its first and answers the retransmission (~380 ms). No register shows when the
+   device becomes ready, which is why probe asks rather than waits.
 2. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, config space, the firmware-info header and even the serial are the same across the
    line — but the session reports the model's stream geometry: `GET_7.1{band 0}` answers
    `{u16 playback_channels, u16 capture_channels}`, a pair unique per model.
-3. **No retry.** If the first command is refused, probe fails at once: a wedged unit does not
-   recover by waiting or by a fresh init, only by a power cycle, and holding the device would also
-   delay the hotplug removal and re-attach that a power cycle triggers.
+3. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
+   message to power-cycle it. The budget is kept short because a removal of the device (the user
+   power-cycling it) waits for its probe to finish.
 
 **Detection is the only path — there is no override.** If the device never answers, or answers
 with a geometry no `clarett_model` claims, probe **fails with `-ENODEV` and registers no card**,
@@ -275,8 +278,9 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `monitor_poll` (default on) — the change-detecting monitor-region poll.
 - `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
 - `monitor_enables` (default on) — the probe-time Monitor Out 1-2 mute/dim enables.
-- `settle_ms` (default 3000, runtime-writable) — the probe settle window described above.
-  `settle_ms=0` skips the wait when the device is known to have been up and untouched.
+- `ready_retry_ms` (default 250), `ready_timeout_ms` (default 10000), `settle_ms` (default 0) —
+  all runtime-writable: the probe's retransmission interval and budget described above, and an
+  optional quiet period before the first command.
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
 
 The rest (`stream_probe`, `error_probe`, `seed_dump`, `resp_trace`, `tx_trace`, the fragment-padding

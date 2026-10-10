@@ -389,12 +389,34 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		}
 	}
 
-	c->seq++;
+	/*
+	 * Advance the sequence number only for a command the device answered as ours. One whose response
+	 * never landed (or that drew another command's answer) was not taken: the device still expects
+	 * this number, refuses every later one (err=3, stale echoed seq), and accepts the same number
+	 * again once it is ready. So the next command reuses the number. Measured on a Clarett asked too
+	 * early after power-up: re-asking with the next number stays refused indefinitely; re-sending the
+	 * same command with the same number answers. (A different command reusing the number, as after
+	 * a response lost mid-session, has not been tested.)
+	 */
+	if (resp_echo && !c->mbox_wedged)
+		c->seq++;
 
 	atomic_set(&c->cmd_inflight, 0);	/* completion window closed; idle-gap events may resume */
 
 	mutex_unlock(&c->mbox_lock);
 	return ret;
+}
+
+/* Read-to-clear the cause blocks between probe's readiness attempts, so each starts from a clean slate. */
+void clarett_mbox_clear_causes(struct clarett *c)
+{
+	static const u16 causes[] = { REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0, REG_NOTIFY_CAUSE, 0x500 };
+	int i;
+
+	mutex_lock(&c->mbox_lock);
+	for (i = 0; i < ARRAY_SIZE(causes); i++)
+		clarett_rl(c, causes[i]);
+	mutex_unlock(&c->mbox_lock);
 }
 
 int clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len)

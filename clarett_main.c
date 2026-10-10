@@ -59,37 +59,43 @@ MODULE_PARM_DESC(tx_trace,
  * default. Probe waits for the flash-persisted session to answer (clarett_detect_model) and detects the
  * model from it, arming nothing.
  *
- * If the device refuses its first command, probe does NOT fall back to a placeholder, which would pass
- * a not-ready device off as a working card. It fails loudly; power-cycle the unit to retry.
+ * If the device never answers within ready_timeout_ms, probe does NOT fall back to a placeholder, which
+ * would pass a not-ready device off as a working card. It fails loudly; power-cycle the unit to retry.
  */
 
 /*
- * Leave the device untouched for this long after attach, before the pre-mailbox init.
+ * Probe readiness. A freshly powered unit cannot answer its first mailbox commands straight away, and
+ * how long it needs varies by model and by power-up:
+ * - The Red 8Line answers at once, both on attach and on a rebind.
+ * - A Clarett brings its link up twice at power-up (~1.5 s apart) and is enabled just after the second;
+ *   its first answer has come anywhere from ~0.65 s to over 1 s after the enable on an 8Pre.
+ * - No register shows when the device becomes ready: every pre-mailbox register reads its final value
+ *   from the first read after the enable.
  *
- * Measured on attach after a power cycle, timed from the PCI enable:
- * - The Red 8Line needs no wait: it answered its first command with none, on attach and on a rebind.
- * - A Clarett appears on Thunderbolt twice at power-up, ~1.8 s apart, and is enabled just after the
- *   second appearance. When it can first answer varies from one power-up to the next: on an 8Pre a
- *   first touch has passed at 656 ms and failed at 1000 ms (1 of 5 there), and at 3 s it has not
- *   failed without other activity. So this is margin over a spread, not a threshold.
- * - No register shows readiness: the caps word, serial, firmware header and mailbox words all read
- *   their final values from the first read after the enable, long before the mailbox can answer.
- *
- * When a first command does fail, the command completes (DONE raised) but never DMAs a response, so the trailing ack
- * is withheld (acking an unlanded response makes the device refuse the session), and the device is left
- * holding that command unretired, answering it in place of every later one (stale rseq, err=3). Nothing
- * over the mailbox recovers that, and neither does leaving it alone (minutes, with a fresh pre-mailbox
- * init every 30 s): only a power cycle does. Hence a don't-touch window rather than a retry.
- *
- * Every probe pays it, including a reload or sysfs rebind, which need it less (a rebind of a unit that
- * has been up for a while answered at once on the Red), but which cannot be told apart from an attach.
+ * A command sent too early completes (DONE raised) but never DMAs a response, and the device keeps
+ * expecting that command's sequence number: anything sent with a later one is refused (err=3, stale
+ * echoed seq). Re-sending with the SAME sequence number once the device is ready is answered normally,
+ * which is why the mailbox does not advance the number past an unanswered command (clarett_mailbox.c).
+ * So probe asks at once and, while the device is not ready, re-asks every ready_retry_ms until it
+ * answers or ready_timeout_ms runs out. settle_ms is an optional quiet period before the first ask.
  */
-static unsigned int settle_ms = 3000;
+static unsigned int settle_ms;
 module_param(settle_ms, uint, 0644);
 MODULE_PARM_DESC(settle_ms,
-		 "Leave the device untouched for this long (ms) after attach before the first init "
-		 "(default 3000). Touching a freshly attached device too early can wedge its mailbox until "
-		 "it is power-cycled. 0 disables the wait.");
+		 "Leave the device untouched for this long (ms) after attach before the first command "
+		 "(default 0: ask at once and retry).");
+
+static unsigned int ready_retry_ms = 250;
+module_param(ready_retry_ms, uint, 0644);
+MODULE_PARM_DESC(ready_retry_ms,
+		 "Interval (ms) between readiness attempts at probe while the device is not ready yet "
+		 "(default 250).");
+
+static unsigned int ready_timeout_ms = 10000;
+module_param(ready_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(ready_timeout_ms,
+		 "Give up on a device that has not answered by this long (ms) after the first attempt "
+		 "(default 10000).");
 
 /*
  * RX fragment slot stride. A fragment that straddles a 4 KB page is mis-framed by the device's DMA: with
@@ -1667,7 +1673,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	clarett_setup_irq(c);
 
 	if (settle_ms)
-		msleep(settle_ms);	/* cold attach: do not touch the device before it can answer */
+		msleep(settle_ms);	/* optional quiet period; readiness is handled by the retry below */
 	clarett_hw_init(c);
 
 	/*
@@ -1678,15 +1684,29 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	{
 		bool collapsed = false;
 		const struct clarett_model *det;
+		unsigned long deadline = jiffies + msecs_to_jiffies(ready_timeout_ms);
+		int tries = 0;
 
 		/*
-		 * One attempt, logged (a refusal's status/size, or an unmatched device's raw geometry). A
-		 * device that refuses its first command stays wedged until it is power-cycled: retrying,
-		 * waiting, and replaying the init after 30 s untouched have all failed to recover one. So
-		 * fail at once and let the device go. Holding it would also hold back the hotplug removal
-		 * when the user power-cycles it, and with it the re-attach that would work.
+		 * Ask until the device answers. An attempt it was not ready for leaves its sequence number
+		 * unconsumed, so the next attempt is a retransmission of the same command (see the note
+		 * above settle_ms). Quiet while retrying; the last attempt is re-run with logging below.
+		 * The budget is kept short: while probe holds the device, a removal of it (the user
+		 * power-cycling a unit that will not answer) waits too.
 		 */
-		det = clarett_detect_model(c, &collapsed, false);
+		for (;;) {
+			tries++;
+			det = clarett_detect_model(c, &collapsed, true);
+			if (det || !collapsed || time_after(jiffies, deadline))
+				break;
+			msleep(ready_retry_ms);
+			clarett_mbox_clear_causes(c);
+		}
+		if (tries > 1)
+			dev_dbg(&pci->dev, "readiness: answered on attempt %d\n", tries);
+		/* One logged pass on any failure: a refusal's status/size, or an unmatched geometry. */
+		if (!det)
+			det = clarett_detect_model(c, &collapsed, false);
 
 		if (collapsed) {
 			/*
@@ -1694,9 +1714,9 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 			 * device off as a working card. Fail the probe loudly so it gets attention.
 			 */
 			dev_err(&pci->dev,
-				"device did not become ready (mailbox %s) — refusing to register. It was asked "
-				"before it could answer and stays wedged until it is power-cycled; power-cycle "
-				"the unit to retry.\n",
+				"device did not become ready within %u ms over %d attempts (mailbox %s) — refusing "
+				"to register; power-cycle the unit to retry.\n",
+				ready_timeout_ms, tries,
 				c->mbox_wedged ? "wedged: no response, or one echoing another command's seq"
 					       : "answering, but refusing the request");
 			err = -ENODEV;
@@ -2425,9 +2445,9 @@ MODULE_DEVICE_TABLE(pci, clarett_ids);
 static struct pci_driver clarett_driver = {
 	.name = KBUILD_MODNAME,
 	/*
-	 * Probe sleeps settle_ms before touching the device. Asynchronous so that sleep runs on its own
-	 * worker, not in line with every other driver's probe. (A removal of this device still waits for
-	 * its probe to finish, which is one reason probe does not retry.)
+	 * Probe can spend up to ready_timeout_ms waiting for a device to become ready. Asynchronous so
+	 * that wait runs on its own worker, not in line with every other driver's probe. (A removal of
+	 * this device still waits for its probe to finish, which is why the budget is short.)
 	 */
 	.driver = { .probe_type = PROBE_PREFER_ASYNCHRONOUS },
 	.id_table = clarett_ids,

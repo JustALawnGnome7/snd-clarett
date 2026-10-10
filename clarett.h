@@ -947,6 +947,7 @@ static inline size_t clarett_stream_total_bytes(const struct clarett *c)
 
 /* mailbox.c */
 int clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len);
+void clarett_mbox_clear_causes(struct clarett *c);
 int clarett_fcp_cmd(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
 		    u8 *resp, u16 resp_len);
 

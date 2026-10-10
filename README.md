@@ -247,10 +247,9 @@ sudo rm /var/lib/alsa/asound.state
 - **Preamp Mode/Air can read wrong right after a cold boot.** The hardware is correct (the
   front-panel LEDs are right); only the on-screen value lags until you touch a control.
 - **No per-output mute** — the hardware has none, only the master Mute/Dim.
-- **Rarely, no card appears right after a cold Thunderbolt attach.** The driver waits for the
-  interface to come up and refuses to register if it never answers (it logs *"device did not
-  become ready"*). Reload the module once the interface has settled
-  (`sudo make unload && sudo make load`).
+- **Rarely, no card appears after a Thunderbolt attach.** The driver keeps asking the interface for
+  up to 10 seconds and refuses to register if it never answers (it logs *"device did not become
+  ready"*). Power-cycle the interface to retry.
 
 ## How it works / contributing
 
