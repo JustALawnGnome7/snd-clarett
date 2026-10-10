@@ -1278,8 +1278,9 @@ static void clarett_notify_work(struct work_struct *work)
 /*
  * Monitor-region change poll: read the monitor region at the meter rate and relay only when the bytes
  * actually CHANGE. It predates the event-bit relay, which now carries the knob and Dim/Mute idle and
- * while streaming, and hw_gain_follow, which now runs on those events (clarett_schedule_follow); it
- * stays as a backstop for front-panel changes that raise no event. Cost is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
+ * while streaming, and hw_gain_follow, which now runs on those events (clarett_schedule_follow). Off
+ * by default: every front-panel control tried on a Clarett and on a Red is followed without it. Kept
+ * as a backstop for a change that raises no event. Cost when on is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
  * the unit relays nothing at all. The Clarett region (24, len 92) covers the monitor mute/dim flags,
  * the master volume pair at 32/33, the HW-enable bits and the knob; a model can widen it
  * (clarett_model.monitor_cfg_len) to reach its other front-panel controls.
@@ -1288,11 +1289,11 @@ static void clarett_notify_work(struct work_struct *work)
  * relay is live outside a stream but is not known to fire for every front-panel control, and
  * clarett_hw_gain_follow() hangs off the same change detection and has to track the knob at all times.
  */
-static bool monitor_poll = true;
+static bool monitor_poll;
 module_param(monitor_poll, bool, 0644);
 MODULE_PARM_DESC(monitor_poll,
 		 "Poll the monitor config region and act when it changes: relay a notification and "
-		 "drive hw_gain_follow. A backstop for changes that raise no device event (default on).");
+		 "drive hw_gain_follow. A backstop for changes that raise no device event (default off).");
 
 /*
  * Keep the SW gain of every output under HARDWARE control equal to the front-panel knob.
@@ -1528,7 +1529,7 @@ static void clarett_meter_work(struct work_struct *work)
 			clarett_fcp(c, FCP_GET_METER, meter_req, sizeof(meter_req));
 		}
 
-		/* Runs streaming or not — hw_gain_follow has to track the knob at all times. */
+		/* The optional backstop poll (monitor_poll), streaming or not. */
 		if (monitor_poll && READ_ONCE(c->ctl_ready))
 			clarett_monitor_poll(c);
 

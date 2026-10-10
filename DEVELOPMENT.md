@@ -68,8 +68,9 @@ period (`0x300`) events.
   a rate limit (one interval after the *first* event of a burst), not a debounce, which against a
   control being moved continuously would never fire.
 - **The relay runs while streaming too.** An audio period raises no event bit, so a stream adds no
-  relays. `monitor_poll` reads the monitor region (`GET_DATA(24, 92)`) at the meter rate and relays
-  **only when the bytes change**, as a backstop for front-panel changes that raise no event.
+  relays. `monitor_poll` (off by default) reads the monitor region (`GET_DATA(24, 92)`) at the meter
+  rate and relays **only when the bytes change**, as a backstop for a front-panel change that raises
+  no event; none has been found.
 - **`hw_gain_follow` runs on events:** a relayed monitor or dim/mute event, the card coming up, and
   `fcp-server` committing a SW/HW switch (which the device does not announce).
 
@@ -282,7 +283,7 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `max_buffer` — optional hard ceiling on the ALSA buffer, in frames (`0`, the default, leaves it to
   the per-period rule).
 - `notify_ms` (default 50) — rate limit for the notification relay.
-- `monitor_poll` (default on) — the change-detecting monitor-region poll.
+- `monitor_poll` (default off) — the change-detecting monitor-region poll (a backstop).
 - `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
 - `monitor_enables` (default on) — the probe-time Monitor Out 1-2 mute/dim enables.
 - `addr_ack_ms` (default 500), `ready_resp_ms` (default 20), `ready_retry_ms` (default 0),
