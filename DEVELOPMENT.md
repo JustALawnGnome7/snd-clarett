@@ -112,10 +112,12 @@ Probe sequence:
 1. **Ask, and retransmit until answered.** A freshly powered unit can lose its first mailbox
    command: DONE is raised but no response arrives, and the device then refuses anything sent as the
    next sequence number. Asking again as **sequence number 0** is answered, so after an unanswered
-   command the mailbox starts the sequence over at 0, and probe re-asks every `ready_retry_ms` (250 ms) until the device answers or `ready_timeout_ms`
-   (10 s) runs out. A Red 8Line answers the first attempt (~25 ms after the PCI enable); a Clarett
-   8Pre loses its first and answers the retransmission (~380 ms). No register shows when the
-   device becomes ready, which is why probe asks rather than waits.
+   command the mailbox starts the sequence over at 0, and probe re-asks until the device answers or
+   `ready_timeout_ms` (10 s) runs out. Each attempt waits `ready_resp_ms` (20 ms) for its response
+   instead of the mailbox's usual 100 ms, because a response that lands at all lands within a
+   millisecond. A Red 8Line and a Clarett 4Pre answer the first attempt; a Clarett 8Pre or 8PreX
+   loses its first and answers the next one. No register shows when the device becomes ready, which
+   is why probe asks rather than waits.
 2. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, config space, the firmware-info header and even the serial are the same across the
    line — but the session reports the model's stream geometry: `GET_7.1{band 0}` answers
@@ -277,9 +279,10 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `monitor_poll` (default on) — the change-detecting monitor-region poll.
 - `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
 - `monitor_enables` (default on) — the probe-time Monitor Out 1-2 mute/dim enables.
-- `ready_retry_ms` (default 250), `ready_timeout_ms` (default 10000), `settle_ms` (default 0) —
-  all runtime-writable: the probe's retransmission interval and budget described above, and an
-  optional quiet period before the first command.
+- `ready_resp_ms` (default 20), `ready_retry_ms` (default 0), `ready_timeout_ms` (default 10000),
+  `settle_ms` (default 0) — all runtime-writable: how long each probe attempt waits for its
+  response, an extra pause between attempts, the budget described above, and an optional quiet
+  period before the first command.
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
 
 The rest (`stream_probe`, `error_probe`, `seed_dump`, `resp_trace`, `tx_trace`, the fragment-padding

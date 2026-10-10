@@ -96,7 +96,8 @@ static inline bool clarett_stream_cause(const struct clarett *c, u16 reg)
 static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit, s64 *land_us)
 {
 	const u8 *r = c->resp_buf;
-	unsigned long deadline = jiffies + msecs_to_jiffies(max(resp_timeout_ms, 1u));
+	unsigned int ms = c->resp_deadline_ms ? c->resp_deadline_ms : resp_timeout_ms;
+	unsigned long deadline = jiffies + msecs_to_jiffies(max(ms, 1u));
 	ktime_t spin_until = ktime_add_us(ktime_get(), 500);
 	u32 echo;
 

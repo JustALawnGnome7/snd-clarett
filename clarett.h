@@ -510,6 +510,7 @@ struct clarett {
 
 	struct mutex mbox_lock;		/* serialises FCP transactions */
 	u16 seq;
+	unsigned int resp_deadline_ms;	/* response deadline override while probe asks; 0 = resp_timeout_ms */
 
 	void *resp_buf;			/* coherent GET-response DMA buffer */
 	dma_addr_t resp_dma;
