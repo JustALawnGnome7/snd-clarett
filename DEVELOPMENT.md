@@ -131,7 +131,7 @@ Probe sequence:
    a millisecond.
 3. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, config space, the firmware-info header and even the serial are the same across the
-   line — but the session reports the model's stream geometry: `GET_7.1{band 0}` answers
+   line — but the session reports the model's stream geometry: `STREAM_INFO{band 0}` answers
    `{u16 playback_channels, u16 capture_channels}`, a pair unique per model.
 4. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
    message to power-cycle it. The budget is kept short because a removal of the device (the user

@@ -182,7 +182,7 @@ static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, cla
  * regs, config space, the fw-info header, even the dummy serial), and the Thunderbolt DROM's model
  * name is not reliably visible either (whether a Thunderbolt 2 unit is enumerated as a kernel-managed
  * Thunderbolt device depends on the host firmware). But the device reports its own stream geometry:
- * GET_7.1{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per model.
+ * STREAM_INFO{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per model.
  *
  * Everything downstream is sized from c->model: channel counts, DMA ring and descriptor geometry,
  * fragment strides, routing and mixer tables, meter layout, the fcp-server map slug. A wrong model
@@ -235,7 +235,7 @@ static int clarett_unit_tb_gen(struct pci_dev *pdev)
 }
 
 /*
- * Ask the device who it is: GET_7.1{band 0} returns {u16 playback_ch, u16 capture_ch}
+ * Ask the device who it is: STREAM_INFO{band 0} returns {u16 playback_ch, u16 capture_ch}
  * (+16 more bytes, meaning open), a pair unique per model. Runs before the meter heartbeat
  * starts, so nothing else touches resp_buf between the (landed-gated) completion and the parse.
  * Returns NULL if the query fails or the pair matches no known model.
@@ -267,11 +267,11 @@ static const struct clarett_model *clarett_detect_model(struct clarett *c, bool 
 	 * model pins the cause (transport vs. status vs. unmatched) in one line and surfaces the
 	 * actual pair to add to the table.
 	 */
-	err = clarett_fcp(c, FCP_GET_71, &band0, 1);
+	err = clarett_fcp(c, FCP_STREAM_INFO, &band0, 1);
 	if (err) {
 		if (!quiet)
 			dev_warn(&c->pci->dev,
-				 "model auto-detect: GET_7.1 transport failed (%d)\n", err);
+				 "model auto-detect: STREAM_INFO transport failed (%d)\n", err);
 		*collapsed = true;	/* GET didn't complete at all — the path is dead */
 		return NULL;
 	}
@@ -283,7 +283,7 @@ static const struct clarett_model *clarett_detect_model(struct clarett *c, bool 
 	if (status != FCP_RESP_ERR_OK || size < 4) {
 		if (!quiet)
 			dev_warn(&c->pci->dev,
-				 "model auto-detect: GET_7.1 bad response (status=%u size=%u raw playback=%u capture=%u)\n",
+				 "model auto-detect: STREAM_INFO bad response (status=%u size=%u raw playback=%u capture=%u)\n",
 				 status, size, pb, cap);
 		*collapsed = true;	/* GET refused (status=3/size=0) */
 		return NULL;
@@ -410,10 +410,10 @@ static void clarett_error_probe(struct clarett *c)
 		{ "GET_DATA bad-offset",      FCP_GET_DATA, { 0,0,0xff,0xff, 4,0,0,0 }, 8 },
 		{ "unknown opcode 0x0000ff",  0x0000ff,     { 0 }, 0 },
 		/* Queries that answer with real data on a working session: READ_SEG (segment open),
-		 * GET_7/GET_6 device queries, CONFIG_PUSH{id} (a per-id name query: 0x1e -> "ADAT 8"),
+		 * STREAM_INFO/GET_6 device queries, 0x005000{id} (a per-id name query: 0x1e -> "ADAT 8"),
 		 * and GET_DATA{0xc8} in the persistent appspace. */
 		{ "READ_SEG{0,8}",            FCP_READ_SEG, { 0,0,0,0,  8,0,0,0 }, 8 },
-		{ "GET_7.1{0}",               0x007001,     { 0 }, 1 },
+		{ "STREAM_INFO{0}",           FCP_STREAM_INFO, { 0 }, 1 },
 		{ "GET_6.2",                  0x006002,     { 0 }, 0 },
 		{ "CONFIG_PUSH{0x1e}",        0x005000,     { 0x1e, 0 }, 2 },
 		{ "GET_DATA{0xc8,8}",         FCP_GET_DATA, { 0xc8,0,0,0, 8,0,0,0 }, 8 },
@@ -2414,7 +2414,7 @@ static const struct clarett_model red_16line = {
  * Focusrite Red 4Pre and Red 8Pre — NOT YET SEEN ON HARDWARE; everything here comes from their device
  * descriptors. Each is its Line model's twin: the same stream geometry, S/MUX tails, clock sources,
  * knob groups and config layout, with preamps on more of its inputs (a control-plane difference the
- * fcp-server maps carry, not the driver). They share their twin's GET_7.1 pair, so they are told
+ * fcp-server maps carry, not the driver). They share their twin's STREAM_INFO pair, so they are told
  * apart by the unit's own Thunderbolt controller: the Pre models are Thunderbolt 2 units, the Line
  * models Thunderbolt 3 (clarett_unit_tb_gen()).
  */
