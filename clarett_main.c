@@ -422,7 +422,7 @@ static void clarett_hw_init(struct clarett *c)
 			u32 c100 = readl(bar + REG_IRQ0_CAUSE);
 			u32 c300 = readl(bar + STREAM_BLK1);
 			u32 c200 = readl(bar + STREAM_BLK0);
-			u32 c400 = readl(bar + REG_NOTIFY_CAUSE);
+			u32 c400 = c->irq_ready ? 0 : readl(bar + REG_NOTIFY_CAUSE);	/* the ISR's when MSI is up */
 			u32 c500 = readl(bar + 0x500);
 
 			dev_dbg(&c->pci->dev,
@@ -757,10 +757,8 @@ static int clarett_stream_service(void *data)
 			readl(bar + REG_IRQ0_CAUSE);	/* 0x100 per-period cause (bit31) + mailbox DONE */
 		c2 = readl(bar + STREAM_BLK1);		/* 0x300 read-to-clear = period event + counter (owned) */
 		readl(bar + STREAM_BLK0);		/* 0x200 TX cause (owned) */
-		if (!busy) {
-			readl(bar + REG_NOTIFY_CAUSE);	/* 0x400 command-phase/notify — mailbox's during a command */
-			readl(bar + 0x500);		/* 0x500 IRQ summary */
-		}
+		if (!busy)
+			readl(bar + 0x500);		/* 0x500 IRQ summary (0x400 belongs to the vec0 ISR) */
 		{
 			u64 rus = ktime_us_delta(ktime_get(), rt0);
 
@@ -1203,23 +1201,30 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 	if (ic->idx == CLARETT_VEC_EVENT) {
 		bool inflight = atomic_read(&c->cmd_inflight);
 
-		/* Default mailbox cycle: a vec0 MSI during a command IS the completion signal. Read
-		 * the mailbox cause here (the sweep's first, MSI-paced 0x100 read) and hand the rest
-		 * of the sweep to the waiting clarett_fcp. An in-command MSI without DONE (e.g. a
-		 * notification) is left to the waiter's timeout/poll fallback. */
-		if (inflight) {
-			u32 cause = readl(c->bar0 + REG_IRQ0_CAUSE);	/* read-to-clear */
+		/*
+		 * This handler is the only reader of 0x400 (read-to-clear): once per vec0 MSI, in or out of
+		 * a command. A second reader takes bits this one needs — the stream servicer used to read
+		 * and discard it at ~6.6 kHz, eating front-panel events mid-stream. The phase bits are
+		 * recorded for the command in flight; the event bits go to the relay either way.
+		 */
+		/*
+		 * 0x100 FIRST when a command is in flight: its DONE bit (bit29) reflects "0x400 has bits
+		 * pending", so reading 0x400 first clears what DONE reports and the command times out.
+		 * Default mailbox cycle: a vec0 MSI during a command IS the completion signal, so the
+		 * mailbox cause is read here (the sweep's first, MSI-paced 0x100 read) and the rest of the
+		 * sweep is left to the waiting clarett_fcp.
+		 */
+		u32 done = inflight ? readl(c->bar0 + REG_IRQ0_CAUSE) : 0;	/* read-to-clear */
+		u32 cause = readl(c->bar0 + REG_NOTIFY_CAUSE);
+		u32 ev = cause & NOTIFY_EVENT_MASK;
 
-			if (cause & IRQ_DONE_BIT) {
-				c->mbox_cause = cause;
+		if (inflight) {
+			atomic_or(cause & NOTIFY_PHASE_MASK, &c->mbox_phase);
+			if (done & IRQ_DONE_BIT) {
+				c->mbox_cause = done;
 				complete(&c->mbox_done);
 			}
-			return IRQ_HANDLED;
 		}
-
-		{
-		u32 cause = readl(c->bar0 + REG_NOTIFY_CAUSE);	/* 0x400, read-to-clear */
-		u32 ev = cause & NOTIFY_EVENT_MASK;
 
 		/* Init is waiting for the response-address acknowledgement (addr_ack_ms). */
 		if (READ_ONCE(c->addr_ack_wait) && (cause & NOTIFY_REQ_ACCEPTED)) {
@@ -1242,7 +1247,6 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 		    (!READ_ONCE(c->stream_on) || READ_ONCE(notify_while_streaming))) {
 			atomic_or(ev, &c->notify_bits);
 			schedule_work(&c->notify_work);
-		}
 		}
 	} else if (ic->idx == 1 || ic->idx == 2) {	/* data-plane period IRQs (probe) */
 		readl(c->bar0 + (ic->idx == 1 ? STREAM_BLK0 : STREAM_BLK1));   /* read-to-clear/observe */
@@ -1669,6 +1673,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	INIT_DELAYED_WORK(&c->meter_work, clarett_meter_work);
 	atomic_set(&c->notify_bits, 0);
 	atomic_set(&c->cmd_inflight, 0);
+	atomic_set(&c->mbox_phase, 0);
 	INIT_DELAYED_WORK(&c->stream_report, clarett_stream_report);
 	atomic_set(&c->period_irqs[1], 0);
 	atomic_set(&c->period_irqs[2], 0);

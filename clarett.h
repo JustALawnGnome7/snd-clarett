@@ -561,6 +561,12 @@ struct clarett {
 	bool addr_ack_wait;			/* the ISR completes addr_acked on 0x400 bit0 */
 	u32 mbox_cause;				/* 0x100 value the ISR consumed with DONE set */
 	/*
+	 * 0x400 command-phase bits (NOTIFY_PHASE_MASK) the vec0 ISR read while the current command was in
+	 * flight. The ISR is the only reader of 0x400 when MSI is up, since it is read-to-clear; this is
+	 * where the mailbox learns what it saw.
+	 */
+	atomic_t mbox_phase;
+	/*
 	 * Is the mailbox wedged? Set when the last command either produced no response DMA at all, or
 	 * produced one echoing a sequence number that is not the one we sent. Both are the same fault:
 	 * a command whose response never landed has its trailing ack withheld — as it must be, since

@@ -86,6 +86,13 @@ static inline bool clarett_stream_cause(const struct clarett *c, u16 reg)
 	return c->stream_on && (reg == STREAM_BLK0 || reg == STREAM_BLK1);
 }
 
+/* Cause blocks the mailbox sweep leaves alone: the stream blocks while streaming, and 0x400 whenever
+ * the vec0 ISR is up, which is then its only reader (the ISR records the phase bits in mbox_phase). */
+static inline bool clarett_skip_cause(const struct clarett *c, u16 reg)
+{
+	return clarett_stream_cause(c, reg) || (reg == REG_NOTIFY_CAUSE && c->irq_ready);
+}
+
 /*
  * Wait for THIS command's response to land in resp_buf. Returns the matched echo word
  * (CMD_EXEC_FLAG | opcode — never zero), or 0 if nothing landed before the deadline;
@@ -220,6 +227,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	 * mbox_done). Held until just before mutex_unlock so it still covers a completion MSI
 	 * delivered after the poll below observes DONE. */
 	reinit_completion(&c->mbox_done);
+	atomic_set(&c->mbox_phase, 0);
 	atomic_set(&c->cmd_inflight, 1);
 
 	t_submit = ktime_get();
@@ -279,10 +287,10 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 			 * stream blocks are irrelevant to it. clarett_stream_cause() flags the two to skip.
 			 */
 			for (s = 1; s < ARRAY_SIZE(sweep); s++)
-				if (!clarett_stream_cause(c, sweep[s]))
+				if (!clarett_skip_cause(c, sweep[s]))
 					clarett_rl(c, sweep[s]);	/* rest of the DONE sweep */
 			for (s = 0; s < ARRAY_SIZE(sweep); s++)
-				if (!clarett_stream_cause(c, sweep[s]))
+				if (!clarett_skip_cause(c, sweep[s]))
 					clarett_rl(c, sweep[s]);	/* confirming full sweep */
 			resp_echo = clarett_resp_wait(c, CMD_EXEC_FLAG | opcode,
 						      t_submit, &land_us);
@@ -313,8 +321,9 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	/* Per-transaction trace. dev_dbg (not dev_info): the GET_METER heartbeat runs at ~24 Hz, so
 	 * info-level here would flood the log. Enable via dynamic debug when diagnosing the mailbox. */
 	dev_dbg(&c->pci->dev,
-		"FCP op=0x%06x seq=%u first_cause=0x%08x polls=%d done=%d status=0x%08x\n",
-		opcode, c->seq, first_cause, polls, !!(cause & IRQ_DONE_BIT), fcp_status);
+		"FCP op=0x%06x seq=%u first_cause=0x%08x polls=%d done=%d phase=0x%x status=0x%08x\n",
+		opcode, c->seq, first_cause, polls, !!(cause & IRQ_DONE_BIT),
+		atomic_read(&c->mbox_phase), fcp_status);
 
 	if (resp_trace) {
 		const u8 *r = c->resp_buf;
@@ -323,10 +332,10 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 			u32 size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 
 			dev_info(&c->pci->dev,
-				 "FCPr op=0x%06x seq=%u done=%lldus resp=%lldus rseq=%u err=%u size=%u\n",
+				 "FCPr op=0x%06x seq=%u done=%lldus resp=%lldus rseq=%u err=%u size=%u phase=0x%x\n",
 				 opcode, c->seq, done_us, land_us,
 				 r[FCP_RESP_SEQ_OFF] | r[FCP_RESP_SEQ_OFF + 1] << 8,
-				 r[FCP_RESP_STATUS_OFF], size);
+				 r[FCP_RESP_STATUS_OFF], size, atomic_read(&c->mbox_phase));
 			/* Payload head for every answered non-meter command; 32 bytes shows counts
 			 * and ids. GET_METER is excluded (24 Hz). */
 			if (size && opcode != FCP_GET_METER)
@@ -335,8 +344,8 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		}
 		else
 			dev_info(&c->pci->dev,
-				 "FCPr op=0x%06x seq=%u done=%lldus resp=NONE (ack withheld)\n",
-				 opcode, c->seq, done_us);
+				 "FCPr op=0x%06x seq=%u done=%lldus resp=NONE (ack withheld) phase=0x%x\n",
+				 opcode, c->seq, done_us, atomic_read(&c->mbox_phase));
 	}
 
 	/*
@@ -417,7 +426,8 @@ void clarett_mbox_clear_causes(struct clarett *c)
 
 	mutex_lock(&c->mbox_lock);
 	for (i = 0; i < ARRAY_SIZE(causes); i++)
-		clarett_rl(c, causes[i]);
+		if (!clarett_skip_cause(c, causes[i]))
+			clarett_rl(c, causes[i]);
 	mutex_unlock(&c->mbox_lock);
 }
 
