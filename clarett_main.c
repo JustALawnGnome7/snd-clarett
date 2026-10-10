@@ -100,26 +100,6 @@ MODULE_PARM_DESC(ready_timeout_ms,
 		 "(default 10000).");
 
 /*
- * RX fragment slot stride. A fragment that straddles a 4 KB page is mis-framed by the device's DMA: with
- * the fragments packed contiguously, the capture drifts its channel alignment by 8 bytes per page. Giving
- * each RX fragment its own page-safe SLOT (a power of two, so it divides the page) over a page-aligned
- * area keeps every fragment page-contained. Default (-1) = auto = roundup_pow_of_two(fragment). 0 = packed
- * contiguously (drifts; diagnostic). >0 = fragment audio bytes + this many.
- */
-static int rx_frag_pad = -1;
-module_param(rx_frag_pad, int, 0444);
-MODULE_PARM_DESC(rx_frag_pad,
-		 "RX fragment slot: -1 = auto page-safe pow2 (default), 0 = contiguous (drifts; "
-		 "diagnostic), >0 = audio bytes + this padding.");
-
-static int tx_frag_pad = -1;
-module_param(tx_frag_pad, int, 0444);
-MODULE_PARM_DESC(tx_frag_pad,
-		 "TX fragment slot (mirror of rx_frag_pad): -1 = auto page-safe pow2 (default), "
-		 "0 = contiguous (garbles playback on models whose fragment is not a power of two; "
-		 "diagnostic), >0 = audio bytes + this padding.");
-
-/*
  * Optional periodic GET_METER. The device does not need a host heartbeat: left with no host traffic at
  * all for minutes, it still answers, and control writes still take physical effect. The Level Meter
  * control reads the meters on demand (cached for CLARETT_METER_CACHE_MS), so an idle card issues no
@@ -130,18 +110,6 @@ module_param(meter_poll_ms, int, 0444);
 MODULE_PARM_DESC(meter_poll_ms,
 		 "Period (ms) of an optional periodic GET_METER, which also drives monitor_poll "
 		 "(default 0: none; the meters are read on demand).");
-
-static int dma_bits = 32;
-module_param(dma_bits, int, 0444);
-MODULE_PARM_DESC(dma_bits,
-		 "DMA coherent mask width (bits). Default 32. Lower it (e.g. 31 -> <2 GB, 30 -> <1 GB) to "
-		 "force the stream buffer lower in the address space (diagnostic).");
-
-static bool monitor_enables = true;
-module_param(monitor_enables, bool, 0444);
-MODULE_PARM_DESC(monitor_enables,
-		 "At probe, write the monitor HW-enable bits (0x48/0x49, cmd3) so global Mute/Dim affect "
-		 "Monitor Out 1-2. Default true; 0 leaves the device's own setting.");
 
 /* Bound on the response-address acknowledgement wait; see the probe readiness note above settle_ms. */
 static unsigned int addr_ack_ms = 500;
@@ -500,8 +468,8 @@ static int clarett_stream_service(void *data)
 	 * Tick-lateness telemetry. The period counters cannot show
 	 * this: they accumulate the HARDWARE ctr delta, so a late servicer catches up on the next tick and
 	 * the totals stay perfectly smooth while the audio glitches. What matters is the wall-clock gap
-	 * between period events — nominal is CLARETT_CTR_FRAMES*step/rate, which is NOT a constant: dyn_period
-	 * ties the IRQ cadence to the negotiated ALSA period, so it spans 0.33 ms (cadence 1) to tens of ms,
+	 * between period events — nominal is CLARETT_CTR_FRAMES*step/rate, which is NOT a constant: the IRQ
+	 * cadence follows the negotiated ALSA period, so it spans 0.33 ms (cadence 1) to tens of ms,
 	 * and the rate varies too. clarett_tick_late_us() derives the threshold from both — do not reintroduce
 	 * a fixed one. A gap far over nominal means the TX refill landed late and the engine read ring content the app had not been
 	 * copied into yet. step_max is the same signal without a clock: the counter delta per event is
@@ -1439,9 +1407,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 
 	pci_set_master(pci);
 
-	if (dma_bits < 28 || dma_bits > 64)
-		dma_bits = 32;
-	err = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(dma_bits));
+	err = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(32));
 	if (err)
 		goto err_free;
 
@@ -1453,8 +1419,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		goto err_free;
 	}
 	/* Log the response buffer's bus address (0x414 carries the high word). */
-	dev_dbg(&pci->dev, "resp buffer dma addr %pad (0x414 high word 0x%x, dma_bits=%d)\n",
-		&c->resp_dma, upper_32_bits(c->resp_dma), dma_bits);
+	dev_dbg(&pci->dev, "resp buffer dma addr %pad (0x414 high word 0x%x)\n",
+		&c->resp_dma, upper_32_bits(c->resp_dma));
 
 	/* MSI is enabled in config space before the first BAR access, so the device never sees
 	 * a session start from a host without an interrupt path. Handlers hook immediately too:
@@ -1536,23 +1502,14 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		clarett_read_rx_live(c);
 	}
 
-	/* RX fragment slot stride: default = page-safe pow2; 0 = contiguous; >0 = audio + padding. */
-	{
-		u32 frag = clarett_frag_bytes(c->model->capture_channels);
-
-		c->rx_slot = rx_frag_pad < 0 ? roundup_pow_of_two(frag)
-			   : rx_frag_pad == 0 ? frag
-					      : frag + rx_frag_pad;
-	}
-	/* TX fragment slot stride, mirror of rx_slot (a contiguous TX ring garbles playback on
-	 * models whose fragment is not a power of two). Default page-safe pow2. */
-	{
-		u32 frag = clarett_tx_frag_bytes(c->model->playback_channels);
-
-		c->tx_slot = tx_frag_pad < 0 ? roundup_pow_of_two(frag)
-			   : tx_frag_pad == 0 ? frag
-					      : frag + tx_frag_pad;
-	}
+	/*
+	 * Fragment slot strides: each fragment gets a page-safe power-of-two slot (it divides the page) over
+	 * a page-aligned area, so no fragment straddles a 4 KB page. The device's DMA mis-frames a fragment
+	 * that does: packed contiguously, capture drifts its channel alignment by 8 bytes per page and
+	 * playback is garbled on models whose fragment is not a power of two.
+	 */
+	c->rx_slot = roundup_pow_of_two(clarett_frag_bytes(c->model->capture_channels));
+	c->tx_slot = roundup_pow_of_two(clarett_tx_frag_bytes(c->model->playback_channels));
 
 	/* Start the optional periodic GET_METER now (meter_poll_ms), so it is already running when the
 	 * monitor-enable writes below go out. */
@@ -1572,7 +1529,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	 * master flag alone does nothing until an output opts in. This is a hardware-side write, so it
 	 * is needed whoever owns the controls — fcp-server drives the same Mute/Dim bytes. Needs the
 	 * seeded shadow for a correct read-modify-write, so only attempt it when seeding succeeded. */
-	if (!seeded && monitor_enables) {
+	if (!seeded) {
 		err = clarett_enable_monitor_hw_controls(c);
 		if (err)
 			dev_warn(&pci->dev,
