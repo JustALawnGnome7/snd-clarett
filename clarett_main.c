@@ -2053,9 +2053,6 @@ static const struct clarett_out_gain clarett_8prex_gains[] = {
 	{ "Line 07", 44 }, { "Line 08", 45 }, { "Line 09", 48 }, { "Line 10", 49 },
 };
 
-static const char * const clarett_mode_mli[] = { "Mic", "Line", "Inst" };
-static const char * const clarett_mode_ml[]  = { "Mic", "Line" };
-
 /* Hardware-meter sources for the 8PreX (activate 8). Selecting one writes its three per-band
  * channel-index tables (@136/146/156) then SET_DATA{184}. */
 static const struct clarett_meter_source clarett_8prex_meter_sources[] = {
@@ -2075,14 +2072,6 @@ static const struct clarett_meter_source clarett_8prex_meter_sources[] = {
 		{ 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 },
 		{ 14, 15, 16, 17, 255, 255, 255, 255, 18, 19 },
 		{ 12, 13, 255, 255, 255, 255, 255, 255, 14, 15 } } },
-};
-
-/* Analogue 1-2 add Inst; 3-8 are Mic/Line. Device byte == text index (identity). */
-static const struct clarett_preamp clarett_8prex_preamps[] = {
-	{ clarett_mode_mli, NULL, 3 }, { clarett_mode_mli, NULL, 3 },
-	{ clarett_mode_ml,  NULL, 2 }, { clarett_mode_ml,  NULL, 2 },
-	{ clarett_mode_ml,  NULL, 2 }, { clarett_mode_ml,  NULL, 2 },
-	{ clarett_mode_ml,  NULL, 2 }, { clarett_mode_ml,  NULL, 2 },
 };
 
 /*
@@ -2109,11 +2098,6 @@ static const struct clarett_model clarett_8prex = {
 	.slug = "clarett-8prex",
 	.out_gains = clarett_8prex_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_8prex_gains),
-	.n_analogue = 8,
-	.analogue = clarett_8prex_preamps,
-	.in_prefix = "Line In",			/* match the USB models' input naming */
-	.mode_label = "Mode",			/* but keep "Mode": Mic/Line/Inst is richer than "Level" */
-	.has_spdif_source = true,
 	.has_midi = true,
 	.notify_word = true,
 	.meter_sources = clarett_8prex_meter_sources,
@@ -2130,8 +2114,7 @@ static const struct clarett_model clarett_8prex = {
 
 /*
  * Clarett 2Pre (Thunderbolt). Shares the 8PreX's config offsets and commands; the first 4 of the
- * 8PreX output gains; 2 combo-jack preamps with the Line/Inst encoding (Line=1, Inst=2 — Mic is
- * auto-detected by the jack, not a software mode; see clarett_mode_li). Streams 4 playback / 14 record,
+ * 8PreX output gains. Streams 4 playback / 14 record,
  * which is also how it is detected (clarett_detect_model). Asymmetric TX 4ch / RX 14ch: periods
  * 0x40 / 0xe0, descriptor fragments 0x100 / 0x380 (clarett_frag_bytes).
  */
@@ -2142,30 +2125,11 @@ static const struct clarett_out_gain clarett_2pre_gains[] = {
 	{ "Line 03 (Headphones L)", 36 }, { "Line 04 (Headphones R)", 37 },
 };
 
-/*
- * Combo-jack input mode (shared by 2Pre / 4Pre / 8Pre). These models use a single combined XLR/TRS jack
- * per input, so the connector auto-selects Mic (XLR inserted) vs the 1/4" path — Mic is NOT a software
- * option; the mode control only chooses Line vs Inst for the 1/4" path. So the enum is {Line=1, Inst=2}
- * with no Mic(0). (The 8PreX, by contrast, has SEPARATE XLR and 1/4" ports, so software must pick
- * Mic/Line/Inst explicitly — see clarett_mode_mli.)
- */
-static const char * const clarett_mode_li[] = { "Line", "Inst" };
-static const u8 clarett_mode_li_vals[] = { 1, 2 };
-
-static const struct clarett_preamp clarett_2pre_preamps[] = {
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-};
-
 static const struct clarett_model clarett_2pre = {
 	.name = "Clarett 2Pre",
 	.slug = "clarett-2pre",
 	.out_gains = clarett_2pre_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_2pre_gains),
-	.n_analogue = 2,
-	.analogue = clarett_2pre_preamps,
-	.in_prefix = "Line In",			/* match scarlett2 Clarett 2Pre USB */
-	.mode_label = "Level",
 	.has_midi = true,
 	.notify_word = true,
 	.capture_channels = 14,			/* record-outputs pin count (12 record + 2 loopback) */
@@ -2183,10 +2147,6 @@ static const struct clarett_model clarett_2pre = {
  * Clarett 4Pre (Thunderbolt). Detected by its (8,20) geometry (clarett_detect_model).
  *
  *   channel counts 8 playback / 20 record (18 record + 2 loopback).
- *   inputs: only Analogue 1-2 have a mode (Line=1/Inst=2; Mic is auto-detected by the combo
- *           XLR/TRS jack, not a software option — see clarett_mode_li), at mode@166/167 cmd 6;
- *           Analogue 1-4 each have Air at air@174..177 cmd 7; Analogue 5-8 have no preamp controls.
- *           So n_analogue=4 (the Air-capable inputs); 3-4 are air-only (n_modes=0).
  *   output gains (cmd 1, 8-bit): Monitor 1-2 @ 32/33, Line 3-4 @ 36/37, Headphone 2 L/R @ 40/41.
  *           S/PDIF outputs carry no gain. Six gains total (no 44/45 pair on this model).
  */
@@ -2198,24 +2158,11 @@ static const struct clarett_out_gain clarett_4pre_gains[] = {
 	{ "Line 05 (Headphones 2 L)", 40 }, { "Line 06 (Headphones 2 R)", 41 },
 };
 
-/* Analogue 1-2 Line/Inst (combo jack auto-detects Mic); 3-4 air-only (n_modes=0). */
-static const struct clarett_preamp clarett_4pre_preamps[] = {
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ NULL, NULL, 0 },
-	{ NULL, NULL, 0 },
-};
-
 static const struct clarett_model clarett_4pre = {
 	.name = "Clarett 4Pre",
 	.slug = "clarett-4pre",
 	.out_gains = clarett_4pre_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_4pre_gains),
-	.n_analogue = 4,
-	.analogue = clarett_4pre_preamps,
-	.in_prefix = "Line In",			/* match scarlett2 Clarett 4Pre USB */
-	.mode_label = "Level",
-	.has_spdif_source = true,
 	.has_midi = true,
 	.notify_word = true,
 	.capture_channels = 20,			/* record-outputs pin count */
@@ -2231,25 +2178,12 @@ static const struct clarett_model clarett_4pre = {
 /*
  * Clarett 8Pre (Thunderbolt) — a DISTINCT model from the 8PreX (do not confuse).
  *
- * Differences from the 8PreX — these are physical: the 8Pre uses combo XLR/TRS jacks (the jack
- * auto-detects Mic when an XLR is inserted), whereas the 8PreX has SEPARATE XLR + 1/4" ports per input
- * (so its mode must be software-selected). Hence:
- *   - inputs: all 8 carry Air @ 174..181 (cmd 7), but only Analogue 1-2 have a mode (Line=1/Inst=2 for
- *     the 1/4" path; Mic is jack-auto, not a software option) @ 166/167 (cmd 6); Analogue 3-8 are
- *     air-only. (The 8PreX, with discrete ports, exposes software Mic/Line[/Inst] on all 8.)
+ * Differences from the 8PreX:
  *   - streams: 20 playback / 20 record (the 8PreX is 28/28 — the 8Pre has a single ADAT bank).
  *   - outputs: same 10-gain offsets as the 8PreX (Monitor @ 32/33, then 36..49), but named to
  *     mirror scarlett2's Clarett 8Pre USB line_out_descrs (Monitor L/R, Line 03-06 unlabelled,
  *     Headphones 1/2), so it gets its own gain table rather than reusing the 8PreX's.
  */
-static const struct clarett_preamp clarett_8pre_preamps[] = {	/* 1-2 Line/Inst, 3-8 air-only */
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
-	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
-	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
-};
-
 /* scarlett2 Clarett 8Pre USB line_out_descrs: Monitor L/R, four unlabelled line outs, Headphones 1/2. */
 static const struct clarett_out_gain clarett_8pre_gains[] = {
 	{ "Line 01 (Monitor L)", 32 }, { "Line 02 (Monitor R)", 33 },
@@ -2263,11 +2197,6 @@ static const struct clarett_model clarett_8pre = {
 	.slug = "clarett-8pre",
 	.out_gains = clarett_8pre_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_8pre_gains),
-	.n_analogue = 8,
-	.analogue = clarett_8pre_preamps,
-	.in_prefix = "Line In",			/* match scarlett2 Clarett 8Pre USB */
-	.mode_label = "Level",
-	.has_spdif_source = true,
 	.has_midi = true,
 	.notify_word = true,
 	.capture_channels = 20,			/* 18 record + 2 loopback */
@@ -2290,9 +2219,6 @@ static const struct clarett_model clarett_8pre = {
  *    bits="16", min-gain -112.0 dB), where every Clarett uses a 7-bit 1 dB/step attenuation byte.
  *    clarett_hw_gain_follow() writes a BYTE at out_gains[].offset, so populating this table from the
  *    Red's offsets would write half a gain field. NULL correctly disables that mirror outright.
- *  - the preamp/naming fields (n_analogue, analogue, in_prefix, mode_label, has_spdif_source): dead
- *    since the in-kernel control layer was removed, and the Red's preamps carry phantom, phase,
- *    stereo-link and separate mic/line/inst gains that this struct cannot describe anyway.
  *  - meter_sources: the Red's front-panel meter bridge is not mapped.
  *  - has_midi: the Red range has no MIDI jacks, so no rawmidi device is created for it.
  * The control plane therefore reaches userspace only through the FCP hwdep, where fcp-server's

@@ -350,17 +350,6 @@ struct clarett_out_gain {
 };
 
 /*
- * Per-preamp input mode enum. mode_values is the per-model device encoding:
- * NEVER assume text index == device byte (8PreX Mic/Line/Inst = 0/1/2, but the
- * 2Pre's Line/Inst = 1/2 with no Mic). NULL = identity (index == device byte).
- */
-struct clarett_preamp {
-	const char * const *mode_texts;
-	const u8 *mode_values;
-	int n_modes;
-};
-
-/*
  * One selectable clock source: the enum value SET_CLOCK carries, and the label the "Clock Source" ALSA
  * control shows. Per model, Internal first (the default, and what a user without digital inputs wants).
  */
@@ -388,18 +377,6 @@ struct clarett_model {
 	/* control plane */
 	const struct clarett_out_gain *out_gains;
 	int n_out_gains;
-	int n_analogue;				/* preamp count (air + mode controls) */
-	const struct clarett_preamp *analogue;	/* [n_analogue] */
-	/* Input-control naming. All models use in_prefix "Line In" (matching the scarlett2 names for
-	 * the USB siblings). mode_label is "Level" for the USB models (their Line/Inst switch) but
-	 * "Mode" for the 8PreX, whose Mic/Line/Inst mode is richer than scarlett2's Line/Inst "Level".
-	 * Output-gain names carry the full "Line NN (descr)" string per model in out_gains[].name. */
-	const char *in_prefix;			/* "Line In" (all models) */
-	const char *mode_label;			/* "Level" (USB models) or "Mode" (8PreX) */
-	/* "S/PDIF Source Capture Enum" (None/Optical/RCA @ SPDIF_SOURCE_OFFSET). Present where the
-	 * device has a selectable S/PDIF input — 4Pre/8Pre/8PreX. The 2Pre has optical only (one
-	 * option), so it gets no control, matching scarlett2 (which omits it for the 2Pre). */
-	bool has_spdif_source;
 	/* DIN MIDI in/out jacks. Every Clarett has them; the Red range has none, although the Red 8Line's
 	 * register UART is present and answers like a Clarett's, so a port created on it would lead nowhere. */
 	bool has_midi;
