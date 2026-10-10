@@ -143,26 +143,12 @@ MODULE_PARM_DESC(monitor_enables,
 		 "At probe, write the monitor HW-enable bits (0x48/0x49, cmd3) so global Mute/Dim affect "
 		 "Monitor Out 1-2. Default true; 0 leaves the device's own setting.");
 
-static bool seed_dump;
-module_param(seed_dump, bool, 0444);
-MODULE_PARM_DESC(seed_dump,
-		 "One-shot dump of the full seeded config shadow [0,256) at probe (16 lines); diff two "
-		 "dumps to locate a setting's offset. Default 0.");
-
 /* Bound on the response-address acknowledgement wait; see the probe readiness note above settle_ms. */
 static unsigned int addr_ack_ms = 500;
 module_param(addr_ack_ms, uint, 0644);
 MODULE_PARM_DESC(addr_ack_ms,
 		 "Wait up to this long (ms) for the device to acknowledge the response-buffer address "
 		 "(0x400 bit0) before the first command (default 500; 0 = a fixed ~3.22 ms instead).");
-
-static bool error_probe;
-module_param(error_probe, bool, 0444);
-MODULE_PARM_DESC(error_probe,
-		 "Diagnostic: at probe, send a few deliberately MALFORMED FCP commands (bad offset, zero "
-		 "length, unknown opcode) alongside a valid GET_DATA and log each response's error word "
-		 "(resp+8) and size. Off by default (sends junk commands). Combine with meter_poll_ms=0, or "
-		 "the heartbeat's responses interleave with the probe's.");
 
 static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, clarett_8pre,
 				  red_8line, red_16line, red_4pre, red_8pre;
@@ -419,89 +405,6 @@ static void clarett_hw_init(struct clarett *c)
 	}
 
 	memset(c->shadow, 0, sizeof(c->shadow));
-}
-
-/*
- * Error-code probe (error_probe, diagnostic). Send a valid GET_DATA plus deliberately malformed and
- * unsupported commands, and log each response's error word (resp+8) and size. Reads resp+8 directly
- * because the BAR MBOX_ERROR word reads 0; the real error is in the DMAed response.
- */
-static void clarett_error_probe(struct clarett *c)
-{
-	static const struct {
-		const char *name;
-		u32 opcode;
-		u8 data[8];
-		u16 len;
-	} cmds[] = {
-		/* Status codes (resp+8) on a working session, one per validation stage:
-		 *   valid → 0; bad parameter (offset out of range / oversized length) → 1;
-		 *   unsupported category (ESP_DFU 0x009) → 4; unknown opcode or sub-op in a
-		 *   supported category → 7. Zero-length and past-the-end reads are accepted (0).
-		 * A refused session answers everything identically: err=3, size=0, seq=0 (the
-		 * request seq is not echoed), opcode echoed. */
-		{ "GET_DATA{24,4} valid",     FCP_GET_DATA, { 24,0,0,0,  4,0,0,0 }, 8 },
-		{ "GET_DATA bad-offset",      FCP_GET_DATA, { 0,0,0xff,0xff, 4,0,0,0 }, 8 },
-		{ "unknown opcode 0x0000ff",  0x0000ff,     { 0 }, 0 },
-		/* Queries that answer with real data on a working session: READ_SEG (segment open),
-		 * STREAM_INFO/GET_6 device queries, 0x005000{id} (a per-id name query: 0x1e -> "ADAT 8"),
-		 * and GET_DATA{0xc8} in the persistent appspace. */
-		{ "READ_SEG{0,8}",            FCP_READ_SEG, { 0,0,0,0,  8,0,0,0 }, 8 },
-		{ "STREAM_INFO{0}",           FCP_STREAM_INFO, { 0 }, 1 },
-		{ "GET_6.2",                  0x006002,     { 0 }, 0 },
-		{ "port name{0x1e}",          0x005000,     { 0x1e, 0 }, 2 },
-		{ "GET_DATA{0xc8,8}",         FCP_GET_DATA, { 0xc8,0,0,0, 8,0,0,0 }, 8 },
-		/* Further validation stages: length errors, an unknown sub-op inside a supported
-		 * category, and a command in an unsupported one. Read-only — no side effects. */
-		{ "GET_DATA zero-len",        FCP_GET_DATA, { 24,0,0,0,  0,0,0,0 }, 8 },
-		{ "GET_DATA oversized-len",   FCP_GET_DATA, { 0,0,0,0,  0,0,1,0 }, 8 },   /* len=0x10000 */
-		{ "GET_DATA overrun-end",     FCP_GET_DATA, { 0xf8,0,0,0, 0x40,0,0,0 }, 8 }, /* off ok, off+len past end */
-		{ "unknown sub-op in MUX",    0x0030ff,     { 0 }, 0 },   /* supported cat 0x003, bogus sub-op */
-		{ "unknown sub-op in MIX",    0x0020ff,     { 0 }, 0 },   /* supported cat 0x002, bogus sub-op */
-		{ "unsupported cat ESP_DFU",  0x009000,     { 0 }, 0 },   /* CAP_READ: 0x009 NOT SUPPORTED */
-		{ "unsupported cat ESP_DFU1", 0x009001,     { 0 }, 0 },
-	};
-	const u8 *r = c->resp_buf;
-	int i, ret;
-
-	for (i = 0; i < ARRAY_SIZE(cmds); i++) {
-		u32 exp_echo = CMD_EXEC_FLAG | cmds[i].opcode;
-		u16 exp_seq = c->seq;		/* the seq clarett_fcp will stamp on this command */
-		unsigned long deadline;
-		u32 echo = 0, err = 0;
-		u16 size = 0, rseq = 0;
-		bool landed = false;
-
-		/*
-		 * The device DMAs its response ASYNCHRONOUSLY, a little after the BAR done bit clarett_fcp
-		 * polls — so reading resp_buf immediately races and catches the PREVIOUS command's late
-		 * response. Wait for THIS command's response by matching the echoed opcode (unique per command
-		 * after the memset). A refusal does not echo the request seq (it writes seq=0), so match the
-		 * echo ONLY; a timeout is a genuine no-response. Requires meter_poll_ms=0 (else the heartbeat
-		 * shares resp_buf and bumps seq).
-		 */
-		memset(c->resp_buf, 0, 32);
-		ret = clarett_fcp(c, cmds[i].opcode, cmds[i].data, cmds[i].len);
-
-		deadline = jiffies + msecs_to_jiffies(50);
-		do {
-			dma_rmb();
-			echo = r[0] | r[1] << 8 | r[2] << 16 | r[3] << 24;
-			rseq = r[FCP_RESP_SEQ_OFF] | r[FCP_RESP_SEQ_OFF + 1] << 8;
-			if (echo == exp_echo) {
-				landed = true;
-				break;
-			}
-			usleep_range(200, 300);
-		} while (time_before(jiffies, deadline));
-
-		size = r[4] | r[5] << 8;
-		err  = r[8] | r[9] << 8 | r[10] << 16 | r[11] << 24;
-		dev_info(&c->pci->dev,
-			 "error_probe: %-20s fcp_ret=%d %s echo=0x%08x seq=%u(exp %u) err=%u size=%u payload=%*ph\n",
-			 cmds[i].name, ret, landed ? "RESP" : "NO-RESP",
-			 echo, rseq, exp_seq, err, size, 8, r + FCP_RESP_DATA_OFF);
-	}
 }
 
 /*
@@ -1664,24 +1567,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		dev_warn(&pci->dev,
 			 "config shadow seed failed (%d); leaving hardware mute/dim enables untouched\n",
 			 seeded);
-	else if (seed_dump) {
-		/* One-shot full [0,256) seeded-shadow dump (gated on seed_dump so normal loads stay
-		 * quiet); diff two dumps to locate a setting. */
-		int off;
-
-		for (off = 0; off < CLARETT_CONFIG_SIZE; off += 16)
-			dev_info(&pci->dev, "seeded shadow [%3d]=%*ph\n",
-				 off, 16, c->shadow + off);
-	}
-
-	/* Diagnostic: log the FCP status codes for valid and malformed commands. Requires
-	 * meter_poll_ms=0 so the heartbeat doesn't share resp_buf/seq (see param desc). */
-	if (error_probe) {
-		if (meter_poll_ms > 0)
-			dev_warn(&pci->dev,
-				 "error_probe needs meter_poll_ms=0 (meter worker races the shared response buffer); results unreliable\n");
-		clarett_error_probe(c);
-	}
 
 	/* Make Mute/Dim actually affect Monitor Out 1-2 by setting the per-output enable bits: the
 	 * master flag alone does nothing until an output opts in. This is a hardware-side write, so it

@@ -295,7 +295,7 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
   period before the first command.
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
 
-The rest (`error_probe`, `seed_dump`, `resp_trace`, `tx_trace`, the fragment-padding
+The rest (`resp_trace`, `tx_trace`, the fragment-padding
 and DMA-mask levers, and others) are diagnostics; their `MODULE_PARM_DESC` strings say what each
 does.
 
@@ -311,4 +311,4 @@ to another host, so the driver does not re-apply them. This mirrors the in-kerne
   the device restores Mode/Air to the hardware from NVRAM while bringing the host-readable config up
   at a fixed default that does not mirror it, so the display can disagree with the front-panel LEDs
   until a control is touched. The hardware is correct; there is no read of the true preamp state on a
-  fresh boot. `seed_dump=1` dumps the config shadow at probe for anyone digging further.
+  fresh boot.

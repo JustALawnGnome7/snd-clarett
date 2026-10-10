@@ -274,36 +274,22 @@ struct snd_rawmidi_substream;
  * clarett_detect_model() keys on; the higher bands shrink by the channels ADAT S/MUX removes. The two
  * trailing words are undecoded. A band past 2 is not an error: one model answers zeros, another repeats
  * band 2.
- *
- * The other opcodes here are session-open queries the vendor issues at attach, not fully decoded; the
- * category 6 ones answer rate and clock state.
  */
 #define FCP_STREAM_INFO          0x007001
 #define CLARETT_SPEED_BANDS      3
-#define FCP_READ_SEG             0x800005
-#define FCP_INIT_2               0x000002
 
 /*
  * Further opcodes seen in the vendor attach, not issued by the driver. SET_MIX and SET_MUX are what a
  * routing or mixer edit from fcp-server issues.
- *   0x000001 subsystem enable {u16 id}; 0x001000/0x002000/0x003000/0x004000 subsystem-count
- *   queries; 0x002002 SET_MIX {u16 mix, u16 coeff[30]}; 0x003001 MUX_READ {u8 offset, u8 pad,
- *   u8 count, u8 band} -> u32 (src << 12 | dst) entries, at most 28 per reply; 0x003002 SET_MUX;
- *   0x004001/0x004005 subsystem-4 setup; 0x005000 {u16 id} reads a fixed port-name string;
- *   0x007002/0x007003 {u32 speed, u16 count} declare the TX/RX stream width.
+ *   0x000001 subsystem enable {u16 id}, and also the capability read: {u16 category} -> one byte,
+ *   non-zero = that opcode category is live on this session (fcp-server refuses the device unless
+ *   INIT 0x000 and DATA 0x800 both answer non-zero); 0x000002 INIT_2; 0x001000/0x002000/0x003000/
+ *   0x004000 subsystem-count queries; 0x002002 SET_MIX {u16 mix, u16 coeff[30]}; 0x003001 MUX_READ
+ *   {u8 offset, u8 pad, u8 count, u8 band} -> u32 (src << 12 | dst) entries, at most 28 per reply;
+ *   0x003002 SET_MUX; 0x004001/0x004005 subsystem-4 setup; 0x005000 {u16 id} reads a fixed port-name
+ *   string; 0x007002/0x007003 {u32 speed, u16 count} declare the TX/RX stream width; 0x800005
+ *   READ_SEG, the flash segment read.
  */
-#define FCP_INIT_1               0x000001
-
-/*
- * 0x000001 is also the CAPABILITY READ: {u16 category} -> one byte, non-zero = that opcode category
- * is live on this session. fcp-server calls it first and refuses the device unless INIT (0x000) and
- * DATA (0x800) both answer non-zero, so it is the authoritative "is the session really up?" test.
- * The driver itself does not run it: probe waits for the identity query to answer instead, which is
- * the same evidence one command earlier.
- */
-#define FCP_CAP_READ             FCP_INIT_1
-#define FCP_CAT_INIT             0x000
-#define FCP_CAT_DATA             0x800
 
 /*
  * Per-model descriptor. One const instance per supported model, detected at probe and pinned as
@@ -399,7 +385,11 @@ struct clarett_model {
  *   resp[0..3]  = echoed cmd (CMD_EXEC_FLAG | opcode) — guard on this
  *   resp[4..5]  = size: # of payload bytes the device actually returned
  *   resp[6..7]  = echoed request seq
- *   resp[8..11] = FCP error word: 0 = OK; 0x3 = the device refusing the session
+ *   resp[8..11] = FCP error word, one value per validation stage on a working session: 0 = OK (a
+ *                 zero-length or past-the-end read included); 1 = bad parameter (offset out of
+ *                 range, oversized length); 4 = unsupported category; 7 = unknown opcode or sub-op
+ *                 in a supported category. 3 = the device refusing the session: every command then
+ *                 answers 3 with size=0 and seq=0.
  *   resp[16+i]  = config[offset + i]  for a GET_DATA{offset, len}
  * The header is zeroed before each command, so an echo of 0 means nothing landed. The echo alone
  * is not sufficient: a refused command can land a header with size=0 and no payload, so a reader

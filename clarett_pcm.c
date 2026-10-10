@@ -30,16 +30,6 @@
 static void clarett_build_rings(struct clarett *c);	/* rebuilt at prepare when dyn_period changes cadence */
 
 /*
- * Diagnostic: issue an extra re-init batch in the stream handshake (see clarett_stream_handshake). It
- * has no known benefit, so it is off by default.
- */
-static bool stream_batch;
-module_param(stream_batch, bool, 0644);
-MODULE_PARM_DESC(stream_batch,
-		 "Diagnostic: issue a re-init batch (INIT_2, subsystem enables 1-8, count queries, "
-		 "0x004001 x6) before arming the stream engine (default off).");
-
-/*
  * dyn_period: derive the RX IRQ cadence from the negotiated ALSA period instead of the fixed 256-frame
  * default, so a DAW can pick a smaller device buffer (down to one 16-frame fragment). It rebuilds the
  * descriptor ring at a finer marker cadence; both directions are locked to one period (DAWs use a single
@@ -954,7 +944,7 @@ static int clarett_pcm_hw_free(struct snd_pcm_substream *ss)
 static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 {
 	u8 clk[8];
-	int e_clk, e_en1, e_en2, e_commit, batch_err = 0, i;
+	int e_clk, e_en1, e_en2, e_commit;
 	int clk_src = clarett_clock_source(c);
 
 	if (!rate)
@@ -965,36 +955,14 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 
 	e_clk = clarett_fcp(c, FCP_SET_CLOCK, clk, sizeof(clk));
 
-	/* Diagnostic re-init batch (stream_batch): subsystem enables 1..8, count queries, and
-	 * 0x004001 for indices 0..5. Semantics not decoded. */
-	if (stream_batch) {
-		static const u32 count_queries[] = { 0x001000, 0x002000, 0x003000, 0x004000 };
-		u8 arg[4];
-
-		clarett_fcp(c, FCP_INIT_2, NULL, 0);
-		for (i = 1; i <= 8; i++) {
-			arg[0] = i; arg[1] = 0;
-			batch_err |= clarett_fcp(c, FCP_INIT_1, arg, 2);
-		}
-		clarett_fcp(c, FCP_INIT_2, NULL, 0);
-		for (i = 0; i < (int)ARRAY_SIZE(count_queries); i++)
-			batch_err |= clarett_fcp(c, count_queries[i], NULL, 0);
-		for (i = 0; i < 6; i++) {
-			clarett_put_le32(arg, i);
-			batch_err |= clarett_fcp(c, 0x004001, arg, 4);
-		}
-	}
-
 	/* The sync queries, in order 0x6004, 0x6002, 0x6005 (see FCP_SYNC_READ in clarett.h). */
 	e_en1    = clarett_fcp(c, FCP_SYNC_READ, NULL, 0);
 	e_en2    = clarett_fcp(c, FCP_SYNC_RATE_CFG, NULL, 0);
 	e_commit = clarett_fcp(c, FCP_SYNC_RATE, NULL, 0);
 
 	dev_dbg(&c->pci->dev,
-		 "stream-handshake: SET_CLOCK{%u,%u}=%d batch=%s(err=%d) "
-		 "0x6004=%d 0x6002=%d 0x6005=%d\n",
-		 rate, clk_src, e_clk, stream_batch ? "yes" : "off", batch_err,
-		 e_en1, e_en2, e_commit);
+		 "stream-handshake: SET_CLOCK{%u,%u}=%d 0x6004=%d 0x6002=%d 0x6005=%d\n",
+		 rate, clk_src, e_clk, e_en1, e_en2, e_commit);
 }
 
 /*
