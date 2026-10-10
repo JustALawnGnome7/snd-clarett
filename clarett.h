@@ -119,17 +119,23 @@ struct snd_rawmidi_substream;
 #define CLARETT_VEC_EVENT        0       /* the device signals control events on vec0 */
 
 /*
- * REG_NOTIFY_CAUSE (0x400) is NOT an async event queue — it is a 2-bit command-phase/status
- * register holding {0,1,2,3}: idle/ready = 0x3, dipping to 0x0 while a mailbox command is accepted
- * and passing 0x1->0x2 mid-command, back to 0x3 at completion. There is no per-bit follow-up read.
+ * REG_NOTIFY_CAUSE (0x400), read-to-clear, carries two populations of bits. Bits 0 and 1 are the
+ * mailbox command phase: bit0 = request accepted (also raised once, with no command in flight, to
+ * acknowledge the response-buffer address), bit1 = response DMA landed. The bits above them are
+ * device events, and they ARE the notification word: on a Clarett, bit21 = dim/mute and bit22 =
+ * monitor (the vendor descriptors' notification masks), bit3 = sync state changed.
  *
- * Consequence for the ISR: vec0 fires on mailbox-DONE too, and at completion 0x400 reads its idle
- * 0x3 (== NOTIFY_MON_PRIMARY), so a completion MSI can be misread as a monitor event; the
- * cmd_inflight guard suppresses that self-reflection.
+ * Consequence for the ISR: vec0 fires on mailbox completion too, so only the event bits may be relayed
+ * as a notification; relaying the phase bits makes every one of the driver's own commands look like a
+ * front-panel change.
  */
-#define NOTIFY_MON_PRIMARY       0x00000003u  /* bit0|bit1 — raised on every monitor (mute/dim) event */
-#define NOTIFY_MON_AUX           0x00200000u  /* bit21 — co-occurs intermittently */
-#define NOTIFY_MONITOR_MASK      (NOTIFY_MON_PRIMARY | NOTIFY_MON_AUX)
+#define NOTIFY_REQ_ACCEPTED      0x00000001u  /* bit0 — request accepted / address acknowledged */
+#define NOTIFY_RESP_LANDED       0x00000002u  /* bit1 — response DMA landed */
+#define NOTIFY_PHASE_MASK        (NOTIFY_REQ_ACCEPTED | NOTIFY_RESP_LANDED)
+#define NOTIFY_EVENT_MASK        (~NOTIFY_PHASE_MASK)
+#define NOTIFY_EV_SYNC           0x00000008u  /* bit3  — sync state changed */
+#define NOTIFY_EV_DIM_MUTE       0x00200000u  /* bit21 — dim/mute */
+#define NOTIFY_EV_MONITOR        0x00400000u  /* bit22 — monitor (front-panel knob) */
 
 /* Monitoring config region re-read on a notification. */
 #define MONITOR_CFG_OFFSET       24
@@ -393,6 +399,12 @@ struct clarett_model {
 	/* DIN MIDI in/out jacks. Every Clarett has them; the Red range has none, although the Red 8Line's
 	 * register UART is present and answers like a Clarett's, so a port created on it would lead nowhere. */
 	bool has_midi;
+	/*
+	 * The 0x400 event bits are this model's notification word, and its device map's notify-client
+	 * masks are written against them. Without it the relay sends an all-bits wildcard, so fcp-server
+	 * re-reads every notifiable control: the Red range, whose event bits have not been measured.
+	 */
+	bool notify_word;
 	/*
 	 * Thunderbolt generation of the unit's own controller, for models whose stream geometry another
 	 * model shares: the Red 4Pre and 8Pre (Thunderbolt 2) report the same pair as the Red 8Line and

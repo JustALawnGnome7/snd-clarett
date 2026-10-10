@@ -58,13 +58,15 @@ period (`0x300`) events.
   channel → raw-slot map (the control's `.get` polls `GET_METER` and projects through it) plus an
   optional `FCP_CHANNEL_LABELS` TLV. The map's size is fixed once the control exists; a map of a
   different size is rejected until the driver is reloaded.
-- **The notification relay delivers a wildcard.** The USB FCP device carries a precise notification
-  bitmask; this device only signals *that* something may have changed, and the `0x400` signal is in
-  fact a periodic heartbeat at ~13.4 Hz rather than a change event. So the relay delivers an
-  all-categories event (`~0`) and `fcp-server` re-reads every notifiable control. Wakes are
-  **rate-limited** to one per `notify_ms` — deliberately a rate limit (one interval after the
-  *first* event of a burst), not a debounce, which against a source that never goes idle would
-  never fire.
+- **The notification relay delivers the device's event bits.** `0x400` carries the mailbox
+  command phase in bits 0-1 and device events above them, and those event bits are the FCP
+  notification word: on a Clarett, bit 22 = monitor (the front-panel knob), bit 21 = dim/mute.
+  The relay passes them to `fcp-server`, which re-reads the controls whose `notify-client` mask
+  matches (`0x600000` in the Clarett maps). An idle Clarett raises none. The Red range, whose event
+  bits are not yet identified, gets an all-categories wildcard (`~0`) instead
+  (`clarett_model.notify_word`). Wakes are **rate-limited** to one per `notify_ms` — deliberately
+  a rate limit (one interval after the *first* event of a burst), not a debounce, which against a
+  control being moved continuously would never fire.
 - **The relay is suppressed while a stream runs** (default), because each wake costs a re-read of
   every notifiable control. `notify_while_streaming=1` keeps it running. While it is suppressed the
   monitor section still tracks: `monitor_poll` reads the monitor region (`GET_DATA(24, 92)`) at the

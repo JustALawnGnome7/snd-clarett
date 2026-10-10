@@ -519,12 +519,11 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  * hwdep path). fcp-server's read() returns a u32 bitmask and re-reads every control whose
  * devmap "notify-client" mask intersects it.
  *
- * Adaptation: the USB FCP device delivers that precise FCP notification bitmask in its interrupt
- * message; this Thunderbolt device only signals *that* a notification occurred, via the 0x400
- * cause register (ev = the monitor-mask cause bits) — the FCP notification word is not exposed on
- * any surface we can read. We therefore deliver an all-categories event (~0) so fcp-server does a
- * correct, if broad, re-read of all notifiable controls. If a real notification word is ever
- * found, carry it through here instead of the wildcard.
+ * The USB FCP device delivers that bitmask in its interrupt message; this Thunderbolt device carries
+ * it in the event bits of the 0x400 cause register (ev, phase bits already removed), so it is relayed
+ * as is on a model whose device map is written against it (clarett_model.notify_word). Any other
+ * model gets an all-categories wildcard (~0), so fcp-server does a correct, if broad, re-read of all
+ * notifiable controls.
  */
 /*
  * Minimum gap between notification wakes. Writable at runtime:
@@ -533,18 +532,16 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  * trips on a 2Pre (the routing and mixer controls are not notifiable, so they cost nothing), so
  * 20 Hz would be roughly 160 round trips a second.
  *
- * 50 ms rather than something smaller because the 0x400 config-change signal is a PERIODIC
- * HEARTBEAT at ~13.4 Hz, not a change event: the rate is the same idle, under load, and while a
- * control is being turned. So the device says "re-read me" on a fixed cadence and says nothing about
- * what changed — which is why the relay is a wildcard, and why front-panel tracking is capped at one
- * update per ~75 ms. 50 ms passes essentially everything on offer while still collapsing a burst.
+ * Turning a Clarett's monitor knob raises its event bit ~46 times a second; 50 ms collapses that to
+ * one re-read per 50 ms, which tracks the knob smoothly. An idle Clarett raises no event bits at all.
+ * (The steady ~8-13 Hz "notification" seen before the event bits were separated out was the mailbox
+ * phase bits of the driver's own commands, relayed by mistake.)
  */
 static uint notify_ms = 50;
 module_param(notify_ms, uint, 0644);
 MODULE_PARM_DESC(notify_ms,
 		 "Minimum ms between notification wakes to userspace (default 50; 0 = every "
-		 "notification). The device itself only announces at ~13.5 Hz, so lowering this "
-		 "further changes nothing; raise it to cut mailbox traffic.");
+		 "notification). Raise it to cut mailbox traffic while a front-panel control moves.");
 
 /* Coalesced wake: fires ~notify_ms after the FIRST notification of a burst — see the rate-limit
  * note in clarett_hwdep_notify() for why it must not be the last one. */
@@ -558,10 +555,9 @@ static void clarett_hwdep_notify_wake(struct work_struct *work)
 void clarett_hwdep_notify(struct clarett *c, u32 ev)
 {
 	/*
-	 * The device asserts the 0x400 config-change notification steadily (~13.4 Hz), and we can
-	 * only relay a wildcard (~0) since the FCP notification word is not exposed — so every wake
-	 * makes fcp-server re-read every control it marks notifiable. Coalesce: set the event now, and
-	 * wake at most once per notify_ms so a storm of idle notifications becomes one re-read.
+	 * A moving front-panel control raises events far faster than anyone can see (~46/s for the
+	 * monitor knob), and every wake makes fcp-server re-read each control the word matches.
+	 * Coalesce: set the event now, and wake at most once per notify_ms.
 	 *
 	 * schedule_delayed_work(), NOT mod_delayed_work(): it is a no-op while the work is already
 	 * queued, so the wake lands notify_ms after the FIRST notification of a burst.
@@ -571,7 +567,14 @@ void clarett_hwdep_notify(struct clarett *c, u32 ev)
 	 */
 	if (!c->hwdep_ready)
 		return;
-	atomic_or(~0u, &c->hwdep_notify_event);
+	if (c->model->notify_word) {
+		ev &= NOTIFY_EVENT_MASK;
+		if (!ev)
+			return;
+	} else {
+		ev = ~0u;
+	}
+	atomic_or(ev, &c->hwdep_notify_event);
 	schedule_delayed_work(&c->hwdep_notify_dwork, msecs_to_jiffies(notify_ms));
 }
 

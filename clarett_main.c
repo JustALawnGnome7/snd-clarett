@@ -1219,25 +1219,23 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 
 		{
 		u32 cause = readl(c->bar0 + REG_NOTIFY_CAUSE);	/* 0x400, read-to-clear */
-		u32 ev = cause & NOTIFY_MONITOR_MASK;
+		u32 ev = cause & NOTIFY_EVENT_MASK;
 
 		/* Init is waiting for the response-address acknowledgement (addr_ack_ms). */
-		if (READ_ONCE(c->addr_ack_wait) && (cause & 0x1)) {
+		if (READ_ONCE(c->addr_ack_wait) && (cause & NOTIFY_REQ_ACCEPTED)) {
 			WRITE_ONCE(c->addr_ack_wait, false);
 			complete(&c->addr_acked);
 		}
 
-		/* vec0 also fires on mailbox-DONE, and 0x400 reads its idle level 0x3 (== NOTIFY_MON_PRIMARY)
-		 * at completion time (see the REG_NOTIFY_CAUSE note in clarett.h). Skipping the notify path
-		 * while our own command is in flight suppresses that self-reflection. ctl_ready gates the
-		 * relay: the handlers are hooked BEFORE the controls exist (for MSI-paced completion), and a
-		 * pre-controls event must not notify.
+		/* Only the event bits are a notification; the phase bits belong to the mailbox (see the
+		 * REG_NOTIFY_CAUSE note in clarett.h), and the in-flight test above keeps this path off
+		 * 0x400 while a command owns it. ctl_ready gates the relay: the handlers are hooked BEFORE
+		 * the controls exist (for MSI-paced completion), and a pre-controls event must not notify.
 		 *
-		 * stream_on gate: while the engine streams, vec0 ALSO fires on every audio period, and 0x400
-		 * reads its idle 0x3 each time — so this path would schedule a relay ~per period (coalesced to
-		 * one wake per notify_ms). The relay is a wildcard (the FCP notify word is not exposed), so
-		 * fcp-server answers each wake by re-reading every notifiable control, a GET_DATA apiece. The
-		 * gate saves that mailbox load; notify_while_streaming turns it off. While it is on,
+		 * stream_on gate: vec0 also fires on every audio period while the engine streams. When the
+		 * phase bits were relayed, each period scheduled a relay and fcp-server re-read every
+		 * notifiable control; with only event bits relayed that cost should be gone, but the gate
+		 * stays until that is measured. notify_while_streaming turns it off. While it is on,
 		 * front-panel changes reach userspace mid-stream only through monitor_poll, which covers the
 		 * monitor region and nothing else. */
 		if (ev && READ_ONCE(c->ctl_ready) &&
@@ -1471,7 +1469,7 @@ static void clarett_monitor_poll(struct clarett *c)
 		 * when idle the relay is live, but it is not known to fire for every front-panel control (the
 		 * Red's Meter Source), and a duplicate costs fcp-server one re-read on a real change only.
 		 */
-		clarett_hwdep_notify(c, NOTIFY_MON_PRIMARY);
+		clarett_hwdep_notify(c, NOTIFY_EV_MONITOR | NOTIFY_EV_DIM_MUTE);
 	}
 
 	/* Also on the FIRST poll: the stored SW gains of HW-controlled outputs are whatever the last
@@ -2134,6 +2132,7 @@ static const struct clarett_model clarett_8prex = {
 	.mode_label = "Mode",			/* but keep "Mode": Mic/Line/Inst is richer than "Level" */
 	.has_spdif_source = true,
 	.has_midi = true,
+	.notify_word = true,
 	.meter_sources = clarett_8prex_meter_sources,
 	.n_meter_sources = ARRAY_SIZE(clarett_8prex_meter_sources),
 	.capture_channels = STREAM_CHANS,
@@ -2198,6 +2197,7 @@ static const struct clarett_model clarett_2pre = {
 	.in_prefix = "Line In",			/* match scarlett2 Clarett 2Pre USB */
 	.mode_label = "Level",
 	.has_midi = true,
+	.notify_word = true,
 	.capture_channels = 14,			/* record-outputs pin count (12 record + 2 loopback) */
 	.playback_channels = 4,			/* playback pin count */
 	.rx_live_mid = 10,			/* ADAT 5-8 -> ch10-13 gone at double speed */
@@ -2262,6 +2262,7 @@ static const struct clarett_model clarett_4pre = {
 	.mode_label = "Level",
 	.has_spdif_source = true,
 	.has_midi = true,
+	.notify_word = true,
 	.capture_channels = 20,			/* record-outputs pin count */
 	.playback_channels = 8,			/* playback pin count */
 	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
@@ -2336,6 +2337,7 @@ static const struct clarett_model clarett_8pre = {
 	.mode_label = "Level",
 	.has_spdif_source = true,
 	.has_midi = true,
+	.notify_word = true,
 	.capture_channels = 20,			/* 18 record + 2 loopback */
 	.playback_channels = 20,		/* Playback 1-20 */
 	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
