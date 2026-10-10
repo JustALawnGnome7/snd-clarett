@@ -64,23 +64,23 @@ MODULE_PARM_DESC(tx_trace,
  */
 
 /*
- * Probe readiness. A freshly powered unit cannot answer its first mailbox commands straight away, and
- * how long it needs varies by model and by power-up:
- * - The Red 8Line answers at once, both on attach and on a rebind.
- * - A Clarett brings its link up twice at power-up (~1.5 s apart) and is enabled just after the second.
- *   The 4Pre answers at once. The 8Pre and 8PreX lose the first command sent after power-up, and answer
- *   the next one, even when it follows the first lost response's deadline immediately.
- * - No register shows when the device becomes ready: every pre-mailbox register reads its final value
- *   from the first read after the enable.
+ * Probe readiness. The device acknowledges the response-buffer address (the 0x414 write in
+ * clarett_hw_init) by raising 0x400 bit0, and a mailbox command sent before that acknowledgement is
+ * never answered. How long it takes varies by model and is not small: on a cold power-up a Red 8Line
+ * acknowledges after ~0.15 ms, a Clarett 4Pre after ~11 ms and an 8Pre or 8PreX after ~12.6-13 ms. A
+ * fixed ~11.5 ms from the write to the first command therefore served the 4Pre by half a millisecond
+ * and lost the 8Pre's and 8PreX's first command every time. So clarett_hw_init
+ * waits for the acknowledgement (up to addr_ack_ms) instead of sleeping a fixed time, and the first
+ * command is then answered. No other register shows readiness: every pre-mailbox register reads its
+ * final value from the first read after the enable.
  *
- * A lost command completes (DONE raised) but never DMAs a response, and the device keeps refusing
- * anything sent as the next sequence number (err=3, stale echoed seq). Asking again as seq 0 is
- * answered normally, which is why the mailbox starts over at 0 after an unanswered command
- * (clarett_mailbox.c). So probe asks at once and, while unanswered, re-asks every ready_retry_ms until
- * it answers or ready_timeout_ms runs out. Each attempt waits ready_resp_ms for its response rather
- * than the mailbox's usual resp_timeout_ms: a response that lands at all lands within a millisecond,
- * and on a unit that loses its first command, that wait is most of the attach time. settle_ms is an
- * optional quiet period before the first ask.
+ * Fallback, for a device that does not acknowledge in time: a command sent too early completes (DONE
+ * raised) but never DMAs a response, and the device keeps refusing anything sent as the next sequence
+ * number (err=3, stale echoed seq). Asking again as seq 0 is answered normally, which is why the mailbox
+ * starts over at 0 after an unanswered command (clarett_mailbox.c). So probe re-asks every
+ * ready_retry_ms until it answers or ready_timeout_ms runs out. Each attempt waits ready_resp_ms for its
+ * response rather than the mailbox's usual resp_timeout_ms: a response that lands at all lands within a
+ * millisecond. settle_ms is an optional quiet period before the first ask.
  */
 static unsigned int settle_ms;
 module_param(settle_ms, uint, 0644);
@@ -169,6 +169,13 @@ MODULE_PARM_DESC(premailbox_reads,
 		 "Read the full pre-mailbox BAR0 register set at attach (caps/serial/fw-header/"
 		 "cause-blocks/0x514/0x58c) before the first FCP command. Default true; 0 reads only "
 		 "what the driver uses (diagnostic).");
+
+/* Bound on the response-address acknowledgement wait; see the probe readiness note above settle_ms. */
+static unsigned int addr_ack_ms = 500;
+module_param(addr_ack_ms, uint, 0644);
+MODULE_PARM_DESC(addr_ack_ms,
+		 "Wait up to this long (ms) for the device to acknowledge the response-buffer address "
+		 "(0x400 bit0) before the first command (default 500; 0 = a fixed ~3.22 ms instead).");
 
 static bool error_probe;
 module_param(error_probe, bool, 0444);
@@ -386,8 +393,26 @@ static void clarett_hw_init(struct clarett *c)
 		usleep_range(5640, 5800);		/* ~5.64 ms */
 		clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
 		usleep_range(1850, 1950);		/* ~1.85 ms */
-		clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
-		usleep_range(3200, 3350);		/* ~3.22 ms */
+		if (addr_ack_ms) {
+			ktime_t t0;
+
+			reinit_completion(&c->addr_acked);
+			WRITE_ONCE(c->addr_ack_wait, true);
+			t0 = ktime_get();
+			clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
+			if (wait_for_completion_timeout(&c->addr_acked, msecs_to_jiffies(addr_ack_ms)))
+				dev_dbg(&c->pci->dev,
+					"readiness: response address acknowledged after %lld us\n",
+					ktime_us_delta(ktime_get(), t0));
+			else
+				dev_warn(&c->pci->dev,
+					 "response address not acknowledged within %u ms; asking anyway\n",
+					 addr_ack_ms);
+			WRITE_ONCE(c->addr_ack_wait, false);
+		} else {
+			clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
+			usleep_range(3200, 3350);	/* ~3.22 ms */
+		}
 		{
 			/*
 			 * Read-to-clear cause blocks (0x100, 0x300, 0x200, 0x400, 0x500). On a cold boot they
@@ -1196,6 +1221,12 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 		u32 cause = readl(c->bar0 + REG_NOTIFY_CAUSE);	/* 0x400, read-to-clear */
 		u32 ev = cause & NOTIFY_MONITOR_MASK;
 
+		/* Init is waiting for the response-address acknowledgement (addr_ack_ms). */
+		if (READ_ONCE(c->addr_ack_wait) && (cause & 0x1)) {
+			WRITE_ONCE(c->addr_ack_wait, false);
+			complete(&c->addr_acked);
+		}
+
 		/* vec0 also fires on mailbox-DONE, and 0x400 reads its idle level 0x3 (== NOTIFY_MON_PRIMARY)
 		 * at completion time (see the REG_NOTIFY_CAUSE note in clarett.h). Skipping the notify path
 		 * while our own command is in flight suppresses that self-reflection. ctl_ready gates the
@@ -1634,6 +1665,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	mutex_init(&c->pcm_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
 	init_completion(&c->mbox_done);
+	init_completion(&c->addr_acked);
 	INIT_WORK(&c->notify_work, clarett_notify_work);
 	INIT_DELAYED_WORK(&c->save_work, clarett_save_work);
 	INIT_DELAYED_WORK(&c->meter_work, clarett_meter_work);

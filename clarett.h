@@ -537,6 +537,9 @@ struct clarett {
 	u8 mon_snap[MONITOR_CFG_MAX_LEN];
 	bool mon_snap_valid;
 	struct completion mbox_done;		/* completed by the vec0 ISR on mailbox DONE */
+	/* Response-address acknowledgement (0x400 bit0 after the 0x414 write); see addr_ack_ms. */
+	struct completion addr_acked;
+	bool addr_ack_wait;			/* the ISR completes addr_acked on 0x400 bit0 */
 	u32 mbox_cause;				/* 0x100 value the ISR consumed with DONE set */
 	/*
 	 * Is the mailbox wedged? Set when the last command either produced no response DMA at all, or

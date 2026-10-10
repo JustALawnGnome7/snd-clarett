@@ -109,20 +109,25 @@ mixer untouched.
 
 Probe sequence:
 
-1. **Ask, and retransmit until answered.** A freshly powered unit can lose its first mailbox
-   command: DONE is raised but no response arrives, and the device then refuses anything sent as the
-   next sequence number. Asking again as **sequence number 0** is answered, so after an unanswered
-   command the mailbox starts the sequence over at 0, and probe re-asks until the device answers or
-   `ready_timeout_ms` (10 s) runs out. Each attempt waits `ready_resp_ms` (20 ms) for its response
-   instead of the mailbox's usual 100 ms, because a response that lands at all lands within a
-   millisecond. A Red 8Line and a Clarett 4Pre answer the first attempt; a Clarett 8Pre or 8PreX
-   loses its first and answers the next one. No register shows when the device becomes ready, which
-   is why probe asks rather than waits.
-2. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
+1. **Wait for the response-address acknowledgement.** The device answers the write of the
+   response buffer's address (high word, `0x414`) by raising `0x400` bit 0, and does not answer a
+   mailbox command sent before that. Probe waits for it, up to `addr_ack_ms` (500 ms). The delay
+   varies by model: ~0.15 ms on a Red 8Line, ~11 ms on a Clarett 4Pre, ~13 ms on an 8Pre or 8PreX,
+   so a fixed pause loses the first command on some model. With the wait, every model answers its
+   first command, ~20-40 ms after the PCI enable.
+   Credit: Geoffrey D. Bennett identified this handshake.
+2. **Ask, and retransmit if unanswered** (fallback). A command sent before the acknowledgement
+   completes — DONE is raised — but no response arrives, and the device then refuses anything sent
+   as the next sequence number. Asking again as **sequence number 0** is answered, so after an
+   unanswered command the mailbox starts the sequence over at 0, and probe re-asks until the device
+   answers or `ready_timeout_ms` (10 s) runs out. Each attempt waits `ready_resp_ms` (20 ms) for its
+   response instead of the mailbox's usual 100 ms, because a response that lands at all lands within
+   a millisecond.
+3. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, config space, the firmware-info header and even the serial are the same across the
    line — but the session reports the model's stream geometry: `GET_7.1{band 0}` answers
    `{u16 playback_channels, u16 capture_channels}`, a pair unique per model.
-3. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
+4. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
    message to power-cycle it. The budget is kept short because a removal of the device (the user
    power-cycling it) waits for its probe to finish.
 
@@ -279,8 +284,9 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `monitor_poll` (default on) — the change-detecting monitor-region poll.
 - `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
 - `monitor_enables` (default on) — the probe-time Monitor Out 1-2 mute/dim enables.
-- `ready_resp_ms` (default 20), `ready_retry_ms` (default 0), `ready_timeout_ms` (default 10000),
-  `settle_ms` (default 0) — all runtime-writable: how long each probe attempt waits for its
+- `addr_ack_ms` (default 500), `ready_resp_ms` (default 20), `ready_retry_ms` (default 0),
+  `ready_timeout_ms` (default 10000), `settle_ms` (default 0) — all runtime-writable: the bound on
+  the response-address acknowledgement wait, how long each fallback attempt waits for its
   response, an extra pause between attempts, the budget described above, and an optional quiet
   period before the first command.
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
