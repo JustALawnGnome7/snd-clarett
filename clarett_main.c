@@ -73,10 +73,9 @@ MODULE_PARM_DESC(tx_trace,
  *   from the first read after the enable.
  *
  * A command sent too early completes (DONE raised) but never DMAs a response, and the device keeps
- * expecting that command's sequence number: anything sent with a later one is refused (err=3, stale
- * echoed seq). Re-sending with the SAME sequence number once the device is ready is answered normally,
- * which is why the mailbox does not advance the number past an unanswered command (clarett_mailbox.c).
- * So probe asks at once and, while the device is not ready, re-asks every ready_retry_ms until it
+ * refusing anything sent as the next sequence number (err=3, stale echoed seq). Asking again as seq 0
+ * once the device is ready is answered normally, which is why the mailbox starts over at 0 after an
+ * unanswered command (clarett_mailbox.c). So probe asks at once and, while the device is not ready, re-asks every ready_retry_ms until it
  * answers or ready_timeout_ms runs out. settle_ms is an optional quiet period before the first ask.
  */
 static unsigned int settle_ms;
@@ -1688,9 +1687,9 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		int tries = 0;
 
 		/*
-		 * Ask until the device answers. An attempt it was not ready for leaves its sequence number
-		 * unconsumed, so the next attempt is a retransmission of the same command (see the note
-		 * above settle_ms). Quiet while retrying; the last attempt is re-run with logging below.
+		 * Ask until the device answers. After an attempt it was not ready for, the mailbox starts
+		 * the sequence over at 0, so the next attempt is the same command as seq 0 again (see the
+		 * note above settle_ms). Quiet while retrying; the last attempt is re-run with logging below.
 		 * The budget is kept short: while probe holds the device, a removal of it (the user
 		 * power-cycling a unit that will not answer) waits too.
 		 */

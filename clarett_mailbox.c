@@ -390,16 +390,17 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	}
 
 	/*
-	 * Advance the sequence number only for a command the device answered as ours. One whose response
-	 * never landed (or that drew another command's answer) was not taken: the device still expects
-	 * this number, refuses every later one (err=3, stale echoed seq), and accepts the same number
-	 * again once it is ready. So the next command reuses the number. Measured on a Clarett asked too
-	 * early after power-up: re-asking with the next number stays refused indefinitely; re-sending the
-	 * same command with the same number answers. (A different command reusing the number, as after
-	 * a response lost mid-session, has not been tested.)
+	 * Advance the sequence number for a command the device answered as ours; after one whose response
+	 * never landed (or that drew another command's answer), start over at 0. Measured on a Clarett
+	 * asked too early after power-up, when the lost command was seq 0: re-asking as seq 1 stays
+	 * refused (err=3, stale echoed seq) indefinitely, re-asking as seq 0 is answered. Whether the
+	 * device wants 0 or the lost command's own number has not been separated, since the lost one was
+	 * always 0; nor has a reset after a response lost mid-session been tested.
 	 */
 	if (resp_echo && !c->mbox_wedged)
 		c->seq++;
+	else
+		c->seq = 0;
 
 	atomic_set(&c->cmd_inflight, 0);	/* completion window closed; idle-gap events may resume */
 

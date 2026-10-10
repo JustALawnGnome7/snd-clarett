@@ -110,10 +110,9 @@ mixer untouched.
 Probe sequence:
 
 1. **Ask, and retransmit until answered.** A freshly powered unit can lose its first mailbox
-   command: DONE is raised but no response arrives, and the device keeps expecting that command's
-   sequence number, refusing anything sent with a later one. Re-sending with the **same** number is
-   answered, so the mailbox never advances the sequence number past an unanswered command, and
-   probe re-asks every `ready_retry_ms` (250 ms) until the device answers or `ready_timeout_ms`
+   command: DONE is raised but no response arrives, and the device then refuses anything sent as the
+   next sequence number. Asking again as **sequence number 0** is answered, so after an unanswered
+   command the mailbox starts the sequence over at 0, and probe re-asks every `ready_retry_ms` (250 ms) until the device answers or `ready_timeout_ms`
    (10 s) runs out. A Red 8Line answers the first attempt (~25 ms after the PCI enable); a Clarett
    8Pre loses its first and answers the retransmission (~380 ms). No register shows when the
    device becomes ready, which is why probe asks rather than waits.
