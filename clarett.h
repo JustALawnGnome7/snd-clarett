@@ -45,20 +45,19 @@ struct snd_rawmidi_substream;
 
 /*
  * DIN MIDI UART (rawmidi) — register PIO, NOT the FCP mailbox / audio DMA. REG_MIDI_DATA is
- * bidirectional: a TX write packs up to 3 MIDI
- * bytes with a byte-count in the top byte; an RX read returns one byte with bit24 (MIDI_RX_VALID) set, or
- * 0 when the RX FIFO is empty. RX is interrupt-driven — the shared IRQ summary REG_MIDI_STATUS low byte
+ * bidirectional and both directions use one word format: up to 3 MIDI bytes packed low->high with a
+ * byte count in the top byte. An RX read with a count of 0 means the RX FIFO is empty; the device chooses
+ * how many bytes each RX word carries. RX is interrupt-driven — the shared IRQ summary REG_MIDI_STATUS low byte
  * carries a MIDI-RX-pending code (0x0a); the driver drains REG_MIDI_DATA, then writes
  * MIDI_IRQ_ACK_VAL to REG_MIDI_ACK to clear it. REG_MIDI_STATUS also carries the TX flow-control bit
  * MIDI_TX_READY, which must gate every TX write. See clarett_midi.c.
  */
 #define REG_MIDI_STATUS          0x500   /* IRQ summary (low byte 0x0a = MIDI RX pending); also read by servicer */
 #define REG_MIDI_ACK             0x504   /* write MIDI_IRQ_ACK_VAL to clear the MIDI RX interrupt */
-#define REG_MIDI_DATA            0x58c   /* TX: (count<<24)|(b2<<16)|(b1<<8)|b0 ; RX: (valid<<24)|byte */
-#define MIDI_RX_VALID            0x01000000u  /* bit24 of a REG_MIDI_DATA read: a byte is present */
-#define MIDI_RX_BYTE_MASK        0x000000ffu
+#define REG_MIDI_DATA            0x58c   /* TX and RX: (count<<24)|(b2<<16)|(b1<<8)|b0 */
 #define MIDI_IRQ_ACK_VAL         0x8          /* -> REG_MIDI_ACK to clear the MIDI RX interrupt */
-#define MIDI_TX_COUNT_SHIFT      24           /* TX packed word: byte count (1..3) in bits 24-31 */
+#define MIDI_COUNT_SHIFT         24           /* packed word: byte count in bits 24-31 */
+#define MIDI_WORD_BYTES          3            /* most MIDI bytes one packed word carries */
 /*
  * bit16 of REG_MIDI_STATUS: the TX FIFO can accept another packed word. It clears when the FIFO is
  * full, and a word written while it is clear is DISCARDED, silently tearing the outgoing byte

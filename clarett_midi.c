@@ -3,19 +3,20 @@
  * Focusrite Clarett/Red (Thunderbolt) ALSA driver — DIN MIDI (ALSA rawmidi).
  *
  * The MIDI transport is register PIO through a single memory-mapped MIDI UART at BAR0 REG_MIDI_DATA
- * (0x58c) — NOT the FCP mailbox, NOT the audio DMA ring. The framing is:
+ * (0x58c) — NOT the FCP mailbox, NOT the audio DMA ring. Both directions move the same packed word,
+ * (count << 24) | (b2 << 16) | (b1 << 8) | b0, where count = the number of valid MIDI bytes 1..3 packed
+ * low->high in wire order. `count` is a plain BYTE COUNT (the SysEx F7 terminator is a lone count=1 word),
+ * NOT a USB-MIDI CIN, and words are chunked by raw byte grouping, independent of message boundaries.
  *
- *   TX  write (count << 24) | (b2 << 16) | (b1 << 8) | b0  to REG_MIDI_DATA, where count = the number of
- *       valid MIDI bytes 1..3 packed low->high in transmit order. `count` is a plain BYTE COUNT (the SysEx
- *       F7 terminator is a lone count=1 word), NOT a USB-MIDI CIN. Chunking is by raw 3-byte grouping of
- *       the outgoing byte stream, independent of message boundaries — so the TX path just hands the device
- *       whatever bytes ALSA has queued, three at a time. Every write is gated on MIDI_TX_READY in
- *       REG_MIDI_STATUS: the FIFO is nine words deep and discards a word written while it is full.
+ *   TX  write a word to REG_MIDI_DATA. The TX path just hands the device whatever bytes ALSA has queued,
+ *       three at a time. Every write is gated on MIDI_TX_READY in REG_MIDI_STATUS: the FIFO is nine words
+ *       deep and discards a word written while it is full.
  *
- *   RX  read REG_MIDI_DATA one byte per read = (valid << 24) | byte, valid = bit24 (MIDI_RX_VALID); a read
- *       returns 0 when the RX FIFO is empty. RX is interrupt-driven (an idle device does zero MMIO): the
- *       shared IRQ summary REG_MIDI_STATUS carries a MIDI-RX-pending code in its low byte, the driver drains
- *       REG_MIDI_DATA to empty, then writes MIDI_IRQ_ACK_VAL to REG_MIDI_ACK to clear the interrupt.
+ *   RX  read a word from REG_MIDI_DATA; count 0 means the RX FIFO is empty. The device decides how many
+ *       bytes a word carries: the 2Pre returns one byte per read, while the 8PreX also returns count=2
+ *       words. RX is interrupt-driven (an idle device does zero MMIO): the shared IRQ summary
+ *       REG_MIDI_STATUS carries a MIDI-RX-pending code in its low byte, the driver drains REG_MIDI_DATA to
+ *       empty, then writes MIDI_IRQ_ACK_VAL to REG_MIDI_ACK to clear the interrupt.
  *
  * This is the simplest possible transport — no DMA, no descriptor rings, no mailbox round-trips — and it is
  * independent of the FCP control session, so MIDI works regardless of control-plane state. Every Clarett
@@ -63,13 +64,15 @@ MODULE_PARM_DESC(enable_midi,
  * while it is open and triggered, but the FIFO is ALWAYS drained and acked, open or not — the ack is what
  * re-arms the interrupt. Runs in hard IRQ context; snd_rawmidi_receive() is designed for that.
  *
- * A failed PCIe read returns 0xffffffff, which has MIDI_RX_VALID set and a 0xff data byte — treating it as
- * data would spin forever emitting 0xff, so bail on it (device gone / transiently unreachable).
+ * A word whose count exceeds MIDI_WORD_BYTES is not data. That includes a failed PCIe read (0xffffffff,
+ * count 0xff) — treating it as data would spin forever emitting 0xff — so bail on it (device gone /
+ * transiently unreachable).
  *
  * The FIFO must be emptied in ONE pass: a non-empty FIFO does not raise a fresh interrupt, so anything
- * left behind strands until an unrelated interrupt happens to re-enter this handler. CLARETT_MIDI_RX_GUARD
- * is therefore a runaway bound for a stuck valid bit, not a per-interrupt work budget, and it sits above
- * the measured FIFO depth so a legitimate backlog never hits it.
+ * left behind strands until an unrelated interrupt happens to re-enter this handler. Likewise a pass that
+ * reads data but skips the ack leaves the interrupt unarmed, so every word with a nonzero count counts as
+ * data. CLARETT_MIDI_RX_GUARD is a runaway bound in bytes for a stuck count, not a per-interrupt work
+ * budget, and it sits above the measured FIFO depth so a legitimate backlog never hits it.
  */
 void clarett_midi_irq(struct clarett *c)
 {
@@ -79,7 +82,7 @@ void clarett_midi_irq(struct clarett *c)
 
 	/*
 	 * Serialise: this runs for every MSI vector, and while streaming the period vectors fire on other
-	 * CPUs concurrently with vec0 — two drainers of the one-byte FIFO would interleave and reorder the
+	 * CPUs concurrently with vec0 — two drainers of the one FIFO would interleave and reorder the
 	 * bytes (corrupting multi-byte messages). Hardirq-only, so plain spin_lock (local IRQs already off).
 	 */
 	spin_lock(&c->midi_rx_lock);
@@ -87,18 +90,21 @@ void clarett_midi_irq(struct clarett *c)
 	ss = READ_ONCE(c->midi_in);
 	deliver = ss && READ_ONCE(c->midi_in_up);
 
-	while (guard-- > 0) {
+	while (guard > 0) {
 		u32 v = clarett_rl(c, REG_MIDI_DATA);
-		u8 byte;
+		unsigned int n = v >> MIDI_COUNT_SHIFT, i;
+		u8 bytes[MIDI_WORD_BYTES];
 
-		if (v == 0xffffffff)		/* failed transaction — never a real byte */
+		if (!n)				/* FIFO empty */
 			break;
-		if (!(v & MIDI_RX_VALID))	/* FIFO empty */
+		if (n > MIDI_WORD_BYTES)	/* failed transaction — never a real word */
 			break;
-		byte = v & MIDI_RX_BYTE_MASK;
+		for (i = 0; i < n; i++)
+			bytes[i] = v >> (i * 8);
+		guard -= n;
 		got = true;
 		if (deliver)
-			snd_rawmidi_receive(ss, &byte, 1);
+			snd_rawmidi_receive(ss, bytes, n);
 	}
 
 	if (got)
@@ -133,7 +139,7 @@ static void clarett_midi_tx_work(struct work_struct *w)
 {
 	struct clarett *c = container_of(w, struct clarett, midi_tx_work);
 	struct snd_rawmidi_substream *ss = READ_ONCE(c->midi_out);
-	u8 buf[3];
+	u8 buf[MIDI_WORD_BYTES];
 
 	if (!ss)
 		return;
@@ -154,7 +160,7 @@ static void clarett_midi_tx_work(struct work_struct *w)
 		if (n <= 0)			/* nothing more queued (a later write re-triggers us) */
 			break;
 
-		word = (u32)n << MIDI_TX_COUNT_SHIFT;
+		word = (u32)n << MIDI_COUNT_SHIFT;
 		for (i = 0; i < n; i++)
 			word |= (u32)buf[i] << (i * 8);
 
