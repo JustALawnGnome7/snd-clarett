@@ -52,8 +52,8 @@ period (`0x300`) events.
 - `CMD` maps straight onto the mailbox — the FCP wire packet *is* the mailbox packet.
 - `INIT` runs `INIT_1`/`INIT_2` with the opcodes `fcp-server` passes and returns the firmware-info
   block in `step2[]`. `step0` is zero-filled (its USB `STEP0` class request has no mailbox
-  equivalent; `fcp-server` ignores it), and `c->seq` is *not* reset — the in-kernel `GET_METER`
-  heartbeat shares it, and the device only echoes seq.
+  equivalent; `fcp-server` ignores it), and `c->seq` is *not* reset — the driver's own commands
+  share it, and the device only echoes seq.
 - `SET_METER_MAP`/`SET_METER_LABELS` let `fcp-server` create and drive `Level Meter`: it installs a
   channel → raw-slot map (the control's `.get` polls `GET_METER` and projects through it) plus an
   optional `FCP_CHANNEL_LABELS` TLV. The map's size is fixed once the control exists; a map of a
@@ -74,8 +74,10 @@ period (`0x300`) events.
 - **`hw_gain_follow` runs on events:** a relayed monitor or dim/mute event, the card coming up, and
   `fcp-server` committing a SW/HW switch (which the device does not announce).
 
-The device also needs a host heartbeat: the driver issues `GET_METER` every `meter_poll_ms`, as
-Focusrite Control does, and discards the response (`fcp-server` polls the meter itself).
+The device needs no host heartbeat: left with no host traffic for minutes, it still answers and
+control writes still take effect. The `Level Meter` control reads the meters on demand, so an idle
+card issues no mailbox commands at all. `meter_poll_ms` (default 0) optionally issues a periodic
+`GET_METER`, which also drives the `monitor_poll` backstop.
 
 ### Device maps
 

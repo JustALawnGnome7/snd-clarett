@@ -195,9 +195,9 @@ struct snd_rawmidi_substream;
 #define FCP_DATA_CMD             0x800002
 
 /*
- * GET_METER (0x001001): read the level meters. The driver also issues it periodically as a host
- * heartbeat, as Focusrite Control does while connected, with the 8-byte payload {0x00300000, 0x00000001}.
- * See clarett_meter_work().
+ * GET_METER (0x001001): read the level meters, payload {u16 0, u16 count, u32 1}. Read on demand by the
+ * Level Meter control; meter_poll_ms optionally issues it periodically too (clarett_meter_work()). The
+ * device does not need a periodic one as a host heartbeat.
  */
 #define FCP_GET_METER            0x001001
 #define CLARETT_METER_POLL_MS    40
@@ -213,8 +213,8 @@ struct snd_rawmidi_substream;
  * control at its UI refresh rate (30-60 Hz); a device command per read floods the mailbox and disrupts
  * streaming (skips + command timeouts, since control and stream contend on this Thunderbolt device). The
  * .get serves the cached levels between polls, so the GUI still sees a live meter with far fewer device
- * commands. Kept just above the heartbeat interval so the heartbeat's own refresh (below) keeps the cache
- * fresh and the .get never has to poll on its own — one meter poll rate, not two.
+ * commands. With the optional periodic GET_METER (meter_poll_ms) running, this sits just above its 40 ms
+ * default, so the worker keeps the cache fresh and the .get never polls on its own.
  */
 #define CLARETT_METER_CACHE_MS   50
 

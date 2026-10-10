@@ -126,11 +126,17 @@ MODULE_PARM_DESC(tx_frag_pad,
 		 "0 = contiguous (garbles playback on models whose fragment is not a power of two; "
 		 "diagnostic), >0 = audio bytes + this padding.");
 
-static int meter_poll_ms = CLARETT_METER_POLL_MS;
+/*
+ * Optional periodic GET_METER. The device does not need a host heartbeat: left with no host traffic at
+ * all for minutes, it still answers, and control writes still take physical effect. The Level Meter
+ * control reads the meters on demand (cached for CLARETT_METER_CACHE_MS), so an idle card issues no
+ * mailbox commands. The worker also hosts the optional monitor_poll backstop.
+ */
+static int meter_poll_ms;
 module_param(meter_poll_ms, int, 0444);
 MODULE_PARM_DESC(meter_poll_ms,
-		 "Period (ms) of the GET_METER host heartbeat, as Focusrite Control issues while connected. "
-		 "Default 40; 0 disables it (diagnostic).");
+		 "Period (ms) of an optional periodic GET_METER, which also drives monitor_poll "
+		 "(default 0: none; the meters are read on demand).");
 
 static int dma_bits = 32;
 module_param(dma_bits, int, 0444);
@@ -1280,7 +1286,8 @@ static void clarett_notify_work(struct work_struct *work)
  * actually CHANGE. It predates the event-bit relay, which now carries the knob and Dim/Mute idle and
  * while streaming, and hw_gain_follow, which now runs on those events (clarett_schedule_follow). Off
  * by default: every front-panel control tried on a Clarett and on a Red is followed without it. Kept
- * as a backstop for a change that raises no event. Cost when on is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
+ * as a backstop for a change that raises no event; it runs in the meter_poll_ms worker, so it needs that
+ * set too. Cost when on is one GET_DATA per tick beside the periodic GET_METER; a steady state with nobody touching
  * the unit relays nothing at all. The Clarett region (24, len 92) covers the monitor mute/dim flags,
  * the master volume pair at 32/33, the HW-enable bits and the knob; a model can widen it
  * (clarett_model.monitor_cfg_len) to reach its other front-panel controls.
@@ -1293,7 +1300,8 @@ static bool monitor_poll;
 module_param(monitor_poll, bool, 0644);
 MODULE_PARM_DESC(monitor_poll,
 		 "Poll the monitor config region and act when it changes: relay a notification and "
-		 "drive hw_gain_follow. A backstop for changes that raise no device event (default off).");
+		 "drive hw_gain_follow. A backstop for changes that raise no device event; runs in the "
+		 "meter_poll_ms worker, so needs that set too (default off).");
 
 /*
  * Keep the SW gain of every output under HARDWARE control equal to the front-panel knob.
@@ -1826,8 +1834,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 					      : frag + tx_frag_pad;
 	}
 
-	/* Start the GET_METER heartbeat now, so it is running for the rest of probe too, as in a
-	 * normal session, when the monitor-enable writes below go out. */
+	/* Start the optional periodic GET_METER now (meter_poll_ms), so it is already running when the
+	 * monitor-enable writes below go out. */
 	if (meter_poll_ms > 0)
 		schedule_delayed_work(&c->meter_work,
 				      msecs_to_jiffies(meter_poll_ms > 0 ? meter_poll_ms : CLARETT_METER_POLL_MS));
