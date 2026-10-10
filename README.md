@@ -222,6 +222,10 @@ MIDI ports, so a Red gets no MIDI device.
 If you use `amidi` to check MIDI input, pass `-a` and `-c`. Without them it discards Active Sensing
 (`FEh`) and Clock (`F8h`) from what it prints, which looks exactly like the interface dropping them.
 
+**Known issue (Clarett 8Pre):** a loopback test on one 8Pre loses 2 bytes of MIDI about every 50 ms
+while data is flowing, with the host otherwise idle and with the same result on older driver
+versions. The cause is not known yet; a 4Pre on the same host is byte-exact.
+
 ## Settings persistence
 
 The device **owns its settings**: they live in its own NVRAM and survive power cycles, reboots
