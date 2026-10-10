@@ -36,6 +36,18 @@ MODULE_PARM_DESC(legacy_mbox_cycle,
 	"so it serves as a negative control for the default cycle. Default 0.");
 
 /*
+ * Phase-bit cycle: with MSI up, a command completes on the device's own 0x400 phase bits, delivered by
+ * the vec0 ISR — bit0 when the request is accepted, bit1 when its response has landed — instead of
+ * DONE in 0x100 followed by a cause sweep and a poll of the response buffer. Runtime-writable, so the
+ * two cycles can be compared on a loaded module; 0 restores the DONE cycle.
+ */
+static bool phase_cycle = true;
+module_param(phase_cycle, bool, 0644);
+MODULE_PARM_DESC(phase_cycle,
+	"Complete mailbox commands on the 0x400 phase bits (accepted, then response landed) "
+	"delivered by the interrupt handler (default 1; 0 = the DONE + sweep + buffer-poll cycle).");
+
+/*
  * Why the trailing ack waits for the response. The doorbell ack (0x408=2) means "response
  * consumed, buffer free", not "completion observed": the device DMAs its response
  * asynchronously AFTER raising DONE, and acking before it lands makes the device refuse the
@@ -176,7 +188,8 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	unsigned long deadline;
 	u32 cause = 0, first_cause = 0, resp_echo = 0, fcp_status = 0;
 	ktime_t t_submit;
-	s64 done_us = -1, land_us = -1;
+	s64 done_us = -1, land_us = -1, acc_us = -1;
+	bool by_phase = false;
 	int i, ret = 0, polls = 0;
 
 	if (len > CLARETT_MBOX_DATA_MAX)
@@ -227,6 +240,8 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	 * mbox_done). Held until just before mutex_unlock so it still covers a completion MSI
 	 * delivered after the poll below observes DONE. */
 	reinit_completion(&c->mbox_done);
+	reinit_completion(&c->mbox_accepted);
+	reinit_completion(&c->mbox_landed);
 	atomic_set(&c->mbox_phase, 0);
 	atomic_set(&c->cmd_inflight, 1);
 
@@ -234,7 +249,37 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	clarett_wl(c, REG_DOORBELL, DOORBELL_SUBMIT);
 
 	deadline = jiffies + msecs_to_jiffies(CLARETT_MBOX_TIMEOUT_MS);
-	if (legacy_mbox_cycle) {
+	by_phase = phase_cycle && c->irq_ready && !legacy_mbox_cycle;
+	if (by_phase) {
+		/*
+		 * Accepted, then landed. Both deadlines follow the response deadline (resp_timeout_ms, or
+		 * ready_resp_ms while probe asks). An unaccepted or unanswered command is not acked, as in
+		 * the DONE cycle: the device then refuses the next sequence number, and the seq reset below
+		 * is what recovers it.
+		 */
+		unsigned int ms = c->resp_deadline_ms ? c->resp_deadline_ms : resp_timeout_ms;
+
+		polls = 1;
+		if (wait_for_completion_timeout(&c->mbox_accepted, msecs_to_jiffies(max(ms, 1u)))) {
+			acc_us = ktime_us_delta(ktime_get(), t_submit);
+			cause = IRQ_DONE_BIT;	/* accepted: the call succeeds, as DONE did */
+			if (wait_for_completion_timeout(&c->mbox_landed,
+							msecs_to_jiffies(max(ms, 1u))))
+				resp_echo = clarett_resp_wait(c, CMD_EXEC_FLAG | opcode,
+							      t_submit, &land_us);
+			if (resp_echo) {
+				clarett_resp_tail_wait(c);
+				dma_rmb();
+				fcp_status = clarett_get_le32((const u8 *)c->resp_buf +
+							      FCP_RESP_STATUS_OFF);
+				clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
+			} else {
+				dev_warn_ratelimited(&c->pci->dev,
+					"FCP op=0x%06x seq=%u: accepted, response never landed; ack withheld\n",
+					opcode, c->seq);
+			}
+		}
+	} else if (legacy_mbox_cycle) {
 		do {
 			cause = clarett_rl(c, REG_IRQ0_CAUSE);   /* read-to-clear */
 			if (!polls)
@@ -321,9 +366,9 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	/* Per-transaction trace. dev_dbg (not dev_info): the GET_METER heartbeat runs at ~24 Hz, so
 	 * info-level here would flood the log. Enable via dynamic debug when diagnosing the mailbox. */
 	dev_dbg(&c->pci->dev,
-		"FCP op=0x%06x seq=%u first_cause=0x%08x polls=%d done=%d phase=0x%x status=0x%08x\n",
-		opcode, c->seq, first_cause, polls, !!(cause & IRQ_DONE_BIT),
-		atomic_read(&c->mbox_phase), fcp_status);
+		"FCP op=0x%06x seq=%u %s first_cause=0x%08x polls=%d done=%d phase=0x%x acc=%lldus land=%lldus status=0x%08x\n",
+		opcode, c->seq, by_phase ? "phase" : "done", first_cause, polls,
+		!!(cause & IRQ_DONE_BIT), atomic_read(&c->mbox_phase), acc_us, land_us, fcp_status);
 
 	if (resp_trace) {
 		const u8 *r = c->resp_buf;

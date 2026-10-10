@@ -1220,6 +1220,10 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 
 		if (inflight) {
 			atomic_or(cause & NOTIFY_PHASE_MASK, &c->mbox_phase);
+			if (cause & NOTIFY_REQ_ACCEPTED)
+				complete(&c->mbox_accepted);
+			if (cause & NOTIFY_RESP_LANDED)
+				complete(&c->mbox_landed);
 			if (done & IRQ_DONE_BIT) {
 				c->mbox_cause = done;
 				complete(&c->mbox_done);
@@ -1667,6 +1671,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	mutex_init(&c->pcm_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
 	init_completion(&c->mbox_done);
+	init_completion(&c->mbox_accepted);
+	init_completion(&c->mbox_landed);
 	init_completion(&c->addr_acked);
 	INIT_WORK(&c->notify_work, clarett_notify_work);
 	INIT_DELAYED_WORK(&c->save_work, clarett_save_work);
