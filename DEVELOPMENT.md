@@ -218,8 +218,8 @@ it.
   each frame (`clarett_model.rx_loopback_at`), so ALSA capture channel n is the router's PCM n at
   every rate. The Red range's maps name capture channels in stream order and need no reordering.
 - **Clock source** is the `Clock Source` ALSA control, backed by the per-card `clock_source[]`
-  parameter. It is sent with the sample rate in `SET_CLOCK` at every arm. Changing it while idle
-  applies immediately; while streaming it waits for the next arm. `Sync Status` (from `fcp-server`)
+  parameter. It is sent with the sample rate in `SET_CLOCK` at every arm, and a change to the
+  control is sent at once at the current rate, streaming or not. `Sync Status` (from `fcp-server`)
   shows the lock.
 - **There is no default route**: playback is silent until a PCM source is wired to an output in the
   router.
