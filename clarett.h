@@ -35,7 +35,8 @@ struct snd_rawmidi_substream;
 #define REG_SERIAL_LO            0x010
 #define REG_SERIAL_HI            0x014
 #define REG_IRQ0_CAUSE           0x100   /* read-to-clear; bit DONE = mailbox complete */
-#define REG_IRQ0_ENABLE          0x104   /* initialised to 0xf000003f                 */
+#define REG_IRQ0_ENABLE          0x104
+#define IRQ0_ENABLE_ALL          0xf000003fu
 #define REG_NOTIFY_CAUSE         0x400   /* read-to-clear; carries the notify mask     */
 #define REG_DOORBELL             0x408   /* write 1 = submit, 2 = ack/clear prior      */
 #define REG_DMA_ADDR_LO          0x410   /* GET-response DMA buffer bus address (low 32)  */
@@ -52,7 +53,8 @@ struct snd_rawmidi_substream;
  * MIDI_IRQ_ACK_VAL to REG_MIDI_ACK to clear it. REG_MIDI_STATUS also carries the TX flow-control bit
  * MIDI_TX_READY, which must gate every TX write. See clarett_midi.c.
  */
-#define REG_MIDI_STATUS          0x500   /* IRQ summary (low byte 0x0a = MIDI RX pending); also read by servicer */
+#define REG_MIDI_CTRL            0x510   /* written 0x8 at attach; layout undecoded */
+#define REG_MIDI_STATUS          0x500  /* IRQ summary (low byte 0x0a = MIDI RX pending); also read by servicer */
 #define REG_MIDI_ACK             0x504   /* write MIDI_IRQ_ACK_VAL to clear the MIDI RX interrupt */
 #define REG_MIDI_DATA            0x58c   /* TX: (count<<24)|(b2<<16)|(b1<<8)|b0 ; RX: (valid<<24)|byte */
 #define MIDI_RX_VALID            0x01000000u  /* bit24 of a REG_MIDI_DATA read: a byte is present */

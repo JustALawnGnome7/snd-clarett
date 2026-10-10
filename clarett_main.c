@@ -156,13 +156,6 @@ MODULE_PARM_DESC(seed_dump,
 		 "One-shot dump of the full seeded config shadow [0,256) at probe (16 lines); diff two "
 		 "dumps to locate a setting's offset. Default 0.");
 
-static bool premailbox_reads = true;
-module_param(premailbox_reads, bool, 0444);
-MODULE_PARM_DESC(premailbox_reads,
-		 "Read the full pre-mailbox BAR0 register set at attach (caps/serial/fw-header/"
-		 "cause-blocks/0x514/0x58c) before the first FCP command. Default true; 0 reads only "
-		 "what the driver uses (diagnostic).");
-
 /* Bound on the response-address acknowledgement wait; see the probe readiness note above settle_ms. */
 static unsigned int addr_ack_ms = 500;
 module_param(addr_ack_ms, uint, 0644);
@@ -358,99 +351,37 @@ static void clarett_hw_init(struct clarett *c)
 {
 	void __iomem *bar = c->bar0;
 
-	/*
-	 * Pre-mailbox init: 0x510/0x500 device enable, the DMA-response address, and 0x104 (interrupt
-	 * causes). By default (premailbox_reads) this also reads the full attach register set — caps,
-	 * 0x4/0x8/0x514/0x58c, all cause blocks and the whole fw-info header — in the order, and with the
-	 * ~1-8 ms spacing between register groups, of a normal attach. readl() returns are discarded except
-	 * serial/fw (kept for the probe summary). Process context, so sleeping is fine.
-	 */
-	if (premailbox_reads) {
-		u32 r000, r004, r008, r514, r58c_a, r58c_b;
+	c->serial_hi = readl(bar + REG_SERIAL_HI);
+	c->serial_lo = readl(bar + REG_SERIAL_LO);
+	c->fw_app  = readl(bar + REG_INFO + 0x00);
+	c->fw_fpga = readl(bar + REG_INFO + 0x04);
 
-		readl(bar + REG_INFO);			/* 0x8000 — first touch */
-		r004 = readl(bar + 0x004);
-		r008 = readl(bar + 0x008);
-		r000 = readl(bar + REG_CAPS);		/* 0x000 */
-		c->serial_hi = readl(bar + REG_SERIAL_HI);	/* 0x014 (hi before lo) */
-		c->serial_lo = readl(bar + REG_SERIAL_LO);	/* 0x010 */
-		usleep_range(7000, 7200);		/* ~7 ms */
-		r514 = readl(bar + 0x514);
-		usleep_range(1300, 1400);		/* ~1.30 ms */
-		clarett_wl(c, 0x510, 0x8);
-		r58c_a = readl(bar + 0x58c);		/* back-to-back with the write */
-		usleep_range(780, 850);			/* ~0.78 ms */
-		clarett_wl(c, 0x500, 0x8);
-		usleep_range(880, 950);			/* ~0.88 ms */
-		clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);	/* 0x104 — BEFORE the DMA addr */
-		usleep_range(5640, 5800);		/* ~5.64 ms */
-		clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
-		usleep_range(1850, 1950);		/* ~1.85 ms */
-		if (addr_ack_ms) {
-			ktime_t t0;
+	/* The two MIDI-block writes every vendor attach makes; the block's control layout is not decoded
+	 * beyond these values. The interrupt causes are enabled before the address write, so its
+	 * acknowledgement reaches the ISR. */
+	clarett_wl(c, REG_MIDI_CTRL, 0x8);
+	clarett_wl(c, REG_MIDI_STATUS, 0x8);
+	clarett_wl(c, REG_IRQ0_ENABLE, IRQ0_ENABLE_ALL);
 
-			reinit_completion(&c->addr_acked);
-			WRITE_ONCE(c->addr_ack_wait, true);
-			t0 = ktime_get();
-			clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
-			if (wait_for_completion_timeout(&c->addr_acked, msecs_to_jiffies(addr_ack_ms)))
-				dev_dbg(&c->pci->dev,
-					"readiness: response address acknowledged after %lld us\n",
-					ktime_us_delta(ktime_get(), t0));
-			else
-				dev_warn(&c->pci->dev,
-					 "response address not acknowledged within %u ms; asking anyway\n",
-					 addr_ack_ms);
-			WRITE_ONCE(c->addr_ack_wait, false);
-		} else {
-			clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
-			usleep_range(3200, 3350);	/* ~3.22 ms */
-		}
-		{
-			/*
-			 * Read-to-clear cause blocks (0x100, 0x300, 0x200, 0x400, 0x500). On a cold boot they
-			 * report and clear whatever the device latched at power-on; clearing them is also what
-			 * makes the Analogue 2 gain LED flash briefly at probe.
-			 */
-			u32 c100 = readl(bar + REG_IRQ0_CAUSE);
-			u32 c300 = readl(bar + STREAM_BLK1);
-			u32 c200 = readl(bar + STREAM_BLK0);
-			u32 c400 = c->irq_ready ? 0 : readl(bar + REG_NOTIFY_CAUSE);	/* the ISR's when MSI is up */
-			u32 c500 = readl(bar + 0x500);
+	clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
+	if (addr_ack_ms) {
+		ktime_t t0;
 
-			dev_dbg(&c->pci->dev,
-				"pre-mailbox causes: 0x100=0x%08x 0x300=0x%08x 0x200=0x%08x 0x400=0x%08x 0x500=0x%08x\n",
-				c100, c300, c200, c400, c500);
-		}
-		usleep_range(8220, 8400);		/* ~8.22 ms */
-		r58c_b = readl(bar + 0x58c);
-		dev_dbg(&c->pci->dev,
-			"pre-mailbox regs: caps(0x0)=0x%08x 0x4=0x%08x 0x8=0x%08x 0x514=0x%08x 0x58c=0x%08x/0x%08x\n",
-			r000, r004, r008, r514, r58c_a, r58c_b);
-		c->fw_app  = readl(bar + REG_INFO + 0x00);	/* 0x8000 */
-		c->fw_fpga = readl(bar + REG_INFO + 0x04);	/* 0x8004 */
-		readl(bar + REG_INFO + 0x08);		/* rest of the 8-word fw-info header */
-		readl(bar + REG_INFO + 0x0c);
-		readl(bar + REG_INFO + 0x10);
-		readl(bar + REG_INFO + 0x14);
-		readl(bar + REG_INFO + 0x18);
-		readl(bar + REG_INFO + 0x1c);
-	} else {
-		/*
-		 * Read-minimal variant (premailbox_reads=0, diagnostic). 0x510/0x500 are the device-open
-		 * writes (global clock/converter-subsystem enable); the DMA-response address goes to
-		 * REG_DMA_ADDR_LO/HI (HI = bus-address high 32 bits); 0x104 enables the interrupt causes.
-		 */
-		c->serial_lo = readl(bar + REG_SERIAL_LO);
-		c->serial_hi = readl(bar + REG_SERIAL_HI);
-		c->fw_app    = readl(bar + REG_INFO + 0);
-		c->fw_fpga   = readl(bar + REG_INFO + 4);
-
-		clarett_wl(c, 0x510, 0x8);
-		clarett_wl(c, 0x500, 0x8);
-		clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
+		reinit_completion(&c->addr_acked);
+		WRITE_ONCE(c->addr_ack_wait, true);
+		t0 = ktime_get();
 		clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
-		clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);
+		if (wait_for_completion_timeout(&c->addr_acked, msecs_to_jiffies(addr_ack_ms)))
+			dev_dbg(&c->pci->dev, "readiness: response address acknowledged after %lld us\n",
+				ktime_us_delta(ktime_get(), t0));
+		else
+			dev_warn(&c->pci->dev,
+				 "response address not acknowledged within %u ms; asking anyway\n",
+				 addr_ack_ms);
+		WRITE_ONCE(c->addr_ack_wait, false);
+	} else {
+		clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
+		usleep_range(3200, 3350);	/* ~3.22 ms */
 	}
 
 	memset(c->shadow, 0, sizeof(c->shadow));
