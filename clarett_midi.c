@@ -9,8 +9,8 @@
  *       valid MIDI bytes 1..3 packed low->high in transmit order. `count` is a plain BYTE COUNT (the SysEx
  *       F7 terminator is a lone count=1 word), NOT a USB-MIDI CIN. Chunking is by raw 3-byte grouping of
  *       the outgoing byte stream, independent of message boundaries — so the TX path just hands the device
- *       whatever bytes ALSA has queued, three at a time. REG_MIDI_STATUS is read before each write, as a
- *       possible TX-ready gate.
+ *       whatever bytes ALSA has queued, three at a time. Every write is gated on MIDI_TX_READY in
+ *       REG_MIDI_STATUS: the FIFO is nine words deep and discards a word written while it is full.
  *
  *   RX  read REG_MIDI_DATA one byte per read = (valid << 24) | byte, valid = bit24 (MIDI_RX_VALID); a read
  *       returns 0 when the RX FIFO is empty. RX is interrupt-driven (an idle device does zero MMIO): the
@@ -23,12 +23,11 @@
  * where clarett_model.has_midi is set.
  *
  * Open questions, none affecting correctness: which MSI vector carries the MIDI RX interrupt (the ISR
- * drains on ANY vector); whether the pre-TX REG_MIDI_STATUS read is a required ready-gate (a large SysEx
- * dump could overrun the device FIFO — midi_tx_pace_us throttles if so); and whether the RX interrupt
- * needs an explicit enable at input-open (assumed covered by the REG_IRQ0_ENABLE write at probe).
+ * drains on ANY vector); and whether the RX interrupt needs an explicit enable at input-open (assumed
+ * covered by the REG_IRQ0_ENABLE write at probe).
  */
 #include <linux/io.h>
-#include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/list.h>
 #include <linux/pci.h>
 #include <linux/workqueue.h>
@@ -42,32 +41,41 @@ MODULE_PARM_DESC(enable_midi,
 		 "Register the DIN MIDI rawmidi device (the register UART at BAR0 0x58c). Default on.");
 
 /*
- * Optional per-word delay (us) after each MIDI TX register write. Default 0. MIDI is 3125 bytes/s at the
- * wire, but the register FIFO could be shallower than a burst; if a large SysEx dump overruns it (garbled
- * output), a few us here paces the writes to the UART drain rate. The pre-write REG_MIDI_STATUS read may
- * already be the device's own flow control, in which case this stays 0.
+ * TX flow control. The FIFO holds nine packed words and drains at the DIN wire rate — 3125 bytes/s,
+ * so ~960 us per 3-byte word — while a work item can fill it in microseconds. The poll interval is a
+ * fraction of a word time; the timeout is many word times, so it expires only if the UART has
+ * stopped draining altogether rather than merely being full.
  */
-static int midi_tx_pace_us;
-module_param(midi_tx_pace_us, int, 0644);
-MODULE_PARM_DESC(midi_tx_pace_us,
-		 "Delay (us) after each MIDI TX register write to throttle large SysEx (default 0 = none).");
+#define CLARETT_MIDI_TX_POLL_US     200
+#define CLARETT_MIDI_TX_TIMEOUT_US  100000
+
+/*
+ * Runaway bound on the RX drain loop. The device FIFO holds 139 bytes (measured by stalling the drain
+ * until it overflowed and counting what came back); this sits well above that, so a full FIFO always
+ * empties in a single pass.
+ */
+#define CLARETT_MIDI_RX_GUARD       256
 
 /*
  * Drain the RX FIFO, called from the ISR (clarett_irq) on any vector — MIDI RX is register PIO and which
  * MSI vector signals it is unconfirmed, so draining unconditionally is both correct and prevents a stuck
  * MIDI interrupt from livelocking whichever vector it lands on. Bytes are pushed to the input substream only
- * while it is open and triggered, but the FIFO is ALWAYS drained and acked (an undrained FIFO keeps the
- * interrupt asserted). Runs in hard IRQ context; snd_rawmidi_receive() is designed for that.
+ * while it is open and triggered, but the FIFO is ALWAYS drained and acked, open or not — the ack is what
+ * re-arms the interrupt. Runs in hard IRQ context; snd_rawmidi_receive() is designed for that.
  *
  * A failed PCIe read returns 0xffffffff, which has MIDI_RX_VALID set and a 0xff data byte — treating it as
- * data would spin forever emitting 0xff, so bail on it (device gone / transiently unreachable). The guard
- * count bounds the drain per interrupt; anything still pending re-interrupts.
+ * data would spin forever emitting 0xff, so bail on it (device gone / transiently unreachable).
+ *
+ * The FIFO must be emptied in ONE pass: a non-empty FIFO does not raise a fresh interrupt, so anything
+ * left behind strands until an unrelated interrupt happens to re-enter this handler. CLARETT_MIDI_RX_GUARD
+ * is therefore a runaway bound for a stuck valid bit, not a per-interrupt work budget, and it sits above
+ * the measured FIFO depth so a legitimate backlog never hits it.
  */
 void clarett_midi_irq(struct clarett *c)
 {
 	struct snd_rawmidi_substream *ss;
 	bool deliver, got = false;
-	int guard = 64;
+	int guard = CLARETT_MIDI_RX_GUARD;
 
 	/*
 	 * Serialise: this runs for every MSI vector, and while streaming the period vectors fire on other
@@ -100,10 +108,26 @@ void clarett_midi_irq(struct clarett *c)
 }
 
 /*
+ * Wait for the TX FIFO to accept another word. Sleeps rather than busy-waits: a full FIFO takes a
+ * word time to free a slot, which is most of a millisecond. Process context only.
+ */
+static int clarett_midi_tx_wait(struct clarett *c)
+{
+	u32 st;
+
+	return read_poll_timeout(clarett_rl, st, st & MIDI_TX_READY,
+				 CLARETT_MIDI_TX_POLL_US, CLARETT_MIDI_TX_TIMEOUT_US,
+				 false, c, REG_MIDI_STATUS);
+}
+
+/*
  * Drain the rawmidi output buffer into the TX register, up to 3 bytes per write. Runs in process context
  * (scheduled from the output trigger) so it can pull an arbitrarily long stream without spinning in atomic
  * context. snd_rawmidi_transmit() takes up to `count` RAW bytes irrespective of MIDI message boundaries —
  * exactly the device's 3-byte grouping — and combines peek+ack, so each call consumes what it returns.
+ *
+ * MIDI_TX_READY is checked BEFORE taking bytes from ALSA, so a device that has stopped draining leaves
+ * the stream queued for the next kick instead of consuming bytes it cannot transmit.
  */
 static void clarett_midi_tx_work(struct work_struct *w)
 {
@@ -121,6 +145,11 @@ static void clarett_midi_tx_work(struct work_struct *w)
 		if (pci_dev_is_disconnected(c->pci))
 			break;
 
+		if (clarett_midi_tx_wait(c)) {
+			dev_warn_ratelimited(&c->pci->dev, "MIDI TX FIFO stalled; output paused\n");
+			break;
+		}
+
 		n = snd_rawmidi_transmit(ss, buf, sizeof(buf));
 		if (n <= 0)			/* nothing more queued (a later write re-triggers us) */
 			break;
@@ -129,11 +158,7 @@ static void clarett_midi_tx_work(struct work_struct *w)
 		for (i = 0; i < n; i++)
 			word |= (u32)buf[i] << (i * 8);
 
-		clarett_rl(c, REG_MIDI_STATUS);	/* status read before each write (possible ready gate) */
 		clarett_wl(c, REG_MIDI_DATA, word);
-
-		if (midi_tx_pace_us)
-			udelay(midi_tx_pace_us);
 	}
 }
 
