@@ -549,8 +549,8 @@ struct clarett {
 	struct delayed_work save_work;		/* debounced DATA_CMD{PERSIST}; see CLARETT_SAVE_DELAY_MS */
 	atomic_t notify_bits;
 	/*
-	 * Last-seen monitor config region, for the change-detecting poll that keeps the front-panel
-	 * knob live while streaming (clarett_monitor_poll; the 0x400 relay is gated off by stream_on).
+	 * Last-seen monitor config region, for the change-detecting backstop poll
+	 * (clarett_monitor_poll).
 	 * Touched only from the meter worker, so no lock of its own.
 	 */
 	u8 mon_snap[MONITOR_CFG_MAX_LEN];

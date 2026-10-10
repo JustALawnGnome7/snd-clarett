@@ -132,19 +132,6 @@ MODULE_PARM_DESC(meter_poll_ms,
 		 "Period (ms) of the GET_METER host heartbeat, as Focusrite Control issues while connected. "
 		 "Default 40; 0 disables it (diagnostic).");
 
-/*
- * Relay 0x400 notifications to userspace while a stream runs. Off by default, which suppresses the
- * relay for the duration of any stream (see the stream_on gate in clarett_irq) to save the mailbox
- * traffic of fcp-server's re-reads; monitor_poll keeps the monitor controls live meanwhile.
- * Runtime-writable.
- */
-static bool notify_while_streaming;
-module_param(notify_while_streaming, bool, 0644);
-MODULE_PARM_DESC(notify_while_streaming,
-		 "Relay device notifications to userspace while streaming (default 0: suppressed for the "
-		 "duration of a stream, with monitor_poll covering the monitor controls). 1 lets fcp-server "
-		 "re-read its notifiable controls mid-stream, at the cost of that mailbox traffic.");
-
 static int dma_bits = 32;
 module_param(dma_bits, int, 0444);
 MODULE_PARM_DESC(dma_bits,
@@ -1240,15 +1227,9 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 		 * REG_NOTIFY_CAUSE note in clarett.h), and the in-flight test above keeps this path off
 		 * 0x400 while a command owns it. ctl_ready gates the relay: the handlers are hooked BEFORE
 		 * the controls exist (for MSI-paced completion), and a pre-controls event must not notify.
-		 *
-		 * stream_on gate: vec0 also fires on every audio period while the engine streams. When the
-		 * phase bits were relayed, each period scheduled a relay and fcp-server re-read every
-		 * notifiable control; with only event bits relayed that cost should be gone, but the gate
-		 * stays until that is measured. notify_while_streaming turns it off. While it is on,
-		 * front-panel changes reach userspace mid-stream only through monitor_poll, which covers the
-		 * monitor region and nothing else. */
-		if (ev && READ_ONCE(c->ctl_ready) &&
-		    (!READ_ONCE(c->stream_on) || READ_ONCE(notify_while_streaming))) {
+		 * Streaming or not: vec0 also fires on every audio period, but a period raises no event
+		 * bit, so a stream adds no relays (a stream with the knob untouched relays nothing). */
+		if (ev && READ_ONCE(c->ctl_ready)) {
 			atomic_or(ev, &c->notify_bits);
 			schedule_work(&c->notify_work);
 		}
@@ -1295,12 +1276,10 @@ static void clarett_notify_work(struct work_struct *work)
 }
 
 /*
- * Monitor-region change poll: keeps the front-panel knob live while streaming.
- *
- * The 0x400 notification relay is suppressed for the duration of a stream (the stream_on gate in
- * clarett_irq), and with PipeWire holding a PCM open more or less permanently, that is most of the
- * time. So read the monitor region at the meter rate and relay only when the bytes actually CHANGE.
- * Cost is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
+ * Monitor-region change poll: read the monitor region at the meter rate and relay only when the bytes
+ * actually CHANGE. It predates the event-bit relay, which now carries the knob and Dim/Mute idle and
+ * while streaming, and hw_gain_follow, which now runs on those events (clarett_schedule_follow); it
+ * stays as a backstop for front-panel changes that raise no event. Cost is one GET_DATA per tick beside the GET_METER heartbeat; a steady state with nobody touching
  * the unit relays nothing at all. The Clarett region (24, len 92) covers the monitor mute/dim flags,
  * the master volume pair at 32/33, the HW-enable bits and the knob; a model can widen it
  * (clarett_model.monitor_cfg_len) to reach its other front-panel controls.
@@ -1312,10 +1291,8 @@ static void clarett_notify_work(struct work_struct *work)
 static bool monitor_poll = true;
 module_param(monitor_poll, bool, 0644);
 MODULE_PARM_DESC(monitor_poll,
-		 "Poll the monitor config region and act when it changes: relay a notification, so "
-		 "front-panel controls keep tracking (the 0x400 relay is gated off for the duration of a "
-		 "stream), and drive hw_gain_follow. Default on; with 0 the knob does not update in "
-		 "userspace for as long as any PCM is open.");
+		 "Poll the monitor config region and act when it changes: relay a notification and "
+		 "drive hw_gain_follow. A backstop for changes that raise no device event (default on).");
 
 /*
  * Keep the SW gain of every output under HARDWARE control equal to the front-panel knob.
@@ -1507,9 +1484,8 @@ static void clarett_monitor_poll(struct clarett *c)
 
 	if (changed) {
 		/*
-		 * Streaming or not. While streaming the 0x400 relay is gated off and this is the only path;
-		 * when idle the relay is live, but it is not known to fire for every front-panel control (the
-		 * Red's Meter Source), and a duplicate costs fcp-server one re-read on a real change only.
+		 * The event relay normally got there first; this catches a change that raised no event (the
+		 * Red's Meter Source is one), and a duplicate costs fcp-server one re-read on a real change.
 		 */
 		clarett_hwdep_notify(c, NOTIFY_EV_MONITOR | NOTIFY_EV_DIM_MUTE);
 	}
