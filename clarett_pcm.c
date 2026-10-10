@@ -260,24 +260,20 @@ static void clarett_zero_tx(struct clarett *c)
 	memset(clarett_tx_area(c), 0, clarett_pcm_tx_dev_bytes(c));
 }
 
+/* STREAM_INFO speed band for a sample rate: 0 single, 1 double, 2 quad. */
+static unsigned int clarett_speed_band(unsigned int rate)
+{
+	return rate > 96000 ? 2 : rate > 48000 ? 1 : 0;
+}
+
 /*
  * How many leading capture channels does the device actually write at this rate? ADAT S/MUX removes the
  * upper ADAT channels at double and quad speed (8 -> 4 -> 2 per port); the frame stride is unchanged, so
- * the removed channels are a contiguous tail of the frame. See clarett_model.rx_live_{mid,high}.
+ * the removed channels are a contiguous tail of the frame. See clarett.rx_live[].
  */
 static u8 clarett_rx_live_channels(struct clarett *c, unsigned int rate)
 {
-	const struct clarett_model *m = c->model;
-	u8 live = m->capture_channels;
-
-	if (rate > 96000) {
-		if (m->rx_live_high)
-			live = m->rx_live_high;
-	} else if (rate > 48000) {
-		if (m->rx_live_mid)
-			live = m->rx_live_mid;
-	}
-	return min(live, m->capture_channels);
+	return c->rx_live[clarett_speed_band(rate)];
 }
 
 /*

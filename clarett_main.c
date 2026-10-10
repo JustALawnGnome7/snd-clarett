@@ -235,6 +235,39 @@ static int clarett_unit_tb_gen(struct pci_dev *pdev)
 }
 
 /*
+ * STREAM_INFO{band}: the device's stream geometry at one speed band. Returns 0 with the pair filled in,
+ * -EIO if the device refused the read (status != 0 or a short payload), or the transport error. The
+ * reply arrives by DMA, so it is read out of resp_buf.
+ */
+static int clarett_stream_info(struct clarett *c, u8 band, u16 *playback, u16 *capture, bool quiet)
+{
+	const u8 *r = c->resp_buf;
+	u16 size;
+	u8 status;
+	int err;
+
+	err = clarett_fcp(c, FCP_STREAM_INFO, &band, 1);
+	if (err) {
+		if (!quiet)
+			dev_warn(&c->pci->dev, "STREAM_INFO{%u} transport failed (%d)\n", band, err);
+		return err;
+	}
+	dma_rmb();	/* order the DMAed response before we read resp_buf */
+	status = r[FCP_RESP_STATUS_OFF];
+	size = clarett_get_le16(r + FCP_RESP_SIZE_OFF);
+	*playback = clarett_get_le16(r + FCP_RESP_DATA_OFF);
+	*capture  = clarett_get_le16(r + FCP_RESP_DATA_OFF + 2);
+	if (status != FCP_RESP_ERR_OK || size < 4) {
+		if (!quiet)
+			dev_warn(&c->pci->dev,
+				 "STREAM_INFO{%u} bad response (status=%u size=%u raw playback=%u capture=%u)\n",
+				 band, status, size, *playback, *capture);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
  * Ask the device who it is: STREAM_INFO{band 0} returns {u16 playback_ch, u16 capture_ch}
  * (+16 more bytes, meaning open), a pair unique per model. Runs before the meter heartbeat
  * starts, so nothing else touches resp_buf between the (landed-gated) completion and the parse.
@@ -254,40 +287,18 @@ static const struct clarett_model *clarett_detect_model(struct clarett *c, bool 
 		&clarett_2pre, &clarett_4pre, &clarett_8pre, &clarett_8prex,
 		&red_8line, &red_16line, &red_4pre, &red_8pre,
 	};
-	static const u8 band0;
-	const u8 *r = c->resp_buf;
-	u16 pb, cap, size;
-	u8 status;
-	int i, err;
-
-	*collapsed = false;
+	u16 pb, cap;
+	int i;
 
 	/*
-	 * Every early return logs the raw response (when not quiet), so a first attach of a new
-	 * model pins the cause (transport vs. status vs. unmatched) in one line and surfaces the
-	 * actual pair to add to the table.
+	 * The helper logs the raw response on every failure (when not quiet), so a first attach of a new
+	 * model pins the cause (transport vs. status vs. unmatched) in one line and surfaces the actual
+	 * pair to add to the table. Either failure is a collapse: the GET did not complete at all, or it
+	 * was refused (status=3/size=0).
 	 */
-	err = clarett_fcp(c, FCP_STREAM_INFO, &band0, 1);
-	if (err) {
-		if (!quiet)
-			dev_warn(&c->pci->dev,
-				 "model auto-detect: STREAM_INFO transport failed (%d)\n", err);
-		*collapsed = true;	/* GET didn't complete at all — the path is dead */
+	*collapsed = clarett_stream_info(c, 0, &pb, &cap, quiet) != 0;
+	if (*collapsed)
 		return NULL;
-	}
-	dma_rmb();	/* order the DMAed response before we read resp_buf */
-	status = r[FCP_RESP_STATUS_OFF];
-	size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
-	pb  = r[FCP_RESP_DATA_OFF]     | r[FCP_RESP_DATA_OFF + 1] << 8;
-	cap = r[FCP_RESP_DATA_OFF + 2] | r[FCP_RESP_DATA_OFF + 3] << 8;
-	if (status != FCP_RESP_ERR_OK || size < 4) {
-		if (!quiet)
-			dev_warn(&c->pci->dev,
-				 "model auto-detect: STREAM_INFO bad response (status=%u size=%u raw playback=%u capture=%u)\n",
-				 status, size, pb, cap);
-		*collapsed = true;	/* GET refused (status=3/size=0) */
-		return NULL;
-	}
 
 	/*
 	 * The pair identifies the model, except for the two Red pairs that share one (4Pre/8Line,
@@ -335,6 +346,36 @@ static void clarett_log_twin(struct clarett *c)
 	else
 		dev_warn(&c->pci->dev, "%s assumed: its geometry twin cannot be ruled out, as this unit's Thunderbolt controller (%04x:%04x) is not recognised (0x000 = 0x%08x)\n",
 			 m->name, br ? br->vendor : 0, br ? br->device : 0, clarett_rl(c, REG_CAPS));
+}
+
+/*
+ * Read how many capture channels the device writes at each speed band into c->rx_live[]. Band 0 is the
+ * full width by definition; the higher bands lose the channels ADAT S/MUX removes. A band the device
+ * will not answer, or answers with a width beyond the frame, is taken as full width — the capture then
+ * carries the device's residue in those channels rather than dropping the stream.
+ */
+static void clarett_read_rx_live(struct clarett *c)
+{
+	u8 width = c->model->capture_channels;
+	unsigned int band;
+
+	c->rx_live[0] = width;
+	for (band = 1; band < CLARETT_SPEED_BANDS; band++) {
+		u16 pb, cap;
+
+		c->rx_live[band] = width;
+		if (clarett_stream_info(c, band, &pb, &cap, false))
+			continue;
+		if (!cap || cap > width) {
+			dev_warn(&c->pci->dev,
+				 "STREAM_INFO{%u}: capture width %u outside 1..%u, treating as full width\n",
+				 band, cap, width);
+			continue;
+		}
+		c->rx_live[band] = cap;
+	}
+	dev_dbg(&c->pci->dev, "capture channels live per speed band: %u/%u/%u\n",
+		c->rx_live[0], c->rx_live[1], c->rx_live[2]);
 }
 
 void clarett_wl(struct clarett *c, u32 off, u32 val)
@@ -1745,6 +1786,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		c->model = det;
 		clarett_log_twin(c);
 		/* Nothing arms the device, so its flash-persisted routing stands untouched. */
+		clarett_read_rx_live(c);
 	}
 
 	/* RX fragment slot stride: default = page-safe pow2; 0 = contiguous; >0 = audio + padding. */
@@ -2104,10 +2146,8 @@ static const struct clarett_model clarett_8prex = {
 	.n_meter_sources = ARRAY_SIZE(clarett_8prex_meter_sources),
 	.capture_channels = STREAM_CHANS,
 	.playback_channels = STREAM_CHANS,
-	.rx_live_mid = 20,			/* two ADAT ports: ch20-27 gone at double speed */
 	.clock_srcs = clarett_8prex_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_8prex_clock_srcs),
-	.rx_live_high = 16,			/* + ch16-19 gone at quad */
 	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width); playback verified at single speed. */
@@ -2167,10 +2207,8 @@ static const struct clarett_model clarett_2pre = {
 	.notify_word = true,
 	.capture_channels = 14,			/* record-outputs pin count (12 record + 2 loopback) */
 	.playback_channels = 4,			/* playback pin count */
-	.rx_live_mid = 10,			/* ADAT 5-8 -> ch10-13 gone at double speed */
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
-	.rx_live_high = 8,			/* + ADAT 3-4 -> ch8-9 gone at quad */
 	.rx_loopback_at = 4,			/* after analogue 1-2 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified (correct pitch at 96k and 192k,
 						 * full width). */
@@ -2232,10 +2270,8 @@ static const struct clarett_model clarett_4pre = {
 	.notify_word = true,
 	.capture_channels = 20,			/* record-outputs pin count */
 	.playback_channels = 8,			/* playback pin count */
-	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
-	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 gone at quad */
 	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width); playback verified at single speed. */
@@ -2307,10 +2343,8 @@ static const struct clarett_model clarett_8pre = {
 	.notify_word = true,
 	.capture_channels = 20,			/* 18 record + 2 loopback */
 	.playback_channels = 20,		/* Playback 1-20 */
-	.rx_live_mid = 16,			/* ADAT 5-8 -> ch16-19 gone at double speed */
 	.clock_srcs = clarett_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
-	.rx_live_high = 14,			/* + ADAT 3-4 -> ch14-15 gone at quad */
 	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width). */
@@ -2362,11 +2396,10 @@ static const struct clarett_model red_8line = {
 	 * models. The Red differs in KIND, though: rather than simply losing channels it
 	 * RE-PINS survivors (a slot carrying ADAT 5 at single speed carries ADAT 9 at double and Dante 1 at
 	 * quad), and only the tail actually goes away. Both dead sets are still contiguous tails, which is
-	 * what these two counts require. They match the vendor's own per-rate routing tables, which route
-	 * exactly 52 and 32 capture slots at double and quad speed.
+	 * what clarett.rx_live[] requires. The vendor's own per-rate routing tables route exactly 52 and 32
+	 * capture slots at double and quad speed (ADAT 1-4 + 9-12 and all 32 Dante; ADAT 1-2 + 9-10 and
+	 * Dante 1-16).
 	 */
-	.rx_live_mid = 52,			/* ADAT 1-4 + 9-12, all 32 Dante: 8 slots fewer */
-	.rx_live_high = 32,			/* ADAT 1-2 + 9-10, Dante 1-16 */
 	/*
 	 * Double and quad speed verified: correct capture pitch at 96k and 192k, and a digital-loopback
 	 * ramp through a playback channel that survives each speed arrives sample-exact. Playback drops
@@ -2398,10 +2431,11 @@ static const struct clarett_model red_16line = {
 	.slug = "red-16line",
 	.capture_channels = 64,			/* 62 record + 2 loopback */
 	.playback_channels = 64,		/* Playback 1-64 */
-	/* The 8Line's S/MUX re-pinning, over a wider stream; both dead sets are contiguous tails. */
-	.rx_live_mid = 60,			/* ADAT 1-4 + 9-12, all 32 Dante: Dante 25-28's slots go */
-	.rx_live_high = 40,			/* ADAT 1-2 + 9-10, Dante 1-16 */
-	/* Playback 45-64 drop out at quad speed; the device ignores them, as on the 8Line. */
+	/*
+	 * The 8Line's S/MUX re-pinning, over a wider stream; both dead sets are contiguous tails, 60 and 40
+	 * capture channels live at double and quad speed (Dante 25-28's slots go at double). Playback 45-64
+	 * drop out at quad speed; the device ignores them, as on the 8Line.
+	 */
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
@@ -2423,8 +2457,6 @@ static const struct clarett_model red_4pre = {
 	.slug = "red-4pre",
 	.capture_channels = 60,			/* 58 record + 2 loopback, as the 8Line */
 	.playback_channels = 64,
-	.rx_live_mid = 52,
-	.rx_live_high = 32,
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
@@ -2438,8 +2470,6 @@ static const struct clarett_model red_8pre = {
 	.slug = "red-8pre",
 	.capture_channels = 64,			/* 62 record + 2 loopback, as the 16Line */
 	.playback_channels = 64,
-	.rx_live_mid = 60,
-	.rx_live_high = 40,
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
