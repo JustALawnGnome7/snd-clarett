@@ -16,7 +16,6 @@
 #include <linux/atomic.h>
 #include <linux/wait.h>		/* wait_queue_head_t — hwdep notification relay */
 #include <linux/workqueue.h>
-#include <linux/lcm.h>		/* lcm() — descriptor fragment alignment */
 #include <linux/string.h>	/* memcpy/memset */
 #include <linux/log2.h>		/* roundup_pow_of_two() — page-safe fragment slots */
 #include <linux/math64.h>	/* div_u64() — period-relative tick-late threshold */
@@ -83,22 +82,14 @@ struct snd_rawmidi_substream;
 #define   STREAM_OFF_BASE_LO     0x10    /* ring base bus address low 32    */
 #define   STREAM_OFF_BASE_HI     0x14    /* ring base bus address high 32   */
 #define   STREAM_OFF_PTR         0x18    /* DMA position (read-only)        */
-#define STREAM_CHANS             0x1c    /* 8PreX: 28 PCM channels/direction (populates clarett_8prex) */
-#define STREAM_SIZE_VAL          0x1c0   /* 8PreX: bytes the engine DMAs per descriptor (0x208 reg)    */
 /*
- * Descriptor ring. 0x210/0x214 (and 0x310/0x314) point at a table of bare
- * 8-byte little-endian guest-physical addresses, zero-terminated; each entry is one DMA fragment of
- * clarett_model.stream_frag bytes holding capture_channels-wide S32_LE (24-bit MSB-justified)
- * interleaved frames (frame stride = channels * 4). The probe lays CLARETT_STREAM_NDESC valid entries
- * (+ a zero terminator) per ring over one contiguous coherent buffer.
- *
- * STREAM_CHANS / STREAM_SIZE_VAL are the 8PreX values that populate clarett_8prex; all runtime stream
- * geometry is derived per-model from c->model via clarett_buf_bytes() &c. (defined below struct clarett).
+ * Descriptor ring. 0x210/0x214 (and 0x310/0x314) point at a table of bare 8-byte little-endian bus
+ * addresses; each entry is one DMA fragment of channels*4*CLARETT_FRAG_FRAMES bytes holding S32_LE
+ * (24-bit MSB-justified) interleaved frames (frame stride = channels * 4). The PCM path lays
+ * CLARETT_STREAM_NDESC entries per ring over one contiguous coherent buffer; see the geometry helpers
+ * below struct clarett.
  */
 #define CLARETT_STREAM_NDESC     256            /* descriptors per ring (model-independent) */
-
-/* --- PCM (data plane) --------------------------------------------------- */
-#define CLARETT_PCM_RATE         48000          /* default rate, all models (see clocking enum) */
 
 /* FCP mailbox header layout, relative to REG_MBOX */
 #define MBOX_CMD                 0x00    /* bit31 = execute flag | opcode               */
@@ -144,9 +135,6 @@ struct snd_rawmidi_substream;
 #define MONITOR_CFG_LEN          92      /* default: 24..115, the Clarett's gains, HW bits and knob */
 #define MONITOR_CFG_MAX_LEN      245     /* largest per-model region (clarett_model.monitor_cfg_len) */
 #define MONITOR_VOLUME_OFFSET    112     /* the front-panel knob's level; read-only reflection */
-#define MONITOR_ACTIVATE         2       /* DATA_CMD code shared by the monitor controls:
-                                          * mute@24 / dim@28 are 1-bit fields that toggle 0/1
-                                          * and commit with activate=2. */
 
 /*
  * DATA_CMD{5} = persist the app config to flash, issued standalone with no preceding SET_DATA. A plain
@@ -173,14 +161,6 @@ struct snd_rawmidi_substream;
 #define HWEN_MONITOR_MUTE_MASK   0x03    /* Monitor Out 1-2 mute enables */
 #define HWEN_MONITOR_DIM_MASK    0x0c    /* Monitor Out 1-2 dim enables  */
 
-/* S/PDIF source select: 2-bit fields, DATA_CMD activate 4. @132 picks the S/PDIF *input* to capture
- * (scarlett2's "S/PDIF Source Capture Enum"); @124 picks the S/PDIF *output* connector.
- * Enum None=0 / Optical=1 / RCA=2. */
-#define SPDIF_SOURCE_OFFSET      132
-#define SPDIF_SOURCE_ACTIVATE    4
-#define SPDIF_OUTPUT_OFFSET      124
-#define SPDIF_OUTPUT_ACTIVATE    4
-
 /* Hardware-meter source select (@184, DATA_CMD activate 8) + the per-band channel index tables written
  * alongside it (@136 / @146 / @156 for single / double / quad speed, 10 bytes each). Enum is a bitmask
  * value: Analogue=1 / S/PDIF=2 / ADAT1=4 / ADAT2=8. */
@@ -204,12 +184,6 @@ struct snd_rawmidi_substream;
 #define FCP_GET_METER            0x001001
 #define CLARETT_METER_POLL_MS    40
 
-/*
- * MUX_READ: read back the routing table. Request {u8 offset, u8 pad, u8 count, u8 band}; reply is an
- * array of u32 entries (src << 12 | dst), capped at 28 per reply whatever `count` asks for.
- */
-#define FCP_MUX_READ             0x003001
-#define CLARETT_MUX_READ_MAX     28
 /*
  * Minimum spacing between GET_METER device polls from the meter control's .get. The mixer GUI reads the
  * control at its UI refresh rate (30-60 Hz); a device command per read floods the mailbox and disrupts
@@ -308,22 +282,17 @@ struct snd_rawmidi_substream;
 #define CLARETT_SPEED_BANDS      3
 #define FCP_READ_SEG             0x800005
 #define FCP_INIT_2               0x000002
-#define FCP_GET_60               0x006000
-#define FCP_GET_61               0x006001
-#define FCP_GET_62               0x006002
-#define FCP_GET_70               0x007000
 
 /*
- * Further opcodes, named for documentation; the driver issues none of them itself. SET_MIX and SET_MUX
- * are what a routing or mixer edit from fcp-server issues.
+ * Further opcodes seen in the vendor attach, not issued by the driver. SET_MIX and SET_MUX are what a
+ * routing or mixer edit from fcp-server issues.
  *   0x000001 subsystem enable {u16 id}; 0x001000/0x002000/0x003000/0x004000 subsystem-count
- *   queries; 0x002002 SET_MIX {u16 mix, u16 coeff[30]}; 0x003002 SET_MUX; 0x004001/0x004005
- *   subsystem-4 setup; 0x005000 {u16 id} reads a fixed port-name string; 0x007002/0x007003
- *   {u32 speed, u16 count} declare the TX/RX stream width.
+ *   queries; 0x002002 SET_MIX {u16 mix, u16 coeff[30]}; 0x003001 MUX_READ {u8 offset, u8 pad,
+ *   u8 count, u8 band} -> u32 (src << 12 | dst) entries, at most 28 per reply; 0x003002 SET_MUX;
+ *   0x004001/0x004005 subsystem-4 setup; 0x005000 {u16 id} reads a fixed port-name string;
+ *   0x007002/0x007003 {u32 speed, u16 count} declare the TX/RX stream width.
  */
 #define FCP_INIT_1               0x000001
-#define FCP_SET_MIX              0x002002
-#define FCP_SET_MUX              0x003002
 
 /*
  * 0x000001 is also the CAPABILITY READ: {u16 category} -> one byte, non-zero = that opcode category
@@ -416,8 +385,6 @@ struct clarett_model {
 	u8 rx_loopback_at;
 	const struct clarett_clock_src *clock_srcs;	/* selectable clock sources, Internal first */
 	u8 n_clock_srcs;
-	u32 stream_frag;			/* engine-start diagnostic only (uniform per-descriptor DMA bytes);
-						 * the PCM path derives per-direction fragments from channel counts */
 	/*
 	 * Bytes from MONITOR_CFG_OFFSET that clarett_monitor_poll watches for front-panel changes. Must
 	 * cover every config byte a front-panel control can move. 0 = MONITOR_CFG_LEN; at most
@@ -459,7 +426,6 @@ struct clarett_meter_source {
 	u8 tbl[3][10];			/* meters-l, meters-m, meters-h (per sample-rate band) */
 };
 
-#define CLARETT_N_METERS         48    /* GET_METER returns 48 u32 levels (num_meters=0x30)  */
 #define CLARETT_METER_MAX        4095  /* meter level range 0..4095 (matches scarlett2)       */
 /* Most channels one Level Meter control can expose: an INTEGER control's value array. */
 #define CLARETT_METER_MAX_CHANNELS \
@@ -580,7 +546,7 @@ struct clarett {
 	unsigned int *hwdep_meter_labels_tlv[CLARETT_METER_PARTS];	/* each part's own labels */
 	unsigned int hwdep_meter_labels_tlv_size[CLARETT_METER_PARTS];
 
-	/* Data-plane engine state, shared by the PCM path and the stream_probe diagnostic. */
+	/* Data-plane engine state. stream_on is set once clarett_engine_arm() has programmed the rings. */
 	bool stream_on;
 	u32 rx_slot;			/* RX descriptor fragment SLOT stride in bytes (>= audio bytes/fragment):
 					 * a page-safe power of two by default, so no fragment straddles a page;
@@ -620,8 +586,6 @@ struct clarett {
 	void *stream_buf;		/* coherent streaming ring buffer */
 	dma_addr_t stream_dma;
 	size_t stream_size;
-	atomic_t period_irqs[CLARETT_NUM_VECTORS];   /* per-vector IRQ counts */
-	struct delayed_work stream_report;	/* logs pointer/IRQ progress after start */
 	struct task_struct *stream_svc;		/* polls/acks 0x300 to keep the engine clocked */
 	atomic_t stream_periods;		/* running period count (servicer -> hw pointer) */
 	u32 stream_ctr;				/* last 0x300 period counter (servicer-private) */
@@ -720,28 +684,6 @@ static inline void clarett_put_le16(u8 *p, u16 v)
 {
 	p[0] = v;
 	p[1] = v >> 8;
-}
-
-/*
- * Runtime stream geometry, derived per-model from c->model. The hardware rings live in one contiguous
- * coherent buffer of 2 * clarett_ring_bytes(): block 0 (TX) then block 1 (RX), each a descriptor table
- * (clarett_tbl_bytes, model-independent) followed by CLARETT_STREAM_NDESC sample fragments. Used only by
- * the stream_probe diagnostic, where TX and RX share one stream_frag; the PCM path uses the per-direction
- * clarett_pcm_* geometry below.
- */
-static inline size_t clarett_tbl_bytes(void)
-{
-	return ALIGN((CLARETT_STREAM_NDESC + 1) * sizeof(__le64), 64);
-}
-
-static inline size_t clarett_buf_bytes(const struct clarett *c)
-{
-	return (size_t)CLARETT_STREAM_NDESC * c->model->stream_frag;
-}
-
-static inline size_t clarett_ring_bytes(const struct clarett *c)
-{
-	return clarett_tbl_bytes() + clarett_buf_bytes(c);
 }
 
 /*
@@ -985,7 +927,6 @@ int clarett_write_bits(struct clarett *c, u32 offset, u8 mask, u8 val, u32 activ
 void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1);
 void clarett_engine_run(struct clarett *c);
 void clarett_engine_stop(struct clarett *c);
-int clarett_engine_start(struct clarett *c);
 
 /* pcm.c */
 int clarett_create_pcm(struct clarett *c);

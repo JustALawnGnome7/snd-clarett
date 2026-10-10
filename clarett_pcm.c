@@ -987,7 +987,7 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 
 	/* The sync queries, in order 0x6004, 0x6002, 0x6005 (see FCP_SYNC_READ in clarett.h). */
 	e_en1    = clarett_fcp(c, FCP_SYNC_READ, NULL, 0);
-	e_en2    = clarett_fcp(c, FCP_GET_62, NULL, 0);
+	e_en2    = clarett_fcp(c, FCP_SYNC_RATE_CFG, NULL, 0);
 	e_commit = clarett_fcp(c, FCP_SYNC_RATE, NULL, 0);
 
 	dev_dbg(&c->pci->dev,
@@ -1272,7 +1272,7 @@ int clarett_create_pcm(struct clarett *c)
 	 * it is; this adds the ring/buffer detail. */
 	dev_dbg(&c->pci->dev,
 		 "PCM registered (playback %uch / capture %uch, S32_LE @%u, bufs tx=%zu rx=%zu B @%pad)\n",
-		 c->model->playback_channels, c->model->capture_channels, CLARETT_PCM_RATE,
+		 c->model->playback_channels, c->model->capture_channels, CLARETT_DEFAULT_RATE,
 		 txbuf, rxbuf, &c->stream_dma);
 
 	return 0;
