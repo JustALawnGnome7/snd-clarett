@@ -118,7 +118,8 @@ Probe sequence:
 1. **Wait for the response-address acknowledgement.** The device answers the write of the
    response buffer's address (high word, `0x414`) by raising `0x400` bit 0, and does not answer a
    mailbox command sent before that. Probe waits for it, up to `addr_ack_ms` (500 ms). The delay
-   varies by model: ~0.15 ms on a Red 8Line, ~11 ms on a Clarett 4Pre, ~13 ms on an 8Pre or 8PreX,
+   varies by model: ~0.15 ms on a Red 8Line, ~9.5 ms on a Clarett 2Pre, ~11 ms on a 4Pre, ~13 ms
+   on an 8Pre or 8PreX (cold; a warm rebind is faster, ~2 ms on a 2Pre or 4Pre),
    so a fixed pause loses the first command on some model. With the wait, every model answers its
    first command, ~20-40 ms after the PCI enable.
    Credit: Geoffrey D. Bennett identified this handshake.
