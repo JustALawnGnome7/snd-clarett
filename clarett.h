@@ -293,12 +293,19 @@ struct snd_rawmidi_substream;
 #define FCP_SYNC_RATE_CFG        0x006002   /* u32 configured rate */
 
 /*
- * Session and identity opcodes, not fully decoded: CONFIG_PUSH registers config items by id, and
- * GET_6x/GET_7x/READ_SEG are version/identity queries. The device restores its own session from flash,
- * so the host issues only what the stream path needs: clarett_stream_handshake() issues CONFIG_PUSH and
- * the GET_7.x queries at every arm, and clarett_detect_model() uses GET_7.1's channel-count answer as the
- * model identity.
+ * STREAM_INFO {u8 speed_band} -> {u16 playback_ch, u16 capture_ch, u32, u32}: the device's stream
+ * geometry at single (0), double (1) and quad (2) speed. The band-0 pair identifies the model
+ * (clarett_detect_model()); the capture word at bands 1 and 2 is how many leading capture channels the
+ * device still writes once ADAT S/MUX has removed some (clarett_read_rx_live()). The two trailing words
+ * are not decoded. A band past 2 is answered with an empty reply, and is never asked.
+ *
+ * The rest are session and identity opcodes, not fully decoded: CONFIG_PUSH registers config items by
+ * id, and GET_6x/GET_7.2/GET_7.3/READ_SEG are version/identity queries. The device restores its own
+ * session from flash, so the host issues only what the stream path needs: clarett_stream_handshake()
+ * issues CONFIG_PUSH and GET_7.2/GET_7.3 at every arm.
  */
+#define FCP_STREAM_INFO          0x007001
+#define CLARETT_SPEED_BANDS      3
 #define FCP_READ_SEG             0x800005
 #define FCP_INIT_2               0x000002
 #define FCP_CONFIG_PUSH          0x005000
@@ -306,7 +313,6 @@ struct snd_rawmidi_substream;
 #define FCP_GET_61               0x006001
 #define FCP_GET_62               0x006002
 #define FCP_GET_70               0x007000
-#define FCP_GET_71               0x007001
 #define FCP_GET_72               0x007002
 #define FCP_GET_73               0x007003
 
@@ -433,6 +439,10 @@ struct clarett_model {
 	 * clarett_set_rx_live() latches the split at prepare and clarett_rx_drain() does the blanking. These
 	 * are the counts of leading capture channels the device still writes at double and quad speed; the
 	 * dead remainder is a contiguous tail on every model. 0 = all channels live (no ADAT, or unknown).
+	 *
+	 * The device reports the same counts itself (STREAM_INFO at bands 1 and 2), and its answer is what
+	 * the driver uses (clarett.rx_live[]). This table is the fallback for a band the device does not
+	 * answer, and a cross-check: a disagreement is logged at probe.
 	 */
 	u8 rx_live_mid;				/* capture channels written at 88.2/96 kHz */
 	u8 rx_live_high;			/* capture channels written at 176.4/192 kHz */
@@ -632,10 +642,13 @@ struct clarett {
 					 * is truthful before anything streams; lets userspace read the rate
 					 * with NO device traffic (fcp-server needs it to pick the per-rate
 					 * meter layout, and polling the mailbox for it would be gratuitous). */
+	u8 rx_live[CLARETT_SPEED_BANDS];	/* capture channels the device writes at single/double/quad
+						 * speed: STREAM_INFO's answer, read at probe, or the model
+						 * table's where the device gave none (clarett_read_rx_live) */
 	u32 rx_live_bytes;		/* leading bytes of each capture frame the device fills at the negotiated
 					 * rate, and the S/MUX-removed tail after them. Latched at prepare from
-					 * clarett_model.rx_live_{mid,high}; the drain blanks the tail because the
-					 * engine still leaves a sparse residue there. 0 dead = full width. */
+					 * rx_live[]; the drain blanks the tail because the engine still leaves a
+					 * sparse residue there. 0 dead = full width. */
 	u32 rx_dead_bytes;
 	u32 irq_descs;			/* effective RX IRQ cadence (descriptors between markers); 0 = default 16.
 					 * dyn_period derives it from the negotiated ALSA period (clarett_irq_descs). */

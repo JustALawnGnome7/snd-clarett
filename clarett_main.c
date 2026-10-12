@@ -189,7 +189,7 @@ static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, cla
  * regs, config space, the fw-info header, even the dummy serial), and the Thunderbolt DROM's model
  * name is not reliably visible either (whether a Thunderbolt 2 unit is enumerated as a kernel-managed
  * Thunderbolt device depends on the host firmware). But the device reports its own stream geometry:
- * GET_7.1{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per model.
+ * STREAM_INFO{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per model.
  *
  * Everything downstream is sized from c->model: channel counts, DMA ring and descriptor geometry,
  * fragment strides, routing and mixer tables, meter layout, the fcp-server map slug. A wrong model
@@ -242,9 +242,44 @@ static int clarett_unit_tb_gen(struct pci_dev *pdev)
 }
 
 /*
- * Ask the device who it is: GET_7.1{band 0} returns {u16 playback_ch, u16 capture_ch}
- * (+16 more bytes, meaning open), a pair unique per model. Runs before the meter heartbeat
- * starts, so nothing else touches resp_buf between the (landed-gated) completion and the parse.
+ * STREAM_INFO{band}: the device's stream geometry at one speed band. Returns 0 with the pair filled
+ * in, -EIO if the device refused the read (status != 0, or a reply too short to hold the pair), or
+ * the transport error. The reply arrives by DMA and is read out of resp_buf, so this runs only while
+ * nothing else can issue a command (probe, before the card is registered). When not quiet, every
+ * failure logs the raw response.
+ */
+static int clarett_stream_info(struct clarett *c, u8 band, u16 *playback, u16 *capture, bool quiet)
+{
+	const u8 *r = c->resp_buf;
+	u16 size;
+	u8 status;
+	int err;
+
+	err = clarett_fcp(c, FCP_STREAM_INFO, &band, 1);
+	if (err) {
+		if (!quiet)
+			dev_warn(&c->pci->dev, "STREAM_INFO{%u}: transport failed (%d)\n", band, err);
+		return err;
+	}
+	dma_rmb();	/* order the DMAed response before we read resp_buf */
+	status = r[FCP_RESP_STATUS_OFF];
+	size = clarett_get_le16(r + FCP_RESP_SIZE_OFF);
+	*playback = clarett_get_le16(r + FCP_RESP_DATA_OFF);
+	*capture  = clarett_get_le16(r + FCP_RESP_DATA_OFF + 2);
+	if (status != FCP_RESP_ERR_OK || size < 4) {
+		if (!quiet)
+			dev_warn(&c->pci->dev,
+				 "STREAM_INFO{%u}: bad response (status=%u size=%u raw playback=%u capture=%u)\n",
+				 band, status, size, *playback, *capture);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Ask the device who it is: STREAM_INFO{band 0} returns {u16 playback_ch, u16 capture_ch}, a pair
+ * unique per model (bar the Red twins below). Runs before the meter heartbeat starts, so nothing
+ * else touches resp_buf between the (landed-gated) completion and the parse.
  * Returns NULL if the query fails or the pair matches no known model.
  *
  * A NULL return is fatal to probe either way — there is no fallback model — but *collapsed
@@ -261,40 +296,18 @@ static const struct clarett_model *clarett_detect_model(struct clarett *c, bool 
 		&clarett_2pre, &clarett_4pre, &clarett_8pre, &clarett_8prex,
 		&red_8line, &red_16line, &red_4pre, &red_8pre,
 	};
-	static const u8 band0;
-	const u8 *r = c->resp_buf;
-	u16 pb, cap, size;
-	u8 status;
-	int i, err;
-
-	*collapsed = false;
+	u16 pb, cap;
+	int i;
 
 	/*
-	 * Every early return logs the raw response (when not quiet), so a first attach of a new
-	 * model pins the cause (transport vs. status vs. unmatched) in one line and surfaces the
-	 * actual pair to add to the table.
+	 * Every failure logs the raw response (when not quiet), so a first attach of a new model pins
+	 * the cause (transport vs. status vs. unmatched) in one line and surfaces the actual pair to
+	 * add to the table. Either failure of the read is a collapse: the GET did not complete at all,
+	 * or it was refused (status=3/size=0).
 	 */
-	err = clarett_fcp(c, FCP_GET_71, &band0, 1);
-	if (err) {
-		if (!quiet)
-			dev_warn(&c->pci->dev,
-				 "model auto-detect: GET_7.1 transport failed (%d)\n", err);
-		*collapsed = true;	/* GET didn't complete at all — the path is dead */
+	*collapsed = clarett_stream_info(c, 0, &pb, &cap, quiet) != 0;
+	if (*collapsed)
 		return NULL;
-	}
-	dma_rmb();	/* order the DMAed response before we read resp_buf */
-	status = r[FCP_RESP_STATUS_OFF];
-	size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
-	pb  = r[FCP_RESP_DATA_OFF]     | r[FCP_RESP_DATA_OFF + 1] << 8;
-	cap = r[FCP_RESP_DATA_OFF + 2] | r[FCP_RESP_DATA_OFF + 3] << 8;
-	if (status != FCP_RESP_ERR_OK || size < 4) {
-		if (!quiet)
-			dev_warn(&c->pci->dev,
-				 "model auto-detect: GET_7.1 bad response (status=%u size=%u raw playback=%u capture=%u)\n",
-				 status, size, pb, cap);
-		*collapsed = true;	/* GET refused (status=3/size=0) */
-		return NULL;
-	}
 
 	/*
 	 * The pair identifies the model, except for the two Red pairs that share one (4Pre/8Line,
@@ -342,6 +355,47 @@ static void clarett_log_twin(struct clarett *c)
 	else
 		dev_warn(&c->pci->dev, "%s assumed: its geometry twin cannot be ruled out, as this unit's Thunderbolt controller (%04x:%04x) is not recognised (0x000 = 0x%08x)\n",
 			 m->name, br ? br->vendor : 0, br ? br->device : 0, clarett_rl(c, REG_CAPS));
+}
+
+/*
+ * Read how many leading capture channels the device writes at each speed band into c->rx_live[]:
+ * STREAM_INFO's capture word at bands 1 and 2 (band 0 is the full width by definition). The device's
+ * answer is used. The model table (rx_live_mid/high) is the fallback for a band the device does not
+ * answer, or answers with a width outside the frame, and a cross-check: a disagreement is logged, so a
+ * table value never read from a unit is checked the first time one attaches. Run after the model is
+ * final, since the Red twins share band 0 but not necessarily the table.
+ */
+static void clarett_read_rx_live(struct clarett *c)
+{
+	const struct clarett_model *m = c->model;
+	u8 width = m->capture_channels;
+	unsigned int band;
+
+	c->rx_live[0] = width;
+	for (band = 1; band < CLARETT_SPEED_BANDS; band++) {
+		u8 table = band == 1 ? m->rx_live_mid : m->rx_live_high;
+		u16 pb, cap;
+
+		if (!table || table > width)
+			table = width;
+		c->rx_live[band] = table;
+		if (clarett_stream_info(c, band, &pb, &cap, false)) {
+			dev_warn(&c->pci->dev, "STREAM_INFO{%u} unanswered: using the %s table's %u live capture channels\n",
+				 band, m->name, table);
+			continue;
+		}
+		if (!cap || cap > width) {
+			dev_warn(&c->pci->dev, "STREAM_INFO{%u}: capture width %u outside 1..%u; using the %s table's %u\n",
+				 band, cap, width, m->name, table);
+			continue;
+		}
+		if (cap != table)
+			dev_warn(&c->pci->dev, "STREAM_INFO{%u}: device writes %u capture channels, the %s table says %u; using the device's\n",
+				 band, cap, m->name, table);
+		c->rx_live[band] = cap;
+	}
+	dev_dbg(&c->pci->dev, "capture channels live per speed band: %u/%u/%u\n",
+		c->rx_live[0], c->rx_live[1], c->rx_live[2]);
 }
 
 void clarett_wl(struct clarett *c, u32 off, u32 val)
@@ -479,10 +533,10 @@ static void clarett_error_probe(struct clarett *c)
 		{ "GET_DATA bad-offset",      FCP_GET_DATA, { 0,0,0xff,0xff, 4,0,0,0 }, 8 },
 		{ "unknown opcode 0x0000ff",  0x0000ff,     { 0 }, 0 },
 		/* Queries that answer with real data on a working session: READ_SEG (segment open),
-		 * GET_7/GET_6 device queries, CONFIG_PUSH{id} (a per-id name query: 0x1e -> "ADAT 8"),
+		 * STREAM_INFO/GET_6 device queries, CONFIG_PUSH{id} (a per-id name query: 0x1e -> "ADAT 8"),
 		 * and GET_DATA{0xc8} in the persistent appspace. */
 		{ "READ_SEG{0,8}",            FCP_READ_SEG, { 0,0,0,0,  8,0,0,0 }, 8 },
-		{ "GET_7.1{0}",               0x007001,     { 0 }, 1 },
+		{ "STREAM_INFO{0}",           FCP_STREAM_INFO, { 0 }, 1 },
 		{ "GET_6.2",                  0x006002,     { 0 }, 0 },
 		{ "CONFIG_PUSH{0x1e}",        0x005000,     { 0x1e, 0 }, 2 },
 		{ "GET_DATA{0xc8,8}",         FCP_GET_DATA, { 0xc8,0,0,0, 8,0,0,0 }, 8 },
@@ -1813,6 +1867,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		}
 		c->model = det;
 		clarett_log_twin(c);
+		clarett_read_rx_live(c);
 		/* Nothing arms the device, so its flash-persisted routing stands untouched. */
 	}
 
@@ -2483,7 +2538,7 @@ static const struct clarett_model red_16line = {
  * Focusrite Red 4Pre and Red 8Pre — NOT YET SEEN ON HARDWARE; everything here comes from their device
  * descriptors. Each is its Line model's twin: the same stream geometry, S/MUX tails, clock sources,
  * knob groups and config layout, with preamps on more of its inputs (a control-plane difference the
- * fcp-server maps carry, not the driver). They share their twin's GET_7.1 pair, so they are told
+ * fcp-server maps carry, not the driver). They share their twin's STREAM_INFO pair, so they are told
  * apart by the unit's own Thunderbolt controller: the Pre models are Thunderbolt 2 units, the Line
  * models Thunderbolt 3 (clarett_unit_tb_gen()).
  */

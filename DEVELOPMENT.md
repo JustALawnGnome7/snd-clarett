@@ -132,8 +132,9 @@ Probe sequence:
    a millisecond.
 3. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, config space, the firmware-info header and even the serial are the same across the
-   line — but the session reports the model's stream geometry: `GET_7.1{band 0}` answers
-   `{u16 playback_channels, u16 capture_channels}`, a pair unique per model.
+   line — but the session reports the model's stream geometry: `STREAM_INFO{band 0}` (`0x007001`)
+   answers `{u16 playback_channels, u16 capture_channels}`, a pair unique per model. Probe then asks
+   bands 1 and 2 (double and quad speed) for the capture width S/MUX leaves; see Sample rates below.
 4. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
    message to power-cycle it. The budget is kept short because a removal of the device (the user
    power-cycling it) waits for its probe to finish.
@@ -212,7 +213,11 @@ it.
   4096-frame hardware ring. `max_buffer` adds an optional hard ceiling.
 - **Sample rates** 44.1-192 kHz on every supported model. The stream width does not change with
   rate. At double and quad speed the channels S/MUX removes still arrive in the stream with junk
-  in them, so the servicer blanks that dead tail of the capture frame every period.
+  in them, so the servicer blanks that dead tail of the capture frame every period. How many
+  channels stay live at each speed comes from the device (STREAM_INFO's capture word at bands 1
+  and 2, read at probe). The per-model `rx_live_mid`/`rx_live_high` table is the fallback for a
+  band the device does not answer, and a cross-check: a disagreement is logged at probe.
+  Credit: Geoffrey D. Bennett identified STREAM_INFO and its speed bands.
 - **Capture channel order matches the router's PCM names.** The Claretts send the loopback pair
   after the fixed inputs and before ADAT (so S/MUX only ever removes a tail), while the router
   numbers it last (PCM 19-20 on a 4Pre or 8Pre). The capture copy moves the pair to the end of
