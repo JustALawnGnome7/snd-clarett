@@ -204,6 +204,11 @@ engine; the other joins the running clock. Each tick drains the RX ring into the
 refills the TX ring ahead of the device's read position, keeping `CLARETT_TX_GUARD_FRAMES` clear of
 it.
 
+Before each arm the driver sends `SET_CLOCK{rate, source}` and three sync queries. The vendor's
+handshake also reads a port-name string per stream channel (`0x005000`) and declares the stream
+widths (`0x007002`/`0x007003`); none of that is needed, since the engine streams at full width
+without it, so the driver does not send it. Credit: Geoffrey D. Bennett established this.
+
 - **Descriptor fragments are page-safe.** A fragment is `channels × 4 × 16` bytes; each sits in its
   own power-of-two slot so none straddles a 4 KB page, which the device's per-fragment DMA
   mis-frames. On the 2Pre and 4Pre the fragment is already a power of two; the 8Pre and 8PreX need

@@ -953,17 +953,15 @@ static int clarett_pcm_hw_free(struct snd_pcm_substream *ss)
 
 /*
  * Stream-config handshake, run immediately before every engine arm: the device resets its stream config
- * when idle, so nothing established earlier survives to arm time. SET_CLOCK first, then the per-channel
- * CONFIG_PUSH burst (model->stream_tx_ids / stream_rx_ids), which declares which physical inputs feed
- * which DMA stream channels — without it the engine arms cleanly but no samples are routed and 0x300
- * never ticks. Order: SET_CLOCK, GET_6.2, GET_7.2, push tx ids, GET_7.3, push rx ids, then the sync
- * queries. Non-fatal: log and proceed even if a command errors. Process context, so the mailbox is safe.
+ * when idle, so nothing established earlier survives to arm time. SET_CLOCK{rate, source}, then the sync
+ * queries. The vendor also sends a per-channel 0x005000 burst here, but it only reads fixed port-name
+ * strings, and the engine streams at full width without it (see FCP_INIT_1 in clarett.h). Non-fatal:
+ * log and proceed even if a command errors. Process context, so the mailbox is safe.
  */
 static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 {
-	const struct clarett_model *m = c->model;
-	u8 clk[8], id[2];
-	int e_clk, e_en1, e_en2, e_commit, pushes = 0, push_err = 0, batch_err = 0, i;
+	u8 clk[8];
+	int e_clk, e_en1, e_en2, e_commit, batch_err = 0, i;
 	int clk_src = clarett_clock_source(c);
 
 	if (!rate)
@@ -973,23 +971,6 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 	clarett_put_le32(clk + 4, clk_src);
 
 	e_clk = clarett_fcp(c, FCP_SET_CLOCK, clk, sizeof(clk));
-
-	/* Per-channel routing push (skipped if the model has no ids). */
-	if (m->n_stream_tx_ids || m->n_stream_rx_ids) {
-		clarett_fcp(c, FCP_GET_62, NULL, 0);
-		clarett_fcp(c, FCP_GET_72, NULL, 0);
-		for (i = 0; i < m->n_stream_tx_ids; i++) {
-			id[0] = m->stream_tx_ids[i]; id[1] = 0;
-			push_err |= clarett_fcp(c, FCP_CONFIG_PUSH, id, sizeof(id));
-			pushes++;
-		}
-		clarett_fcp(c, FCP_GET_73, NULL, 0);
-		for (i = 0; i < m->n_stream_rx_ids; i++) {
-			id[0] = m->stream_rx_ids[i]; id[1] = 0;
-			push_err |= clarett_fcp(c, FCP_CONFIG_PUSH, id, sizeof(id));
-			pushes++;
-		}
-	}
 
 	/* Diagnostic re-init batch (stream_batch): subsystem enables 1..8, count queries, and
 	 * 0x004001 for indices 0..5. Semantics not decoded. */
@@ -1017,9 +998,9 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 	e_commit = clarett_fcp(c, FCP_SYNC_RATE, NULL, 0);
 
 	dev_dbg(&c->pci->dev,
-		 "stream-handshake: SET_CLOCK{%u,%u}=%d CONFIG_PUSH=%d(err=%d) batch=%s(err=%d) "
+		 "stream-handshake: SET_CLOCK{%u,%u}=%d batch=%s(err=%d) "
 		 "0x6004=%d 0x6002=%d 0x6005=%d\n",
-		 rate, clk_src, e_clk, pushes, push_err, stream_batch ? "yes" : "off", batch_err,
+		 rate, clk_src, e_clk, stream_batch ? "yes" : "off", batch_err,
 		 e_en1, e_en2, e_commit);
 }
 
