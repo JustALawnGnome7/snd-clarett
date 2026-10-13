@@ -115,6 +115,11 @@ mixer untouched.
 
 Probe sequence:
 
+0. **Minimal register init.** Read the serial and firmware words, write `0x510 = 8` and
+   `0x500 = 8` (the device-open writes every attach makes), enable the interrupt causes
+   (`0x104`), then write the response buffer's address. Nothing else is needed before the first
+   command: the register reads, cause-block sweep and inter-group pauses of a normal attach change
+   nothing about how the device answers. Credit: Geoffrey D. Bennett established this.
 1. **Wait for the response-address acknowledgement.** The device answers the write of the
    response buffer's address (high word, `0x414`) by raising `0x400` bit 0, and does not answer a
    mailbox command sent before that. Probe waits for it, up to `addr_ack_ms` (500 ms). The delay
