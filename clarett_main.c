@@ -29,18 +29,11 @@
 #define PCI_VENDOR_FOCUSRITE   0x1cb5
 #define PCI_DEVICE_CLARETT     0x0002
 
-static bool stream_probe;
-module_param(stream_probe, bool, 0444);
-MODULE_PARM_DESC(stream_probe,
-		 "Diagnostic: after probe, program the ring registers with a driver buffer and watch "
-		 "for vec1/vec2 IRQs + DMA-pointer movement (off by default; excludes enable_pcm).");
-
 static bool enable_pcm = true;
 module_param(enable_pcm, bool, 0444);
 MODULE_PARM_DESC(enable_pcm,
 		 "Register the PCM devices (playback + capture, S32_LE, descriptor-ring engine driven "
-		 "by the 0x300 servicer). Default on. Set 0 for a control-only card, or when using "
-		 "stream_probe (mutually exclusive).");
+		 "by the 0x300 servicer). Default on. Set 0 for a control-only card.");
 
 static int tx_trace;
 module_param(tx_trace, int, 0644);
@@ -77,22 +70,11 @@ MODULE_PARM_DESC(tx_trace,
  * Fallback, for a device that does not acknowledge in time: a command sent too early completes (DONE
  * raised) but never DMAs a response, and the device keeps refusing anything sent as the next sequence
  * number (err=3, stale echoed seq). Asking again as seq 0 is answered normally, which is why the mailbox
- * starts over at 0 after an unanswered command (clarett_mailbox.c). So probe re-asks every
- * ready_retry_ms until it answers or ready_timeout_ms runs out. Each attempt waits ready_resp_ms for its
- * response rather than the mailbox's usual resp_timeout_ms: a response that lands at all lands within a
- * millisecond. settle_ms is an optional quiet period before the first ask.
+ * starts over at 0 after an unanswered command (clarett_mailbox.c). So probe re-asks at once until it
+ * answers or ready_timeout_ms runs out. Each attempt waits ready_resp_ms for its response rather than the
+ * mailbox's usual resp_timeout_ms: a response that lands at all lands within a millisecond, and the
+ * device answers the next attempt whenever it comes, so no further pause between attempts helps.
  */
-static unsigned int settle_ms;
-module_param(settle_ms, uint, 0644);
-MODULE_PARM_DESC(settle_ms,
-		 "Leave the device untouched for this long (ms) after attach before the first command "
-		 "(default 0: ask at once and retry).");
-
-static unsigned int ready_retry_ms;
-module_param(ready_retry_ms, uint, 0644);
-MODULE_PARM_DESC(ready_retry_ms,
-		 "Pause (ms) between readiness attempts at probe while the device has not answered "
-		 "(default 0: each attempt is already paced by ready_resp_ms).");
 
 static unsigned int ready_resp_ms = 20;
 module_param(ready_resp_ms, uint, 0644);
@@ -107,26 +89,6 @@ MODULE_PARM_DESC(ready_timeout_ms,
 		 "(default 10000).");
 
 /*
- * RX fragment slot stride. A fragment that straddles a 4 KB page is mis-framed by the device's DMA: with
- * the fragments packed contiguously, the capture drifts its channel alignment by 8 bytes per page. Giving
- * each RX fragment its own page-safe SLOT (a power of two, so it divides the page) over a page-aligned
- * area keeps every fragment page-contained. Default (-1) = auto = roundup_pow_of_two(fragment). 0 = packed
- * contiguously (drifts; diagnostic). >0 = fragment audio bytes + this many.
- */
-static int rx_frag_pad = -1;
-module_param(rx_frag_pad, int, 0444);
-MODULE_PARM_DESC(rx_frag_pad,
-		 "RX fragment slot: -1 = auto page-safe pow2 (default), 0 = contiguous (drifts; "
-		 "diagnostic), >0 = audio bytes + this padding.");
-
-static int tx_frag_pad = -1;
-module_param(tx_frag_pad, int, 0444);
-MODULE_PARM_DESC(tx_frag_pad,
-		 "TX fragment slot (mirror of rx_frag_pad): -1 = auto page-safe pow2 (default), "
-		 "0 = contiguous (garbles playback on models whose fragment is not a power of two; "
-		 "diagnostic), >0 = audio bytes + this padding.");
-
-/*
  * Optional periodic GET_METER. The device does not need a host heartbeat: left with no host traffic at
  * all for minutes, it still answers, and control writes still take physical effect. The Level Meter
  * control reads the meters on demand (cached for CLARETT_METER_CACHE_MS), so an idle card issues no
@@ -138,38 +100,13 @@ MODULE_PARM_DESC(meter_poll_ms,
 		 "Period (ms) of an optional periodic GET_METER, which also drives monitor_poll "
 		 "(default 0: none; the meters are read on demand).");
 
-static int dma_bits = 32;
-module_param(dma_bits, int, 0444);
-MODULE_PARM_DESC(dma_bits,
-		 "DMA coherent mask width (bits). Default 32. Lower it (e.g. 31 -> <2 GB, 30 -> <1 GB) to "
-		 "force the stream buffer lower in the address space (diagnostic).");
-
-static bool monitor_enables = true;
-module_param(monitor_enables, bool, 0444);
-MODULE_PARM_DESC(monitor_enables,
-		 "At probe, write the monitor HW-enable bits (0x48/0x49, cmd3) so global Mute/Dim affect "
-		 "Monitor Out 1-2. Default true; 0 leaves the device's own setting.");
-
-static bool seed_dump;
-module_param(seed_dump, bool, 0444);
-MODULE_PARM_DESC(seed_dump,
-		 "One-shot dump of the full seeded config shadow [0,256) at probe (16 lines); diff two "
-		 "dumps to locate a setting's offset. Default 0.");
-
-/* Bound on the response-address acknowledgement wait; see the probe readiness note above settle_ms. */
+/* Bound on the response-address acknowledgement wait; see the probe readiness note above ready_resp_ms. */
 static unsigned int addr_ack_ms = 500;
 module_param(addr_ack_ms, uint, 0644);
 MODULE_PARM_DESC(addr_ack_ms,
 		 "Wait up to this long (ms) for the device to acknowledge the response-buffer address "
-		 "(0x400 bit0) before the first command (default 500; 0 = a fixed ~3.22 ms instead).");
-
-static bool error_probe;
-module_param(error_probe, bool, 0444);
-MODULE_PARM_DESC(error_probe,
-		 "Diagnostic: at probe, send a few deliberately MALFORMED FCP commands (bad offset, zero "
-		 "length, unknown opcode) alongside a valid GET_DATA and log each response's error word "
-		 "(resp+8) and size. Off by default (sends junk commands). Combine with meter_poll_ms=0, or "
-		 "the heartbeat's responses interleave with the probe's.");
+		 "(0x400 bit0) before the first command (default 500; 0 = do not wait, which usually loses "
+		 "the first command to the retransmit fallback).");
 
 static const struct clarett_model clarett_8prex, clarett_2pre, clarett_4pre, clarett_8pre,
 				  red_8line, red_16line, red_4pre, red_8pre;
@@ -445,89 +382,6 @@ static void clarett_hw_init(struct clarett *c)
 }
 
 /*
- * Error-code probe (error_probe, diagnostic). Send a valid GET_DATA plus deliberately malformed and
- * unsupported commands, and log each response's error word (resp+8) and size. Reads resp+8 directly
- * because the BAR MBOX_ERROR word reads 0; the real error is in the DMAed response.
- */
-static void clarett_error_probe(struct clarett *c)
-{
-	static const struct {
-		const char *name;
-		u32 opcode;
-		u8 data[8];
-		u16 len;
-	} cmds[] = {
-		/* Status codes (resp+8) on a working session, one per validation stage:
-		 *   valid → 0; bad parameter (offset out of range / oversized length) → 1;
-		 *   unsupported category (ESP_DFU 0x009) → 4; unknown opcode or sub-op in a
-		 *   supported category → 7. Zero-length and past-the-end reads are accepted (0).
-		 * A refused session answers everything identically: err=3, size=0, seq=0 (the
-		 * request seq is not echoed), opcode echoed. */
-		{ "GET_DATA{24,4} valid",     FCP_GET_DATA, { 24,0,0,0,  4,0,0,0 }, 8 },
-		{ "GET_DATA bad-offset",      FCP_GET_DATA, { 0,0,0xff,0xff, 4,0,0,0 }, 8 },
-		{ "unknown opcode 0x0000ff",  0x0000ff,     { 0 }, 0 },
-		/* Queries that answer with real data on a working session: READ_SEG (segment open),
-		 * STREAM_INFO/GET_6 device queries, 0x005000{id} (a port-name read: 0x1e -> "ADAT 8"),
-		 * and GET_DATA{0xc8} in the persistent appspace. */
-		{ "READ_SEG{0,8}",            FCP_READ_SEG, { 0,0,0,0,  8,0,0,0 }, 8 },
-		{ "STREAM_INFO{0}",           FCP_STREAM_INFO, { 0 }, 1 },
-		{ "GET_6.2",                  0x006002,     { 0 }, 0 },
-		{ "PORT_NAME{0x1e}",         0x005000,     { 0x1e, 0 }, 2 },
-		{ "GET_DATA{0xc8,8}",         FCP_GET_DATA, { 0xc8,0,0,0, 8,0,0,0 }, 8 },
-		/* Further validation stages: length errors, an unknown sub-op inside a supported
-		 * category, and a command in an unsupported one. Read-only — no side effects. */
-		{ "GET_DATA zero-len",        FCP_GET_DATA, { 24,0,0,0,  0,0,0,0 }, 8 },
-		{ "GET_DATA oversized-len",   FCP_GET_DATA, { 0,0,0,0,  0,0,1,0 }, 8 },   /* len=0x10000 */
-		{ "GET_DATA overrun-end",     FCP_GET_DATA, { 0xf8,0,0,0, 0x40,0,0,0 }, 8 }, /* off ok, off+len past end */
-		{ "unknown sub-op in MUX",    0x0030ff,     { 0 }, 0 },   /* supported cat 0x003, bogus sub-op */
-		{ "unknown sub-op in MIX",    0x0020ff,     { 0 }, 0 },   /* supported cat 0x002, bogus sub-op */
-		{ "unsupported cat ESP_DFU",  0x009000,     { 0 }, 0 },   /* CAP_READ: 0x009 NOT SUPPORTED */
-		{ "unsupported cat ESP_DFU1", 0x009001,     { 0 }, 0 },
-	};
-	const u8 *r = c->resp_buf;
-	int i, ret;
-
-	for (i = 0; i < ARRAY_SIZE(cmds); i++) {
-		u32 exp_echo = CMD_EXEC_FLAG | cmds[i].opcode;
-		u16 exp_seq = c->seq;		/* the seq clarett_fcp will stamp on this command */
-		unsigned long deadline;
-		u32 echo = 0, err = 0;
-		u16 size = 0, rseq = 0;
-		bool landed = false;
-
-		/*
-		 * The device DMAs its response ASYNCHRONOUSLY, a little after the BAR done bit clarett_fcp
-		 * polls — so reading resp_buf immediately races and catches the PREVIOUS command's late
-		 * response. Wait for THIS command's response by matching the echoed opcode (unique per command
-		 * after the memset). A refusal does not echo the request seq (it writes seq=0), so match the
-		 * echo ONLY; a timeout is a genuine no-response. Requires meter_poll_ms=0 (else the heartbeat
-		 * shares resp_buf and bumps seq).
-		 */
-		memset(c->resp_buf, 0, 32);
-		ret = clarett_fcp(c, cmds[i].opcode, cmds[i].data, cmds[i].len);
-
-		deadline = jiffies + msecs_to_jiffies(50);
-		do {
-			dma_rmb();
-			echo = r[0] | r[1] << 8 | r[2] << 16 | r[3] << 24;
-			rseq = r[FCP_RESP_SEQ_OFF] | r[FCP_RESP_SEQ_OFF + 1] << 8;
-			if (echo == exp_echo) {
-				landed = true;
-				break;
-			}
-			usleep_range(200, 300);
-		} while (time_before(jiffies, deadline));
-
-		size = r[4] | r[5] << 8;
-		err  = r[8] | r[9] << 8 | r[10] << 16 | r[11] << 24;
-		dev_info(&c->pci->dev,
-			 "error_probe: %-20s fcp_ret=%d %s echo=0x%08x seq=%u(exp %u) err=%u size=%u payload=%*ph\n",
-			 cmds[i].name, ret, landed ? "RESP" : "NO-RESP",
-			 echo, rseq, exp_seq, err, size, 8, r + FCP_RESP_DATA_OFF);
-	}
-}
-
-/*
  * Seed the whole config shadow from the device. clarett_hw_init() zeroes the shadow; the seed
  * gives the command-3 enable bytes (72/73) their real values, which their packed bits need for a
  * safe read-modify-write. The first GET after programming the DMA address can come back empty
@@ -582,71 +436,6 @@ static int clarett_enable_monitor_hw_controls(struct clarett *c)
 }
 
 /*
- * stream_probe diagnostic layout: two identical rings (block 0 = TX, block 1 = RX). Each ring is a
- * zero-terminated descriptor table followed by its sample fragments; *ring is one ring's byte span,
- * so block 1 begins at offset *ring. Same math in start and report so they agree.
- */
-static void clarett_ring_layout(struct clarett *c, size_t *tbl, size_t *smp, size_t *ring)
-{
-	*tbl = clarett_tbl_bytes();
-	*smp = clarett_buf_bytes(c);
-	*ring = clarett_ring_bytes(c);
-}
-
-/* 1 s after engine-start, log whether DMA advanced: period IRQs, pointer regs, capture-buffer writes. */
-static void clarett_stream_report(struct work_struct *work)
-{
-	struct clarett *c = container_of(work, struct clarett, stream_report.work);
-	size_t tbl, smp, ring, i;
-	const u8 *rx_smp;
-	bool rx_data = false;
-	u32 c1_hits = 0, c2_hits = 0, c2_min = 0xffffffff, c2_max = 0;
-
-	/*
-	 * The streaming signal is the block cause register: while streaming, 0x300 reads
-	 * 0x80000000 | an advancing period counter. Poll 0x200/0x300 here in a ~40 ms burst; bit31-set
-	 * reads with an advancing low counter == periods firing.
-	 */
-	for (i = 0; i < 2000; i++) {
-		u32 c1 = readl(c->bar0 + STREAM_BLK0);		/* 0x200 cause (read-to-clear) */
-		u32 c2 = readl(c->bar0 + STREAM_BLK1);		/* 0x300 cause (read-to-clear) */
-
-		if (c1 & 0x80000000)
-			c1_hits++;
-		if (c2 & 0x80000000) {
-			u32 ctr = c2 & 0x7fffffff;
-
-			c2_hits++;
-			if (ctr < c2_min)
-				c2_min = ctr;
-			if (ctr > c2_max)
-				c2_max = ctr;
-		}
-		udelay(20);
-	}
-	if (c2_min == 0xffffffff)
-		c2_min = 0;
-
-	clarett_ring_layout(c, &tbl, &smp, &ring);
-	rx_smp = (const u8 *)c->stream_buf + ring + tbl;	/* block-1 (capture) sample area */
-	for (i = 0; i < smp; i++) {
-		if (rx_smp[i] != 0xAA) {	/* any byte the device overwrote (incl. zeros) */
-			rx_data = true;
-			break;
-		}
-	}
-
-	dev_info(&c->pci->dev,
-		 "engine probe @1s: vec1=%d vec2=%d IRQs; ptr0=0x%x ptr1=0x%x; "
-		 "cause-poll 0x200:hits=%u 0x300:hits=%u ctr=0x%x..0x%x; capture-buf=%s\n",
-		 atomic_read(&c->period_irqs[1]), atomic_read(&c->period_irqs[2]),
-		 readl(c->bar0 + STREAM_BLK0 + STREAM_OFF_PTR),
-		 readl(c->bar0 + STREAM_BLK1 + STREAM_OFF_PTR),
-		 c1_hits, c2_hits, c2_min, c2_max,
-		 rx_data ? "WRITTEN (marker gone)" : "untouched (marker intact)");
-}
-
-/*
  * Persistent servicing engine. The data-plane DMA engine is flow-controlled: it raises a period on the
  * 0x300 cause register and waits for the host to ACK by reading it (read-to-clear). Without that the
  * engine does a few descriptors and stalls; serviced, it clocks for the stream's lifetime. This kthread
@@ -685,8 +474,8 @@ static int clarett_stream_service(void *data)
 	 * Tick-lateness telemetry. The period counters cannot show
 	 * this: they accumulate the HARDWARE ctr delta, so a late servicer catches up on the next tick and
 	 * the totals stay perfectly smooth while the audio glitches. What matters is the wall-clock gap
-	 * between period events — nominal is CLARETT_CTR_FRAMES*step/rate, which is NOT a constant: dyn_period
-	 * ties the IRQ cadence to the negotiated ALSA period, so it spans 0.33 ms (cadence 1) to tens of ms,
+	 * between period events — nominal is CLARETT_CTR_FRAMES*step/rate, which is NOT a constant: the IRQ
+	 * cadence follows to the negotiated ALSA period, so it spans 0.33 ms (cadence 1) to tens of ms,
 	 * and the rate varies too. clarett_tick_late_us() derives the threshold from both — do not reintroduce
 	 * a fixed one. A gap far over nominal means the TX refill landed late and the engine read ring content the app had not been
 	 * copied into yet. step_max is the same signal without a clock: the counter delta per event is
@@ -1018,84 +807,6 @@ void clarett_engine_run(struct clarett *c)
 	sched_set_fifo_low(c->stream_svc);
 }
 
-/*
- * Data-plane engine-start diagnostic (opt-in via stream_probe). Arms the engine over a minimal descriptor
- * table — 0x210/0x214 point at a zero-terminated array of 8-byte bus addresses, each naming one
- * stream_frag fragment of a coherent buffer — and watches whether it runs (vec1/vec2 IRQs, advancing
- * pointer, the device writing the capture buffer). NOT a PCM implementation.
- */
-int clarett_engine_start(struct clarett *c)
-{
-	void __iomem *bar = c->bar0;
-	size_t tbl, smp, ring;
-	__le64 *tx_tbl, *rx_tbl;
-	dma_addr_t tx_smp, rx_smp, r0, r1;
-	unsigned int i;
-
-	clarett_ring_layout(c, &tbl, &smp, &ring);
-	c->stream_size = 2 * ring;
-	c->stream_buf = dmam_alloc_coherent(&c->pci->dev, c->stream_size,
-					    &c->stream_dma, GFP_KERNEL);
-	if (!c->stream_buf)
-		return -ENOMEM;
-
-	/* Block 0 (vec1) = playback/TX, block 1 (vec2) = capture/RX. */
-	tx_tbl = (__le64 *)c->stream_buf;
-	rx_tbl = (__le64 *)((u8 *)c->stream_buf + ring);
-	tx_smp = c->stream_dma + tbl;
-	rx_smp = c->stream_dma + ring + tbl;
-
-	/* Fill descriptors with fragment bus addresses; entry [NDESC] stays 0 = ring terminator. */
-	for (i = 0; i < CLARETT_STREAM_NDESC; i++) {
-		tx_tbl[i] = cpu_to_le64(tx_smp + (dma_addr_t)i * c->model->stream_frag);
-		rx_tbl[i] = cpu_to_le64(rx_smp + (dma_addr_t)i * c->model->stream_frag);
-	}
-
-	/*
-	 * Bit 0 on the LAST entry is the engine's end-of-list / ring-wrap marker; without it the
-	 * playback engine's per-descriptor status writeback bursts to base 0. Fragment addresses are
-	 * even, so bit 0 is free to carry the flag.
-	 */
-	tx_tbl[CLARETT_STREAM_NDESC - 1] |= cpu_to_le64(1);
-	rx_tbl[CLARETT_STREAM_NDESC - 1] |= cpu_to_le64(1);
-
-	/*
-	 * Mark the RX (capture) sample area with 0xAA so the report can tell "device wrote silence (zeros)"
-	 * from "device never wrote" — with nothing plugged in, a working capture writes near-zero samples
-	 * that a plain non-zero scan would miss.
-	 */
-	memset((u8 *)c->stream_buf + ring + tbl, 0xAA, smp);
-
-	r0 = c->stream_dma;		/* block-0 descriptor-table base */
-	r1 = c->stream_dma + ring;	/* block-1 descriptor-table base */
-
-	/* Arm the engine (register sequence only; no handshake on this diagnostic path). */
-	clarett_engine_arm(c, r0, r1);
-	WRITE_ONCE(c->stream_run, true);	/* probe streams immediately — no PCM trigger to gate it */
-	clarett_engine_run(c);
-
-	dev_info(&c->pci->dev,
-		 "engine probe: started; %u-desc tables @ %pad / %pad, ptr0=0x%x ptr1=0x%x\n",
-		 CLARETT_STREAM_NDESC, &r0, &r1,
-		 readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
-		 readl(bar + STREAM_BLK1 + STREAM_OFF_PTR));
-	/* Diagnostic: did the base latch, and what does the device see at descriptor[0]? */
-	dev_info(&c->pci->dev,
-		 "engine regs: blk0 base=%08x:%08x ctrl=%08x ptr=%08x | blk1 base=%08x:%08x ctrl=%08x ptr=%08x | "
-		 "tx_desc[0]=%016llx rx_desc[0]=%016llx\n",
-		 readl(bar + STREAM_BLK0 + STREAM_OFF_BASE_HI),
-		 readl(bar + STREAM_BLK0 + STREAM_OFF_BASE_LO),
-		 readl(bar + STREAM_BLK0 + STREAM_OFF_CTRL),
-		 readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
-		 readl(bar + STREAM_BLK1 + STREAM_OFF_BASE_HI),
-		 readl(bar + STREAM_BLK1 + STREAM_OFF_BASE_LO),
-		 readl(bar + STREAM_BLK1 + STREAM_OFF_CTRL),
-		 readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
-		 le64_to_cpu(tx_tbl[0]), le64_to_cpu(rx_tbl[0]));
-	schedule_delayed_work(&c->stream_report, msecs_to_jiffies(1000));
-	return 0;
-}
-
 /* Halt the engine before the ring buffer is freed (a bad/continued DMA would fault the IOMMU). */
 void clarett_engine_stop(struct clarett *c)
 {
@@ -1128,7 +839,6 @@ void clarett_engine_stop(struct clarett *c)
 
 	if (svc)
 		kthread_stop(svc);			/* stop acking 0x300 before the engine is torn down */
-	cancel_delayed_work_sync(&c->stream_report);
 	writel(0, c->bar0 + STREAM_BLK0 + STREAM_OFF_CTRL);	/* disable ring 0 */
 	writel(0, c->bar0 + STREAM_BLK1 + STREAM_OFF_CTRL);	/* disable ring 1 */
 	writel(0, c->bar0 + REG_STREAM_IRQ_ARM);
@@ -1162,7 +872,7 @@ static void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0)
  * The device signals control-plane events on vec0. While a mailbox command is in flight a vec0
  * MSI is its completion, and the ISR reads the mailbox cause (0x100); otherwise it checks the
  * notification cause (0x400). vec1/vec2 are the stream period vectors; the servicer polls the
- * period blocks, so here they are only counted (for the stream_probe diagnostic). MSI is
+ * period blocks, so here they are only read. MSI is
  * edge-triggered, so not clearing a cause register cannot storm. Every vector returns
  * IRQ_HANDLED so the core doesn't disable the MSI as spurious.
  */
@@ -1227,9 +937,8 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 			atomic_or(ev, &c->notify_bits);
 			schedule_work(&c->notify_work);
 		}
-	} else if (ic->idx == 1 || ic->idx == 2) {	/* data-plane period IRQs (probe) */
-		readl(c->bar0 + (ic->idx == 1 ? STREAM_BLK0 : STREAM_BLK1));   /* read-to-clear/observe */
-		atomic_inc(&c->period_irqs[ic->idx]);
+	} else if (ic->idx == 1 || ic->idx == 2) {	/* data-plane period IRQs */
+		readl(c->bar0 + (ic->idx == 1 ? STREAM_BLK0 : STREAM_BLK1));   /* read-to-clear */
 	}
 	return IRQ_HANDLED;
 }
@@ -1690,9 +1399,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	atomic_set(&c->notify_bits, 0);
 	atomic_set(&c->cmd_inflight, 0);
 	atomic_set(&c->mbox_phase, 0);
-	INIT_DELAYED_WORK(&c->stream_report, clarett_stream_report);
-	atomic_set(&c->period_irqs[1], 0);
-	atomic_set(&c->period_irqs[2], 0);
 	/* Teardown lives in private_free so snd_card_free sequences it after the last
 	 * userspace handle closes but before c is freed (works are all INIT'd above). */
 	card->private_free = clarett_card_free;
@@ -1708,9 +1414,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 
 	pci_set_master(pci);
 
-	if (dma_bits < 28 || dma_bits > 64)
-		dma_bits = 32;
-	err = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(dma_bits));
+	err = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(32));
 	if (err)
 		goto err_free;
 
@@ -1722,8 +1426,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		goto err_free;
 	}
 	/* Log the response buffer's bus address (0x414 carries the high word). */
-	dev_dbg(&pci->dev, "resp buffer dma addr %pad (0x414 high word 0x%x, dma_bits=%d)\n",
-		&c->resp_dma, upper_32_bits(c->resp_dma), dma_bits);
+	dev_dbg(&pci->dev, "resp buffer dma addr %pad (0x414 high word 0x%x)\n",
+		&c->resp_dma, upper_32_bits(c->resp_dma));
 
 	/* MSI is enabled in config space before the first BAR access, so the device never sees
 	 * a session start from a host without an interrupt path. Handlers hook immediately too:
@@ -1732,8 +1436,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	clarett_enable_msi(c);
 	clarett_setup_irq(c);
 
-	if (settle_ms)
-		msleep(settle_ms);	/* optional quiet period; readiness is handled by the retry below */
 	clarett_hw_init(c);
 
 	/*
@@ -1750,7 +1452,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		/*
 		 * Ask until the device answers. After an attempt it was not ready for, the mailbox starts
 		 * the sequence over at 0, so the next attempt is the same command as seq 0 again (see the
-		 * note above settle_ms). Quiet while retrying; the last attempt is re-run with logging below.
+		 * note above ready_resp_ms). Quiet while retrying; the last attempt is re-run with logging below.
 		 * The budget is kept short: while probe holds the device, a removal of it (the user
 		 * power-cycling a unit that will not answer) waits too.
 		 */
@@ -1760,8 +1462,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 			det = clarett_detect_model(c, &collapsed, true);
 			if (det || !collapsed || time_after(jiffies, deadline))
 				break;
-			if (ready_retry_ms)
-				msleep(ready_retry_ms);
 			clarett_mbox_clear_causes(c);
 		}
 		c->resp_deadline_ms = 0;
@@ -1805,23 +1505,14 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		/* Nothing arms the device, so its flash-persisted routing stands untouched. */
 	}
 
-	/* RX fragment slot stride: default = page-safe pow2; 0 = contiguous; >0 = audio + padding. */
-	{
-		u32 frag = clarett_frag_bytes(c->model->capture_channels);
-
-		c->rx_slot = rx_frag_pad < 0 ? roundup_pow_of_two(frag)
-			   : rx_frag_pad == 0 ? frag
-					      : frag + rx_frag_pad;
-	}
-	/* TX fragment slot stride, mirror of rx_slot (a contiguous TX ring garbles playback on
-	 * models whose fragment is not a power of two). Default page-safe pow2. */
-	{
-		u32 frag = clarett_tx_frag_bytes(c->model->playback_channels);
-
-		c->tx_slot = tx_frag_pad < 0 ? roundup_pow_of_two(frag)
-			   : tx_frag_pad == 0 ? frag
-					      : frag + tx_frag_pad;
-	}
+	/*
+	 * Fragment slot strides. A fragment that straddles a 4 KB page is mis-framed by the device's DMA:
+	 * packed contiguously, capture drifts its channel alignment by 8 bytes per page, and playback on a
+	 * model whose fragment is not a power of two is garbled. So each fragment gets its own slot of the
+	 * next power of two, which divides the page, over a page-aligned area.
+	 */
+	c->rx_slot = roundup_pow_of_two(clarett_frag_bytes(c->model->capture_channels));
+	c->tx_slot = roundup_pow_of_two(clarett_tx_frag_bytes(c->model->playback_channels));
 
 	/* Start the optional periodic GET_METER now (meter_poll_ms), so it is already running when the
 	 * monitor-enable writes below go out. */
@@ -1836,30 +1527,12 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		dev_warn(&pci->dev,
 			 "config shadow seed failed (%d); leaving hardware mute/dim enables untouched\n",
 			 seeded);
-	else if (seed_dump) {
-		/* One-shot full [0,256) seeded-shadow dump (gated on seed_dump so normal loads stay
-		 * quiet); diff two dumps to locate a setting. */
-		int off;
-
-		for (off = 0; off < CLARETT_CONFIG_SIZE; off += 16)
-			dev_info(&pci->dev, "seeded shadow [%3d]=%*ph\n",
-				 off, 16, c->shadow + off);
-	}
-
-	/* Diagnostic: log the FCP status codes for valid and malformed commands. Requires
-	 * meter_poll_ms=0 so the heartbeat doesn't share resp_buf/seq (see param desc). */
-	if (error_probe) {
-		if (meter_poll_ms > 0)
-			dev_warn(&pci->dev,
-				 "error_probe needs meter_poll_ms=0 (meter worker races the shared response buffer); results unreliable\n");
-		clarett_error_probe(c);
-	}
 
 	/* Make Mute/Dim actually affect Monitor Out 1-2 by setting the per-output enable bits: the
 	 * master flag alone does nothing until an output opts in. This is a hardware-side write, so it
 	 * is needed whoever owns the controls — fcp-server drives the same Mute/Dim bytes. Needs the
 	 * seeded shadow for a correct read-modify-write, so only attempt it when seeding succeeded. */
-	if (!seeded && monitor_enables) {
+	if (!seeded) {
 		err = clarett_enable_monitor_hw_controls(c);
 		if (err)
 			dev_warn(&pci->dev,
@@ -1901,7 +1574,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	WRITE_ONCE(c->ctl_ready, true);	/* controls exist; the ISR notify path may fire */
 	clarett_schedule_follow(c);	/* sync the stored SW gains of HW outputs to the knob */
 
-	/* PCM. Owns the engine, so it excludes stream_probe. Every model uses the per-direction
+	/* PCM. Every model uses the per-direction
 	 * descriptor path (geometry derived from channel counts), so no per-model gate is needed. */
 	if (enable_pcm) {
 		err = clarett_create_pcm(c);
@@ -1918,15 +1591,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	if (err)
 		dev_warn(&pci->dev, "MIDI create failed (%d); continuing without MIDI\n", err);
 	err = 0;
-
-	/* Opt-in data-plane diagnostic: start the engine and report what it does. Best-effort; needs
-	 * the IRQ handlers (above) hooked first so vec1/vec2 period IRQs are counted. */
-	if (stream_probe && c->model->stream_frag && !enable_pcm && c->irq_ready) {
-		err = clarett_engine_start(c);
-		if (err)
-			dev_warn(&pci->dev, "engine-start probe failed (%d)\n", err);
-		err = 0;
-	}
 
 	strscpy(card->driver, "Clarett", sizeof(card->driver));
 	/* Mirror snd-usb-audio's naming: brand-free product name in the shortname
@@ -2069,9 +1733,6 @@ static const struct clarett_out_gain clarett_8prex_gains[] = {
 	{ "Line 07", 44 }, { "Line 08", 45 }, { "Line 09", 48 }, { "Line 10", 49 },
 };
 
-static const char * const clarett_mode_mli[] = { "Mic", "Line", "Inst" };
-static const char * const clarett_mode_ml[]  = { "Mic", "Line" };
-
 /* Hardware-meter sources for the 8PreX (activate 8). Selecting one writes its three per-band
  * channel-index tables (@136/146/156) then SET_DATA{184}. */
 static const struct clarett_meter_source clarett_8prex_meter_sources[] = {
@@ -2091,14 +1752,6 @@ static const struct clarett_meter_source clarett_8prex_meter_sources[] = {
 		{ 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 },
 		{ 14, 15, 16, 17, 255, 255, 255, 255, 18, 19 },
 		{ 12, 13, 255, 255, 255, 255, 255, 255, 14, 15 } } },
-};
-
-/* Analogue 1-2 add Inst; 3-8 are Mic/Line. Device byte == text index (identity). */
-static const struct clarett_preamp clarett_8prex_preamps[] = {
-	{ clarett_mode_mli, NULL, 3 }, { clarett_mode_mli, NULL, 3 },
-	{ clarett_mode_ml,  NULL, 2 }, { clarett_mode_ml,  NULL, 2 },
-	{ clarett_mode_ml,  NULL, 2 }, { clarett_mode_ml,  NULL, 2 },
-	{ clarett_mode_ml,  NULL, 2 }, { clarett_mode_ml,  NULL, 2 },
 };
 
 /*
@@ -2125,11 +1778,6 @@ static const struct clarett_model clarett_8prex = {
 	.slug = "clarett-8prex",
 	.out_gains = clarett_8prex_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_8prex_gains),
-	.n_analogue = 8,
-	.analogue = clarett_8prex_preamps,
-	.in_prefix = "Line In",			/* match the USB models' input naming */
-	.mode_label = "Mode",			/* but keep "Mode": Mic/Line/Inst is richer than "Level" */
-	.has_spdif_source = true,
 	.has_midi = true,
 	.notify_word = true,
 	.meter_sources = clarett_8prex_meter_sources,
@@ -2143,13 +1791,12 @@ static const struct clarett_model clarett_8prex = {
 	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width); playback verified at single speed. */
-	.stream_frag = STREAM_SIZE_VAL,
 };
 
 /*
  * Clarett 2Pre (Thunderbolt). Shares the 8PreX's config offsets and commands; the first 4 of the
  * 8PreX output gains; 2 combo-jack preamps with the Line/Inst encoding (Line=1, Inst=2 — Mic is
- * auto-detected by the jack, not a software mode; see clarett_mode_li). Streams 4 playback / 14 record,
+ * auto-detected by the jack, not a software mode). Streams 4 playback / 14 record,
  * which is also how it is detected (clarett_detect_model). Asymmetric TX 4ch / RX 14ch: periods
  * 0x40 / 0xe0, descriptor fragments 0x100 / 0x380 (clarett_frag_bytes).
  */
@@ -2160,30 +1807,11 @@ static const struct clarett_out_gain clarett_2pre_gains[] = {
 	{ "Line 03 (Headphones L)", 36 }, { "Line 04 (Headphones R)", 37 },
 };
 
-/*
- * Combo-jack input mode (shared by 2Pre / 4Pre / 8Pre). These models use a single combined XLR/TRS jack
- * per input, so the connector auto-selects Mic (XLR inserted) vs the 1/4" path — Mic is NOT a software
- * option; the mode control only chooses Line vs Inst for the 1/4" path. So the enum is {Line=1, Inst=2}
- * with no Mic(0). (The 8PreX, by contrast, has SEPARATE XLR and 1/4" ports, so software must pick
- * Mic/Line/Inst explicitly — see clarett_mode_mli.)
- */
-static const char * const clarett_mode_li[] = { "Line", "Inst" };
-static const u8 clarett_mode_li_vals[] = { 1, 2 };
-
-static const struct clarett_preamp clarett_2pre_preamps[] = {
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-};
-
 static const struct clarett_model clarett_2pre = {
 	.name = "Clarett 2Pre",
 	.slug = "clarett-2pre",
 	.out_gains = clarett_2pre_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_2pre_gains),
-	.n_analogue = 2,
-	.analogue = clarett_2pre_preamps,
-	.in_prefix = "Line In",			/* match scarlett2 Clarett 2Pre USB */
-	.mode_label = "Level",
 	.has_midi = true,
 	.notify_word = true,
 	.capture_channels = 14,			/* record-outputs pin count (12 record + 2 loopback) */
@@ -2195,8 +1823,6 @@ static const struct clarett_model clarett_2pre = {
 	.rx_loopback_at = 4,			/* after analogue 1-2 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified (correct pitch at 96k and 192k,
 						 * full width). */
-	.stream_frag = 0,			/* stream_probe unused on the 2Pre; PCM uses
-						 * clarett_frag_bytes() per direction */
 };
 
 /*
@@ -2204,9 +1830,8 @@ static const struct clarett_model clarett_2pre = {
  *
  *   channel counts 8 playback / 20 record (18 record + 2 loopback).
  *   inputs: only Analogue 1-2 have a mode (Line=1/Inst=2; Mic is auto-detected by the combo
- *           XLR/TRS jack, not a software option — see clarett_mode_li), at mode@166/167 cmd 6;
+ *           XLR/TRS jack, not a software option), at mode@166/167 cmd 6;
  *           Analogue 1-4 each have Air at air@174..177 cmd 7; Analogue 5-8 have no preamp controls.
- *           So n_analogue=4 (the Air-capable inputs); 3-4 are air-only (n_modes=0).
  *   output gains (cmd 1, 8-bit): Monitor 1-2 @ 32/33, Line 3-4 @ 36/37, Headphone 2 L/R @ 40/41.
  *           S/PDIF outputs carry no gain. Six gains total (no 44/45 pair on this model).
  */
@@ -2218,24 +1843,11 @@ static const struct clarett_out_gain clarett_4pre_gains[] = {
 	{ "Line 05 (Headphones 2 L)", 40 }, { "Line 06 (Headphones 2 R)", 41 },
 };
 
-/* Analogue 1-2 Line/Inst (combo jack auto-detects Mic); 3-4 air-only (n_modes=0). */
-static const struct clarett_preamp clarett_4pre_preamps[] = {
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ NULL, NULL, 0 },
-	{ NULL, NULL, 0 },
-};
-
 static const struct clarett_model clarett_4pre = {
 	.name = "Clarett 4Pre",
 	.slug = "clarett-4pre",
 	.out_gains = clarett_4pre_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_4pre_gains),
-	.n_analogue = 4,
-	.analogue = clarett_4pre_preamps,
-	.in_prefix = "Line In",			/* match scarlett2 Clarett 4Pre USB */
-	.mode_label = "Level",
-	.has_spdif_source = true,
 	.has_midi = true,
 	.notify_word = true,
 	.capture_channels = 20,			/* record-outputs pin count */
@@ -2247,7 +1859,6 @@ static const struct clarett_model clarett_4pre = {
 	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width); playback verified at single speed. */
-	.stream_frag = 0,			/* PCM uses clarett_frag_bytes() per direction (asymmetric) */
 };
 
 /*
@@ -2264,14 +1875,6 @@ static const struct clarett_model clarett_4pre = {
  *     mirror scarlett2's Clarett 8Pre USB line_out_descrs (Monitor L/R, Line 03-06 unlabelled,
  *     Headphones 1/2), so it gets its own gain table rather than reusing the 8PreX's.
  */
-static const struct clarett_preamp clarett_8pre_preamps[] = {	/* 1-2 Line/Inst, 3-8 air-only */
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ clarett_mode_li, clarett_mode_li_vals, 2 },
-	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
-	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
-	{ NULL, NULL, 0 }, { NULL, NULL, 0 },
-};
-
 /* scarlett2 Clarett 8Pre USB line_out_descrs: Monitor L/R, four unlabelled line outs, Headphones 1/2. */
 static const struct clarett_out_gain clarett_8pre_gains[] = {
 	{ "Line 01 (Monitor L)", 32 }, { "Line 02 (Monitor R)", 33 },
@@ -2285,11 +1888,6 @@ static const struct clarett_model clarett_8pre = {
 	.slug = "clarett-8pre",
 	.out_gains = clarett_8pre_gains,
 	.n_out_gains = ARRAY_SIZE(clarett_8pre_gains),
-	.n_analogue = 8,
-	.analogue = clarett_8pre_preamps,
-	.in_prefix = "Line In",			/* match scarlett2 Clarett 8Pre USB */
-	.mode_label = "Level",
-	.has_spdif_source = true,
 	.has_midi = true,
 	.notify_word = true,
 	.capture_channels = 20,			/* 18 record + 2 loopback */
@@ -2301,7 +1899,6 @@ static const struct clarett_model clarett_8pre = {
 	.rx_loopback_at = 10,			/* after analogue 1-8 + S/PDIF 1-2 */
 	.max_rate = 192000,			/* double + quad speed verified for capture (correct pitch at 96k
 						 * and 192k, full width). */
-	.stream_frag = 0,
 };
 
 /*
@@ -2314,9 +1911,6 @@ static const struct clarett_model clarett_8pre = {
  *    bits="16", min-gain -112.0 dB), where every Clarett uses a 7-bit 1 dB/step attenuation byte.
  *    clarett_hw_gain_follow() writes a BYTE at out_gains[].offset, so populating this table from the
  *    Red's offsets would write half a gain field. NULL correctly disables that mirror outright.
- *  - the preamp/naming fields (n_analogue, analogue, in_prefix, mode_label, has_spdif_source): dead
- *    since the in-kernel control layer was removed, and the Red's preamps carry phantom, phase,
- *    stereo-link and separate mic/line/inst gains that this struct cannot describe anyway.
  *  - meter_sources: the Red's front-panel meter bridge is not mapped.
  *  - has_midi: the Red range has no MIDI jacks, so no rawmidi device is created for it.
  * The control plane therefore reaches userspace only through the FCP hwdep, where fcp-server's
@@ -2357,7 +1951,6 @@ static const struct clarett_model red_8line = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	.stream_frag = 0,
 	.tb_gen = 3,				/* JHL6540 Alpine Ridge; the Red 4Pre is its TB2 twin */
 	/*
 	 * The three front-panel knob groups (monitor, headphones 1, headphones 2) keep their gains at
@@ -2386,7 +1979,6 @@ static const struct clarett_model red_16line = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	.stream_frag = 0,
 	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,	/* the 8Line's knob groups and Meter Source */
 	.tb_gen = 3,				/* its TB2 twin is the Red 8Pre */
 };
@@ -2409,7 +2001,6 @@ static const struct clarett_model red_4pre = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	.stream_frag = 0,
 	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 	.tb_gen = 2,
 };
@@ -2424,7 +2015,6 @@ static const struct clarett_model red_8pre = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	.stream_frag = 0,
 	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 	.tb_gen = 2,
 };

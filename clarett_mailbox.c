@@ -28,13 +28,6 @@
 #define CLARETT_SAVE_WQ	system_unbound_wq
 #endif
 
-static bool legacy_mbox_cycle;
-module_param(legacy_mbox_cycle, bool, 0444);
-MODULE_PARM_DESC(legacy_mbox_cycle,
-	"Diagnostic: use a non-conforming mailbox cycle (leading doorbell ACK, 0x100-only "
-	"completion poll, no wait for the response DMA). The device refuses the session under it, "
-	"so it serves as a negative control for the default cycle. Default 0.");
-
 /*
  * Phase-bit cycle: with MSI up, a command completes on the device's own 0x400 phase bits, delivered by
  * the vec0 ISR — bit0 when the request is accepted, bit1 when its response has landed — instead of
@@ -206,11 +199,6 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 
 	mutex_lock(&c->mbox_lock);
 
-	/* Diagnostic cycle only: a leading ACK. The protocol acks after each completed command
-	 * (below), never before a submit. */
-	if (legacy_mbox_cycle)
-		clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
-
 	/* zero the response header so clarett_resp_wait can't match a stale echo of a
 	 * repeated opcode */
 	memset(c->resp_buf, 0, FCP_RESP_DATA_OFF);
@@ -249,7 +237,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	clarett_wl(c, REG_DOORBELL, DOORBELL_SUBMIT);
 
 	deadline = jiffies + msecs_to_jiffies(CLARETT_MBOX_TIMEOUT_MS);
-	by_phase = phase_cycle && c->irq_ready && !legacy_mbox_cycle;
+	by_phase = phase_cycle && c->irq_ready;
 	if (by_phase) {
 		/*
 		 * Accepted, then landed. Both deadlines follow the response deadline (resp_timeout_ms, or
@@ -279,16 +267,6 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 					opcode, c->seq);
 			}
 		}
-	} else if (legacy_mbox_cycle) {
-		do {
-			cause = clarett_rl(c, REG_IRQ0_CAUSE);   /* read-to-clear */
-			if (!polls)
-				first_cause = cause;
-			polls++;
-			if (cause & IRQ_DONE_BIT)
-				break;
-			cpu_relax();
-		} while (time_before(jiffies, deadline));
 	} else {
 		/* Default cycle: once DONE shows in 0x100, sweep the remaining cause blocks
 		 * (0x300, 0x200, 0x400, 0x500 — 0x400 holds the command-phase value and is

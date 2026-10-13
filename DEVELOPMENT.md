@@ -90,7 +90,7 @@ local `fcp-server` patches, listed in that directory's README.
 
 - **At probe it force-enables hardware Mute/Dim for Monitor Out 1-2** (bytes 72/73, command 3) so the
   global `Mute`/`Dim` act on those outputs — the master flag (offset 24/28) does nothing unless an
-  output opts in via its enable bit. `monitor_enables=0` skips this. The remaining per-output
+  output opts in via its enable bit. The remaining per-output
   mute/dim enables are not exposed. There is no per-output mute on this hardware.
 - **It keeps the software gain of a hardware-controlled output in step with the knob**
   (`hw_gain_follow`). An output whose volume is set to HW ignores its stored software gain, and the
@@ -303,17 +303,16 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `notify_ms` (default 50) — rate limit for the notification relay.
 - `monitor_poll` (default off) — the change-detecting monitor-region poll (a backstop).
 - `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
-- `monitor_enables` (default on) — the probe-time Monitor Out 1-2 mute/dim enables.
-- `addr_ack_ms` (default 500), `ready_resp_ms` (default 20), `ready_retry_ms` (default 0),
-  `ready_timeout_ms` (default 10000), `settle_ms` (default 0) — all runtime-writable: the bound on
-  the response-address acknowledgement wait, how long each fallback attempt waits for its
-  response, an extra pause between attempts, the budget described above, and an optional quiet
-  period before the first command.
+- `meter_poll_ms` (default 0) — an optional periodic `GET_METER`, which also drives `monitor_poll`.
+- `addr_ack_ms` (default 500), `ready_resp_ms` (default 20), `ready_timeout_ms` (default 10000) —
+  all runtime-writable: the bound on the response-address acknowledgement wait, how long each
+  fallback attempt waits for its response, and the budget described above.
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
+- `tx_guard` (default 64) — frames the playback fill keeps clear of the device's read position.
 
-The rest (`stream_probe`, `error_probe`, `seed_dump`, `resp_trace`, `tx_trace`, the fragment-padding
-and DMA-mask levers, and others) are diagnostics; their `MODULE_PARM_DESC` strings say what each
-does.
+The rest are diagnostics: `resp_trace` (per-command response telemetry), `tx_trace` (DMA pointer
+trace while streaming) and `phase_cycle` (`0` returns the mailbox to its older completion cycle, for
+comparison). Their `MODULE_PARM_DESC` strings say more.
 
 ## Settings persistence
 
@@ -327,4 +326,5 @@ to another host, so the driver does not re-apply them. This mirrors the in-kerne
   the device restores Mode/Air to the hardware from NVRAM while bringing the host-readable config up
   at a fixed default that does not mirror it, so the display can disagree with the front-panel LEDs
   until a control is touched. The hardware is correct; there is no read of the true preamp state on a
-  fresh boot. `seed_dump=1` dumps the config shadow at probe for anyone digging further.
+  fresh boot. A `GET_DATA` of that range from userspace, through the hwdep, shows what the device
+  reports.
