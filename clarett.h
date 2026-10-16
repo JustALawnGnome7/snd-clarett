@@ -561,6 +561,14 @@ struct clarett {
 	 */
 	bool mbox_wedged;
 	/*
+	 * A command the device accepted but whose response missed its deadline. The device holds every
+	 * later command until that response is acknowledged, so the next command first waits for it to
+	 * land and acks it (clarett_retire_lost()).
+	 */
+	bool lost_pending;
+	u32 lost_echo;			/* CMD_EXEC_FLAG | opcode of the lost command */
+	u16 lost_seq;
+	/*
 	 * Set while a mailbox command is in flight (clarett_fcp submit->complete). vec0 fires on
 	 * mailbox-DONE as well as front-panel notifications, and 0x400 reads its idle level (bit0|bit1
 	 * = 0x3) at completion, so a completion MSI can be misread as a monitor event. This guard makes

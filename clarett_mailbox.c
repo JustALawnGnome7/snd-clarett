@@ -178,6 +178,45 @@ static void clarett_resp_tail_wait(struct clarett *c)
 }
 
 /*
+ * Retire a command whose response missed its deadline, before the next command is sent. Measured on
+ * a Clarett 8Pre and a Red 8Line by withholding one GET_DATA's ack: the response did land (it was
+ * late, not lost), and until it is acknowledged the device refuses every later command (err=3, no
+ * payload) whatever sequence number it carries. Acking it once it has landed restores the session
+ * completely, with the sequence continuing from the lost command. So: wait up to that command's own
+ * deadline for the response, ack it and carry on; if it never lands (a device asked too early after
+ * power-up answers nothing at all), start the sequence over at 0, which is what recovers that case.
+ * Called with mbox_lock held, before the response buffer is reset for the next command.
+ */
+static void clarett_retire_lost(struct clarett *c)
+{
+	const u8 *r = c->resp_buf;
+	unsigned long deadline;
+	u32 echo;
+
+	if (!c->lost_pending)
+		return;
+	c->lost_pending = false;
+	deadline = jiffies + msecs_to_jiffies(max(clarett_resp_ms(c, c->lost_echo), 1u));
+	for (;;) {
+		dma_rmb();
+		echo = clarett_get_le32(r + FCP_RESP_ECHO_OFF);
+		if (echo == c->lost_echo &&
+		    clarett_get_le16(r + FCP_RESP_SEQ_OFF) == c->lost_seq) {
+			clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
+			c->seq = c->lost_seq + 1;
+			dev_warn_ratelimited(&c->pci->dev,
+				"FCP op=0x%06x seq=%u: late response acknowledged\n",
+				c->lost_echo & ~CMD_EXEC_FLAG, c->lost_seq);
+			return;
+		}
+		if (time_after(jiffies, deadline))
+			break;
+		usleep_range(200, 400);
+	}
+	c->seq = 0;
+}
+
+/*
  * Core mailbox transaction. If resp_out/resp_len are given, the response *payload* (the bytes after
  * the 16-byte echoed header) is copied out under mbox_lock on success — race-free, unlike reading
  * c->resp_buf after the call. clarett_fcp() is the response-less wrapper; clarett_fcp_cmd() is the
@@ -206,6 +245,8 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		return -ENODEV;
 
 	mutex_lock(&c->mbox_lock);
+
+	clarett_retire_lost(c);
 
 	/* zero the response header so clarett_resp_wait can't match a stale echo of a
 	 * repeated opcode */
@@ -246,9 +287,9 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	if (by_phase) {
 		/*
 		 * Accepted, then landed. Both deadlines follow the response deadline (clarett_resp_ms():
-		 * resp_timeout_ms, ready_resp_ms while probe asks, longer for a flash command). An unaccepted or unanswered command is not acked, as in
-		 * the DONE cycle: the device then refuses the next sequence number, and the seq reset below
-		 * is what recovers it.
+		 * resp_timeout_ms, ready_resp_ms while probe asks, longer for a flash command). A command
+		 * whose response has not landed is not acked here; the next command retires it first
+		 * (clarett_retire_lost()).
 		 */
 		unsigned int ms = clarett_resp_ms(c, opcode);
 
@@ -268,7 +309,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 				clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
 			} else {
 				dev_warn_ratelimited(&c->pci->dev,
-					"FCP op=0x%06x seq=%u: accepted, response never landed; ack withheld\n",
+					"FCP op=0x%06x seq=%u: accepted, response not landed; ack deferred\n",
 					opcode, c->seq);
 			}
 		}
@@ -378,14 +419,23 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		c->mbox_wedged = rseq != c->seq;
 	}
 
-	if (!(cause & IRQ_DONE_BIT))
-		ret = -ETIMEDOUT;
 	/*
+	 * The result. A command with no answer of its own fails: not accepted or not answered in time
+	 * (-ETIMEDOUT), or answered with another command's sequence number (-EIO); handing back the
+	 * response buffer then would give the caller poison or a stale reply as if it were data.
+	 *
 	 * NOTE: fcp_status (resp+8) is NOT a clean pass/fail on this device — INIT_1 on an already
 	 * initialised device returns a nonzero status yet the command works. So it does not fail the
-	 * call; it is surfaced in the dev_dbg line above and via resp_trace. Rejection is judged by
-	 * outcome, not by this word.
+	 * call by itself; it is surfaced in the dev_dbg line above and via resp_trace. The one case it
+	 * does decide is a caller asking for data and getting a nonzero status with none: a refusal.
 	 */
+	if (!(cause & IRQ_DONE_BIT) || !resp_echo)
+		ret = -ETIMEDOUT;
+	else if (c->mbox_wedged)
+		ret = -EIO;
+	else if (resp_out && resp_len && fcp_status &&
+		 !clarett_get_le16((const u8 *)c->resp_buf + FCP_RESP_SIZE_OFF))
+		ret = -EIO;
 
 	/* Copy the response payload out while still holding the lock (resp_buf is stable until the next
 	 * command, which can't start before we unlock). Only on success and only if the caller asked. */
@@ -415,17 +465,21 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	}
 
 	/*
-	 * Advance the sequence number for a command the device answered as ours; after one whose response
-	 * never landed (or that drew another command's answer), start over at 0. Measured on a Clarett
-	 * asked too early after power-up, when the lost command was seq 0: re-asking as seq 1 stays
-	 * refused (err=3, stale echoed seq) indefinitely, re-asking as seq 0 is answered. Whether the
-	 * device wants 0 or the lost command's own number has not been separated, since the lost one was
-	 * always 0; nor has a reset after a response lost mid-session been tested.
+	 * Advance the sequence number for a command the device answered as ours. One it accepted but whose
+	 * response has not landed is retired by the next command (clarett_retire_lost(), which sets the
+	 * sequence). Otherwise — not accepted, or another command's answer — start over at 0: measured on
+	 * a Clarett asked too early after power-up, re-asking as seq 1 stays refused (err=3, stale echoed
+	 * seq) indefinitely, re-asking as seq 0 is answered.
 	 */
-	if (resp_echo && !c->mbox_wedged)
+	if (resp_echo && !c->mbox_wedged) {
 		c->seq++;
-	else
+	} else if (!resp_echo && (cause & IRQ_DONE_BIT)) {
+		c->lost_pending = true;
+		c->lost_echo = CMD_EXEC_FLAG | opcode;
+		c->lost_seq = c->seq;
+	} else {
 		c->seq = 0;
+	}
 
 	atomic_set(&c->cmd_inflight, 0);	/* completion window closed; idle-gap events may resume */
 
