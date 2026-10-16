@@ -96,7 +96,7 @@ cat /proc/asound/cards
 
 ```
 snd_clarett ...: Red 8Pre: identified by its Thunderbolt 2 controller 8086:xxxx (0x000 = 0x........)
-snd_clarett ...: Red 8Pre: serial ... FCP hwdep, PCM 64/64ch
+snd_clarett ...: Red 8Pre: App ..., FPGA ..., Front ...; FCP hwdep, PCM 64/64ch
 ```
 
 (`PCM 64/60ch` on a 4Pre), and in `/proc/asound/cards` a line with your model's card ID and the

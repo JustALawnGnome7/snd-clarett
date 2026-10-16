@@ -107,8 +107,8 @@ out:
  * resets seq to 0. Two adaptations for this Thunderbolt device:
  *
  *  - STEP0 has no mailbox equivalent. On USB it is a vendor class request (FCP_USB_REQ_STEP0),
- *    not an FCP opcode; the device-info it returns (serial, firmware ids) is read from BAR
- *    registers here (REG_SERIAL_lo/hi and REG_INFO at probe), never over the wire. We return
+ *    not an FCP opcode; the device-info it returns (serial, firmware ids) the driver reads at
+ *    probe instead (the serial from flash, the versions from the appspace). We return
  *    step0 zeroed; fcp-server only inspects step2, so this is honest, not a fabricated layout.
  *
  *  - We do NOT reset c->seq. fcp.c can zero it because fcp-server is the device's only mailbox

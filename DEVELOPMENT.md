@@ -120,7 +120,7 @@ mixer untouched.
 
 Probe sequence:
 
-0. **Minimal register init.** Read the serial and firmware words, write `0x510 = 8` and
+0. **Minimal register init.** Write `0x510 = 8` and
    `0x500 = 8` (the device-open writes every attach makes), enable the interrupt causes
    (`0x104`), then write the response buffer's address. Nothing else is needed before the first
    command: the register reads, cause-block sweep and inter-group pauses of a normal attach change
@@ -141,8 +141,8 @@ Probe sequence:
    response instead of the mailbox's usual 100 ms, because a response that lands at all lands within
    a millisecond.
 3. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
-   registers, config space, the firmware-info header and even the serial are the same across the
-   line — but the session reports the model's stream geometry: `STREAM_INFO{band 0}` (`0x007001`)
+   registers, PCI config space and the BAR0 serial and firmware-info words (placeholders, the same
+   on every unit) — but the session reports the model's stream geometry: `STREAM_INFO{band 0}` (`0x007001`)
    answers `{u16 playback_channels, u16 capture_channels}`, a pair unique per model. Probe then asks
    bands 1 and 2 (double and quad speed) for the capture width S/MUX leaves; see Sample rates below.
 4. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
@@ -256,11 +256,17 @@ the servicer telemetry below shows it as `readmax`/`gapmax` in the tens of milli
 A healthy load prints **one** line and then stays quiet, including while streaming:
 
 ```
-snd_clarett 0000:0a:00.0: Clarett 2Pre: serial 000012345678abcd fw app 0x04061973 fpga 0x18101966; FCP hwdep, PCM 4/14ch, MIDI
+snd_clarett 0000:0a:00.0: Clarett 2Pre: App 1016, FPGA 1021; FCP hwdep, PCM 4/14ch, MIDI
 ```
 
-The serial and firmware words are the same constants on every unit and model seen, so they cannot
-identify a unit.
+The versions are the unit's firmware: App, FPGA, and on a Red the front panel (`Front`). They are
+appspace words (App at 8, the FPGA build in the low 16 bits of 12, Front at 20), read from the shadow
+probe seeds, and match the versions the device descriptors name. The BAR0 words at `0x010`/`0x014` and
+`0x8000` look like a serial and firmware ids but read the same placeholders on every unit, so the
+driver ignores them. **The unit's serial** is the first line of the flash `App_Env` segment
+(`SERIAL_NO = <digits>`), read at probe with `FLASH_INFO`/`FLASH_SEGMENT_INFO`/`FLASH_READ`. It is
+exposed as `/sys/bus/pci/devices/<bdf>/serial`, as the USB core exposes a USB device's, and never
+logged: a kernel log is what gets pasted into public bug reports.
 
 - **info** — the probe summary above, and a `stream-svc:` line for any 2-second window (or any
   stream) in which something went wrong: a late servicer tick, a device-side period overrun, or an

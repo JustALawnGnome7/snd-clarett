@@ -19,6 +19,7 @@
 #include <linux/sched.h>		/* sched_set_fifo_low() — real-time priority for the stream servicer */
 #include <linux/bitmap.h>
 #include <linux/string.h>
+#include <linux/ctype.h>
 #include <linux/jiffies.h>
 #include <sound/core.h>
 #include <sound/info.h>
@@ -340,22 +341,14 @@ u32 clarett_rl(struct clarett *c, u32 off)
 
 static void clarett_hw_init(struct clarett *c)
 {
-	void __iomem *bar = c->bar0;
-
 	/*
-	 * Pre-mailbox init, cut to what the device needs: the serial and firmware words (for the probe
-	 * summary), the two 0x510/0x500 writes every attach makes (device open; their layout is not
-	 * decoded beyond these values), the interrupt-cause enable, then the response-buffer address,
+	 * Pre-mailbox init, cut to what the device needs: the two 0x510/0x500 writes every attach makes
+	 * (device open; their layout is not decoded beyond these values), the interrupt-cause enable, then the response-buffer address,
 	 * waiting for the device to acknowledge it. The enable goes first because the acknowledgement
 	 * arrives as an interrupt. A normal attach also reads the caps word, 0x4/0x8/0x514/0x58c, every
 	 * cause block and the rest of the firmware-info header, with a few milliseconds between groups;
 	 * none of it changes how the device answers. Process context, so sleeping is fine.
 	 */
-	c->serial_hi = readl(bar + REG_SERIAL_HI);
-	c->serial_lo = readl(bar + REG_SERIAL_LO);
-	c->fw_app    = readl(bar + REG_INFO + 0x00);
-	c->fw_fpga   = readl(bar + REG_INFO + 0x04);
-
 	clarett_wl(c, 0x510, 0x8);
 	clarett_wl(c, REG_MIDI_STATUS, 0x8);
 	clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);
@@ -379,6 +372,54 @@ static void clarett_hw_init(struct clarett *c)
 	}
 
 	memset(c->shadow, 0, sizeof(c->shadow));
+}
+
+/*
+ * Read the unit's serial from flash: the App_Env segment begins with one ASCII line,
+ * "SERIAL_NO = <digits>", optionally newline-terminated, and is otherwise erased. Found by name, not
+ * by index, though it has been segment 4 on every unit read. Read-only (FLASH_INFO, SEGMENT_INFO,
+ * FLASH_READ) and best-effort: any failure leaves c->serial empty, which only hides the sysfs file.
+ */
+static void clarett_read_serial(struct clarett *c)
+{
+	u8 req[12], info[24], line[64];
+	u32 count, i;
+	const char *p, *end;
+	size_t n = 0;
+
+	c->serial[0] = '\0';
+	if (clarett_fcp_cmd(c, FCP_FLASH_INFO, NULL, 0, info, 12))
+		return;
+	count = clarett_get_le32(info + 4);	/* {u32 total size, u32 segment count, u8[4]} */
+	if (!count || count > 32)		/* implausible: not a segment table */
+		return;
+	for (i = 0; i < count; i++) {
+		clarett_put_le32(req, i);
+		if (clarett_fcp_cmd(c, FCP_FLASH_SEGMENT_INFO, req, 4, info, sizeof(info)))
+			return;
+		if (!strncmp((const char *)info + 8, "App_Env", 16))
+			break;
+	}
+	if (i == count)
+		return;
+	clarett_put_le32(req, i);
+	clarett_put_le32(req + 4, 0);
+	clarett_put_le32(req + 8, sizeof(line));
+	if (clarett_fcp_cmd(c, FCP_FLASH_READ, req, sizeof(req), line, sizeof(line)))
+		return;
+
+	end = (const char *)line + sizeof(line);
+	p = strnstr((const char *)line, "SERIAL_NO", sizeof(line));
+	if (!p)
+		return;
+	for (p += strlen("SERIAL_NO"); p < end && (*p == ' ' || *p == '='); p++)
+		;
+	/* ASCII only: the kernel's isalnum() follows Latin-1, where the erased flash after an
+	 * unterminated line (0xff) is a letter. */
+	while (p + n < end && n < CLARETT_SERIAL_LEN - 1 && isascii(p[n]) && isalnum(p[n]))
+		n++;
+	memcpy(c->serial, p, n);
+	c->serial[n] = '\0';
 }
 
 /*
@@ -1519,6 +1560,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	/* Seed the shadow from the device so the enable-byte RMW below is safe. Best-effort: if it
 	 * fails we skip the enable writes. */
 	seeded = clarett_seed_shadow(c);
+	clarett_read_serial(c);
 	if (seeded)
 		dev_warn(&pci->dev,
 			 "config shadow seed failed (%d); leaving hardware mute/dim enables untouched\n",
@@ -1595,9 +1637,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	 * because snd-usb-audio takes the shortname from the device's iProduct
 	 * string; we have no such descriptor, so we synthesise the same shape. */
 	snprintf(card->shortname, sizeof(card->shortname), "%s", c->model->name);
-	snprintf(card->longname, sizeof(card->longname),
-		 "Focusrite %s at %s, fw app 0x%08x", c->model->name, pci_name(pci),
-		 c->fw_app);
+	snprintf(card->longname, sizeof(card->longname), "Focusrite %s at %s",
+		 c->model->name, pci_name(pci));
 
 	/* The model slug, in the card's components string ("Clarett:clarett-8prex"), where
 	 * snd-usb-audio puts a USB card's "USB<vid>:<pid>": readable through the control API
@@ -1644,11 +1685,23 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 			scnprintf(feat, sizeof(feat), "no interfaces registered");
 
 		/* No "(auto-detected)" tag: detection is the only way c->model can be set, so saying so
-		 * would be noise. A model named here is one the device claimed. */
-		dev_info(&pci->dev,
-			 "%s: serial %08x%08x fw app 0x%08x fpga 0x%08x; %s\n",
-			 c->model->name, c->serial_hi, c->serial_lo,
-			 c->fw_app, c->fw_fpga, feat);
+		 * would be noise. A model named here is one the device claimed. The firmware versions
+		 * come from the seeded shadow, so they are left out if the seed failed. The serial is
+		 * never printed: kernel logs get pasted into public bug reports. It is in sysfs. */
+		if (!seeded) {
+			const u8 *s = c->shadow;
+			char fw[48];
+
+			scnprintf(fw, sizeof(fw), "App %u, FPGA %u",
+				  clarett_get_le32(s + APPSPACE_FW_APP),
+				  clarett_get_le32(s + APPSPACE_FW_FPGA) & 0xffff);
+			if (c->model->fw_front)
+				scnprintf(fw + strlen(fw), sizeof(fw) - strlen(fw), ", Front %u",
+					  clarett_get_le32(s + APPSPACE_FW_FRONT));
+			dev_info(&pci->dev, "%s: %s; %s\n", c->model->name, fw, feat);
+		} else {
+			dev_info(&pci->dev, "%s: %s\n", c->model->name, feat);
+		}
 	}
 	return 0;
 
@@ -1926,6 +1979,7 @@ static const struct clarett_clock_src red_clock_srcs[] = {
 static const struct clarett_model red_8line = {
 	.name = "Red 8Line",
 	.slug = "red-8line",
+	.fw_front = true,		/* APPSPACE_FW_FRONT */
 	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 60,			/* 58 record + 2 loopback */
 	.playback_channels = 64,		/* Playback 1-64 */
@@ -1967,6 +2021,7 @@ static const struct clarett_model red_8line = {
 static const struct clarett_model red_16line = {
 	.name = "Red 16Line",
 	.slug = "red-16line",
+	.fw_front = true,		/* APPSPACE_FW_FRONT */
 	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 64,			/* 62 record + 2 loopback */
 	.playback_channels = 64,		/* Playback 1-64 */
@@ -1992,6 +2047,7 @@ static const struct clarett_model red_16line = {
 static const struct clarett_model red_4pre = {
 	.name = "Red 4Pre",
 	.slug = "red-4pre",
+	.fw_front = true,		/* APPSPACE_FW_FRONT */
 	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 60,			/* 58 record + 2 loopback, as the 8Line */
 	.playback_channels = 64,
@@ -2007,6 +2063,7 @@ static const struct clarett_model red_4pre = {
 static const struct clarett_model red_8pre = {
 	.name = "Red 8Pre",
 	.slug = "red-8pre",
+	.fw_front = true,		/* APPSPACE_FW_FRONT */
 	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 64,			/* 62 record + 2 loopback, as the 16Line */
 	.playback_channels = 64,
@@ -2026,6 +2083,39 @@ static const struct pci_device_id clarett_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, clarett_ids);
 
+/*
+ * The unit's serial, as the USB core exposes a USB device's: /sys/bus/pci/devices/<bdf>/serial. Only
+ * present when the flash read succeeded. The PCI core creates it after a successful probe and removes
+ * it on unbind, so drvdata (the card) is valid whenever it can be read.
+ */
+static ssize_t serial_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct snd_card *card = dev_get_drvdata(dev);
+	struct clarett *c = card->private_data;
+
+	return sysfs_emit(buf, "%s\n", c->serial);
+}
+static DEVICE_ATTR_RO(serial);
+
+static umode_t clarett_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct snd_card *card = dev_get_drvdata(kobj_to_dev(kobj));
+	struct clarett *c = card ? card->private_data : NULL;
+
+	return c && c->serial[0] ? attr->mode : 0;
+}
+
+static struct attribute *clarett_attrs[] = {
+	&dev_attr_serial.attr,
+	NULL
+};
+
+static const struct attribute_group clarett_group = {
+	.attrs = clarett_attrs,
+	.is_visible = clarett_attr_visible,
+};
+__ATTRIBUTE_GROUPS(clarett);
+
 static struct pci_driver clarett_driver = {
 	.name = KBUILD_MODNAME,
 	/*
@@ -2037,6 +2127,7 @@ static struct pci_driver clarett_driver = {
 	.id_table = clarett_ids,
 	.probe = clarett_probe,
 	.remove = clarett_remove,
+	.dev_groups = clarett_groups,
 	.shutdown = clarett_shutdown,
 };
 module_pci_driver(clarett_driver);

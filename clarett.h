@@ -31,16 +31,13 @@ struct snd_rawmidi_substream;
 
 /* --- BAR0 register map --------------------------------------------------- */
 #define CLARETT_BAR              0
-#define REG_CAPS                 0x000
-#define REG_SERIAL_LO            0x010
-#define REG_SERIAL_HI            0x014
+#define REG_CAPS                 0x000   /* mirrors appspace offset 12, the FPGA version word */
 #define REG_IRQ0_CAUSE           0x100   /* read-to-clear; bit DONE = mailbox complete */
 #define REG_IRQ0_ENABLE          0x104   /* initialised to 0xf000003f                 */
 #define REG_NOTIFY_CAUSE         0x400   /* read-to-clear; carries the notify mask     */
 #define REG_DOORBELL             0x408   /* write 1 = submit, 2 = ack/clear prior      */
 #define REG_DMA_ADDR_LO          0x410   /* GET-response DMA buffer bus address (low 32)  */
 #define REG_DMA_ADDR_HI          0x414   /* DMA buffer bus address (high 32)              */
-#define REG_INFO                 0x8000  /* read-only fw-info header (fw versions, ...) */
 #define REG_MBOX                 0x8020  /* FCP request mailbox                         */
 
 /*
@@ -186,6 +183,21 @@ struct snd_rawmidi_substream;
 #define METER_TABLE_M_OFFSET     146
 #define METER_TABLE_H_OFFSET     156
 #define METER_TABLE_LEN          10
+
+/*
+ * Unit identity. BAR0 0x010/0x014 and the header at 0x8000 read the same placeholder words on every
+ * unit (a "serial" 0x000012345678abcd and two "firmware" words that decode as dates), so the driver
+ * takes nothing from them. The real values: the firmware versions are appspace words (App at 8, the
+ * FPGA build in the low 16 bits of 12, a Red's front panel at 20), as the device descriptors give
+ * them; the serial is the first line of the App_Env flash segment, "SERIAL_NO = <digits>".
+ */
+#define APPSPACE_FW_APP          8
+#define APPSPACE_FW_FPGA         12
+#define APPSPACE_FW_FRONT        20
+#define FCP_FLASH_INFO           0x004000   /* {} -> {u32 total size, u32 segment count, u8[4]} */
+#define FCP_FLASH_SEGMENT_INFO   0x004001   /* {u32 index} -> {u32 size, u32 flags, char name[16]} */
+#define FCP_FLASH_READ           0x004005   /* {u32 segment, u32 offset, u32 len} -> len bytes */
+#define CLARETT_SERIAL_LEN       16
 
 /* FCP "big" opcodes (low bits of cmd); == scarlett2 USB values */
 #define FCP_GET_DATA             0x800000
@@ -361,6 +373,8 @@ struct clarett_model {
 	/* DIN MIDI in/out jacks. Every Clarett has them; the Red range has none, although the Red 8Line's
 	 * register UART is present and answers like a Clarett's, so a port created on it would lead nowhere. */
 	bool has_midi;
+	/* The appspace carries a front-panel firmware version (APPSPACE_FW_FRONT): the Red range. */
+	bool fw_front;
 	/*
 	 * The 0x400 event bits are this model's notification word, and its device map's notify-client
 	 * masks are written against them (NOTIFY_EV_* on a Clarett, NOTIFY_EV_RED_* on a Red). Without it
@@ -496,7 +510,9 @@ struct clarett {
 	dma_addr_t resp_dma;
 	size_t resp_size;
 
-	u32 serial_lo, serial_hi, fw_app, fw_fpga;
+	/* The unit's serial, from flash (clarett_read_serial); empty if it could not be read. Exposed as
+	 * the PCI device's "serial" sysfs attribute, and deliberately never logged. */
+	char serial[CLARETT_SERIAL_LEN];
 
 	/* MSI / async notifications (vec0). With MSI up the ISR IS the mailbox completion path: while
 	 * cmd_inflight it clears 0x100, then completes mbox_accepted/mbox_landed on the 0x400 phase

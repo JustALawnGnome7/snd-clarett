@@ -176,10 +176,11 @@ own stream geometry, which is unique per model. There is nothing to configure, a
 logs what it found:
 
 ```
-snd_clarett 0000:0a:00.0: Clarett 2Pre: serial 000012345678abcd fw app 0x04061973 fpga 0x18101966; FCP hwdep, PCM 4/14ch, MIDI
+snd_clarett 0000:0a:00.0: Clarett 2Pre: App 1016, FPGA 1021; FCP hwdep, PCM 4/14ch, MIDI
 ```
 
-The serial and firmware fields read the same on every unit, so they do not identify one.
+`App`/`FPGA` (and `Front` on a Red) are the unit's firmware versions. The serial is not logged; it is
+in `/sys/bus/pci/devices/<bdf>/serial`.
 
 There is deliberately no way to override detection: channel counts, DMA geometry and the meter
 layout are all sized from the model, so a wrong guess would stream the wrong width. If the
