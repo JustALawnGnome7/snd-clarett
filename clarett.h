@@ -118,7 +118,9 @@ struct snd_rawmidi_substream;
  * mailbox command phase: bit0 = request accepted (also raised once, with no command in flight, to
  * acknowledge the response-buffer address), bit1 = response DMA landed. The bits above them are
  * device events, and they ARE the notification word: on a Clarett, bit21 = dim/mute and bit22 =
- * monitor (the vendor descriptors' notification masks), bit3 = sync state changed.
+ * monitor (the vendor descriptors' notification masks), bit3 = sync state changed. The Red range
+ * reuses bits 21-22 with other meanings: its descriptors give one bit per category of control
+ * (NOTIFY_EV_RED_*), so what a bit means depends on the family.
  *
  * Consequence for the ISR: vec0 fires on mailbox completion too, so only the event bits may be relayed
  * as a notification; relaying the phase bits makes every one of the driver's own commands look like a
@@ -131,6 +133,18 @@ struct snd_rawmidi_substream;
 #define NOTIFY_EV_SYNC           0x00000008u  /* bit3  — sync state changed */
 #define NOTIFY_EV_DIM_MUTE       0x00200000u  /* bit21 — dim/mute */
 #define NOTIFY_EV_MONITOR        0x00400000u  /* bit22 — monitor (front-panel knob) */
+/*
+ * The Red range's event bits, from its device descriptors' notification masks. Seen on a Red 8Line:
+ * output in bursts while a front-panel knob turns, global and the input pair on front-panel presses,
+ * temperature every ~5 s while idle. Their device maps' notify-client masks are written against these.
+ */
+#define NOTIFY_EV_RED_INPUT_GAIN     0x00200000u  /* bit21 — preamp gain */
+#define NOTIFY_EV_RED_INPUT_OTHER    0x00400000u  /* bit22 — the other input settings */
+#define NOTIFY_EV_RED_OUTPUT         0x00800000u  /* bit23 — output and knob-group gain, mute, dim */
+#define NOTIFY_EV_RED_GLOBAL         0x01000000u  /* bit24 — unit-wide settings */
+#define NOTIFY_EV_RED_DANTE_PERSIST  0x02000000u  /* bit25 — stored Dante settings */
+#define NOTIFY_EV_RED_DANTE_VOLATILE 0x04000000u  /* bit26 — live Dante state */
+#define NOTIFY_EV_RED_TEMPERATURE    0x40000000u  /* bit30 — temperature (8Line and 16Line) */
 
 /* Monitoring config region re-read on a notification. */
 #define MONITOR_CFG_OFFSET       24
@@ -347,8 +361,9 @@ struct clarett_model {
 	bool has_midi;
 	/*
 	 * The 0x400 event bits are this model's notification word, and its device map's notify-client
-	 * masks are written against them. Without it the relay sends an all-bits wildcard, so fcp-server
-	 * re-reads every notifiable control: the Red range, whose event bits have not been measured.
+	 * masks are written against them (NOTIFY_EV_* on a Clarett, NOTIFY_EV_RED_* on a Red). Without it
+	 * the relay sends an all-bits wildcard, so fcp-server re-reads every notifiable control on any
+	 * event: the fallback for a model whose maps predate its event bits.
 	 */
 	bool notify_word;
 	/*

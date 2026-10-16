@@ -1146,9 +1146,11 @@ static void clarett_follow_work(struct work_struct *work)
 		clarett_hw_gain_follow(c, buf);
 }
 
+/* A model with no output gains to follow (the Red range) has nothing to fetch; on a Red, bits 21-22
+ * are input events, not the monitor and dim/mute ones the caller tests for. */
 void clarett_schedule_follow(struct clarett *c)
 {
-	if (hw_gain_follow && READ_ONCE(c->ctl_ready))
+	if (hw_gain_follow && c->model->n_out_gains && READ_ONCE(c->ctl_ready))
 		schedule_delayed_work(&c->follow_work,
 				      msecs_to_jiffies(clarett_hwdep_notify_ms()));
 }
@@ -1930,6 +1932,7 @@ static const struct clarett_clock_src red_clock_srcs[] = {
 static const struct clarett_model red_8line = {
 	.name = "Red 8Line",
 	.slug = "red-8line",
+	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 60,			/* 58 record + 2 loopback */
 	.playback_channels = 64,		/* Playback 1-64 */
 	/*
@@ -1970,6 +1973,7 @@ static const struct clarett_model red_8line = {
 static const struct clarett_model red_16line = {
 	.name = "Red 16Line",
 	.slug = "red-16line",
+	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 64,			/* 62 record + 2 loopback */
 	.playback_channels = 64,		/* Playback 1-64 */
 	/* The 8Line's S/MUX re-pinning, over a wider stream; both dead sets are contiguous tails. */
@@ -1994,6 +1998,7 @@ static const struct clarett_model red_16line = {
 static const struct clarett_model red_4pre = {
 	.name = "Red 4Pre",
 	.slug = "red-4pre",
+	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 60,			/* 58 record + 2 loopback, as the 8Line */
 	.playback_channels = 64,
 	.rx_live_mid = 52,
@@ -2008,6 +2013,7 @@ static const struct clarett_model red_4pre = {
 static const struct clarett_model red_8pre = {
 	.name = "Red 8Pre",
 	.slug = "red-8pre",
+	.notify_word = true,		/* NOTIFY_EV_RED_* */
 	.capture_channels = 64,			/* 62 record + 2 loopback, as the 16Line */
 	.playback_channels = 64,
 	.rx_live_mid = 60,

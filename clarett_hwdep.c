@@ -527,9 +527,9 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  *
  * The USB FCP device delivers that bitmask in its interrupt message; this Thunderbolt device carries
  * it in the event bits of the 0x400 cause register (ev, phase bits already removed), so it is relayed
- * as is on a model whose device map is written against it (clarett_model.notify_word). Any other
- * model gets an all-categories wildcard (~0), so fcp-server does a correct, if broad, re-read of all
- * notifiable controls.
+ * as is on a model whose device map is written against it (clarett_model.notify_word, every model
+ * the driver knows). A model without it gets an all-categories wildcard (~0), so fcp-server does a
+ * correct, if broad, re-read of all notifiable controls.
  */
 /*
  * Minimum gap between notification wakes. Writable at runtime:

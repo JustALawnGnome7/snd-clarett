@@ -62,9 +62,14 @@ period (`0x300`) events.
   command phase in bits 0-1 and device events above them, and those event bits are the FCP
   notification word: on a Clarett, bit 22 = monitor (the front-panel knob), bit 21 = dim/mute.
   The relay passes them to `fcp-server`, which re-reads the controls whose `notify-client` mask
-  matches (`0x600000` in the Clarett maps). An idle Clarett raises none. The Red range, whose event
-  bits are not yet identified, gets an all-categories wildcard (`~0`) instead
-  (`clarett_model.notify_word`). Wakes are **rate-limited** to one per `notify_ms` — deliberately
+  matches (`0x600000` in the Clarett maps). An idle Clarett raises none. The Red range uses one bit
+  per category of control, from its descriptors: bit 21 preamp gain, bit 22 other input settings,
+  bit 23 outputs and knob groups, bit 24 unit-wide settings, bits 25-26 Dante, bit 30 temperature
+  (`NOTIFY_EV_RED_*`), and its maps' masks are written against those. A model without
+  `clarett_model.notify_word` gets an all-categories wildcard (`~0`) instead. **Driver and maps
+  move together:** a map whose masks predate the event bits (the Clarett's `1`, the Red's `1`)
+  matches nothing this driver relays, so front-panel changes silently stop reaching the GUI; a new
+  map under an older, wildcard-relaying driver still works. Wakes are **rate-limited** to one per `notify_ms` — deliberately
   a rate limit (one interval after the *first* event of a burst), not a debounce, which against a
   control being moved continuously would never fire.
 - **The relay runs while streaming too.** An audio period raises no event bit, so a stream adds no
