@@ -205,10 +205,12 @@ struct snd_rawmidi_substream;
  * control at its UI refresh rate (30-60 Hz); a device command per read floods the mailbox and disrupts
  * streaming (skips + command timeouts, since control and stream contend on this Thunderbolt device). The
  * .get serves the cached levels between polls, so the GUI still sees a live meter with far fewer device
- * commands. With the optional periodic GET_METER (meter_poll_ms) running, this sits just above its 40 ms
- * default, so the worker keeps the cache fresh and the .get never polls on its own.
+ * commands. 40 ms, under alsa-scarlett-gui's fastest (and default) 20 Hz Levels rate: at 50 ms a 50 ms
+ * reader got the previous values on about every other read, so its display refreshed at ~10 Hz. With the
+ * optional periodic GET_METER (meter_poll_ms) at its 40 ms default the two coincide, and a .get may
+ * occasionally poll beside the worker.
  */
-#define CLARETT_METER_CACHE_MS   50
+#define CLARETT_METER_CACHE_MS   40
 
 /* Debounced flash persist: after a control change, schedule a single DATA_CMD{PERSIST} this many ms
  * later (cancel+reschedule on each change) so a burst coalesces into one NVRAM write. Matches the
