@@ -315,9 +315,8 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
 - `tx_guard` (default 64) — frames the playback fill keeps clear of the device's read position.
 
-The rest are diagnostics: `resp_trace` (per-command response telemetry), `tx_trace` (DMA pointer
-trace while streaming) and `phase_cycle` (`0` returns the mailbox to its older completion cycle, for
-comparison). Their `MODULE_PARM_DESC` strings say more.
+The rest are diagnostics: `resp_trace` (per-command response telemetry) and `tx_trace` (DMA pointer
+trace while streaming). Their `MODULE_PARM_DESC` strings say more.
 
 ## Settings persistence
 

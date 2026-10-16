@@ -29,16 +29,11 @@
 #endif
 
 /*
- * Phase-bit cycle: with MSI up, a command completes on the device's own 0x400 phase bits, delivered by
- * the vec0 ISR — bit0 when the request is accepted, bit1 when its response has landed — instead of
- * DONE in 0x100 followed by a cause sweep and a poll of the response buffer. Runtime-writable, so the
- * two cycles can be compared on a loaded module; 0 restores the DONE cycle.
+ * Two completion cycles. With MSI up, a command completes on the device's own 0x400 phase bits,
+ * delivered by the vec0 ISR: bit0 when the request is accepted, bit1 when its response has landed.
+ * Without MSI (allocation or request_irq failed, which the driver survives), it falls back to polling
+ * 0x100 for DONE, sweeping the cause blocks and polling the response buffer.
  */
-static bool phase_cycle = true;
-module_param(phase_cycle, bool, 0644);
-MODULE_PARM_DESC(phase_cycle,
-	"Complete mailbox commands on the 0x400 phase bits (accepted, then response landed) "
-	"delivered by the interrupt handler (default 1; 0 = the DONE + sweep + buffer-poll cycle).");
 
 /*
  * Why the trailing ack waits for the response. The doorbell ack (0x408=2) means "response
@@ -222,12 +217,9 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		clarett_wl(c, REG_MBOX + MBOX_DATA + i, w);
 	}
 
-	/* Mark the command in flight BEFORE submitting: vec0 fires on mailbox-DONE, and the ISR must
-	 * suppress its notify path for our own completion (clarett_irq / the 0x400 note in clarett.h).
-	 * In the default cycle the ISR is also the completion consumer (reads 0x100, completes
-	 * mbox_done). Held until just before mutex_unlock so it still covers a completion MSI
-	 * delivered after the poll below observes DONE. */
-	reinit_completion(&c->mbox_done);
+	/* Mark the command in flight BEFORE submitting: vec0 fires on the command's phase bits, and the
+	 * ISR must record them for this command rather than relay them (clarett_irq / the 0x400 note in
+	 * clarett.h). Held until just before mutex_unlock so it still covers an MSI delivered late. */
 	reinit_completion(&c->mbox_accepted);
 	reinit_completion(&c->mbox_landed);
 	atomic_set(&c->mbox_phase, 0);
@@ -237,7 +229,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	clarett_wl(c, REG_DOORBELL, DOORBELL_SUBMIT);
 
 	deadline = jiffies + msecs_to_jiffies(CLARETT_MBOX_TIMEOUT_MS);
-	by_phase = phase_cycle && c->irq_ready;
+	by_phase = c->irq_ready;
 	if (by_phase) {
 		/*
 		 * Accepted, then landed. Both deadlines follow the response deadline (resp_timeout_ms, or
@@ -268,7 +260,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 			}
 		}
 	} else {
-		/* Default cycle: once DONE shows in 0x100, sweep the remaining cause blocks
+		/* Polled fallback (no MSI): once DONE shows in 0x100, sweep the remaining cause blocks
 		 * (0x300, 0x200, 0x400, 0x500 — 0x400 holds the command-phase value and is
 		 * read-to-clear), do one confirming full sweep, then wait for the response and ack.
 		 * Sweep only AFTER DONE: sweeping the read-to-clear phase registers continuously
@@ -277,28 +269,15 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 					     REG_NOTIFY_CAUSE, 0x500 };
 		int s;
 
-		/* Completion discovery: wait for the vec0 MSI; the ISR performs the sweep's first
-		 * 0x100 read, so 0x100 is read about twice per command rather than dozens of times
-		 * by a tight poll. Poll only as a fallback (MSI not granted, or a lost/raced
-		 * interrupt). polls==1 in the dev_dbg line means the MSI path was taken. */
-		if (c->irq_ready &&
-		    wait_for_completion_timeout(&c->mbox_done,
-						msecs_to_jiffies(CLARETT_MBOX_TIMEOUT_MS))) {
-			cause = c->mbox_cause;
-			first_cause = cause;
-			polls = 1;
-		}
-		if (!(cause & IRQ_DONE_BIT)) {
-			do {	/* >=1 read even if the MSI wait consumed the deadline */
-				cause = clarett_rl(c, REG_IRQ0_CAUSE);   /* fallback poll, read-to-clear */
-				if (!polls)
-					first_cause = cause;
-				polls++;
-				if (cause & IRQ_DONE_BIT)
-					break;
-				cpu_relax();
-			} while (time_before(jiffies, deadline));
-		}
+		do {
+			cause = clarett_rl(c, REG_IRQ0_CAUSE);	/* read-to-clear */
+			if (!polls)
+				first_cause = cause;
+			polls++;
+			if (cause & IRQ_DONE_BIT)
+				break;
+			cpu_relax();
+		} while (time_before(jiffies, deadline));
 
 		if (cause & IRQ_DONE_BIT) {
 			done_us = ktime_us_delta(ktime_get(), t_submit);

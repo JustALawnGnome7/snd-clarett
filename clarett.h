@@ -496,9 +496,9 @@ struct clarett {
 
 	u32 serial_lo, serial_hi, fw_app, fw_fpga;
 
-	/* MSI / async notifications (vec0). In the default mailbox cycle the ISR IS the
-	 * completion path: while cmd_inflight it reads the 0x100 mailbox cause (the sweep's
-	 * first read, MSI-paced) and completes mbox_done; clarett_fcp then finishes the sweep. */
+	/* MSI / async notifications (vec0). With MSI up the ISR IS the mailbox completion path: while
+	 * cmd_inflight it clears 0x100, then completes mbox_accepted/mbox_landed on the 0x400 phase
+	 * bits. Without it, clarett_fcp polls (the fallback cycle). */
 	bool irq_ready;
 	bool ctl_ready;				/* controls registered; notify path may snd_ctl_notify */
 	int n_vec;				/* MSI vectors actually allocated (<= CLARETT_NUM_VECTORS) */
@@ -513,13 +513,11 @@ struct clarett {
 	 */
 	u8 mon_snap[MONITOR_CFG_MAX_LEN];
 	bool mon_snap_valid;
-	struct completion mbox_done;		/* completed by the vec0 ISR on mailbox DONE */
-	struct completion mbox_accepted;	/* ...on 0x400 bit0 (request accepted), in flight */
+	struct completion mbox_accepted;	/* by the vec0 ISR on 0x400 bit0 (request accepted), in flight */
 	struct completion mbox_landed;		/* ...on 0x400 bit1 (response landed), in flight */
 	/* Response-address acknowledgement (0x400 bit0 after the 0x414 write); see addr_ack_ms. */
 	struct completion addr_acked;
 	bool addr_ack_wait;			/* the ISR completes addr_acked on 0x400 bit0 */
-	u32 mbox_cause;				/* 0x100 value the ISR consumed with DONE set */
 	/*
 	 * 0x400 command-phase bits (NOTIFY_PHASE_MASK) the vec0 ISR read while the current command was in
 	 * flight. The ISR is the only reader of 0x400 when MSI is up, since it is read-to-clear; this is

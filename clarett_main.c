@@ -901,11 +901,10 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 		/*
 		 * 0x100 FIRST when a command is in flight: its DONE bit (bit29) reflects "0x400 has bits
 		 * pending", so reading 0x400 first clears what DONE reports and the command times out.
-		 * Default mailbox cycle: a vec0 MSI during a command IS the completion signal, so the
-		 * mailbox cause is read here (the sweep's first, MSI-paced 0x100 read) and the rest of the
-		 * sweep is left to the waiting clarett_fcp.
+		 * The read clears DONE; the command itself completes on the phase bits below.
 		 */
-		u32 done = inflight ? readl(c->bar0 + REG_IRQ0_CAUSE) : 0;	/* read-to-clear */
+		if (inflight)
+			readl(c->bar0 + REG_IRQ0_CAUSE);	/* read-to-clear */
 		u32 cause = readl(c->bar0 + REG_NOTIFY_CAUSE);
 		u32 ev = cause & NOTIFY_EVENT_MASK;
 
@@ -915,10 +914,6 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 				complete(&c->mbox_accepted);
 			if (cause & NOTIFY_RESP_LANDED)
 				complete(&c->mbox_landed);
-			if (done & IRQ_DONE_BIT) {
-				c->mbox_cause = done;
-				complete(&c->mbox_done);
-			}
 		}
 
 		/* Init is waiting for the response-address acknowledgement (addr_ack_ms). */
@@ -1390,7 +1385,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	mutex_init(&c->hwdep_lock);
 	mutex_init(&c->pcm_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
-	init_completion(&c->mbox_done);
 	init_completion(&c->mbox_accepted);
 	init_completion(&c->mbox_landed);
 	init_completion(&c->addr_acked);
