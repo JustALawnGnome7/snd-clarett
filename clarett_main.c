@@ -378,7 +378,8 @@ static void clarett_hw_init(struct clarett *c)
  * Read the unit's serial from flash: the App_Env segment begins with one ASCII line,
  * "SERIAL_NO = <digits>", optionally newline-terminated, and is otherwise erased. Found by name, not
  * by index, though it has been segment 4 on every unit read. Read-only (FLASH_INFO, SEGMENT_INFO,
- * FLASH_READ) and best-effort: any failure leaves c->serial empty, which only hides the sysfs file.
+ * FLASH_READ), and only on demand: the first read of the "serial" sysfs attribute, never at probe, so a
+ * slow flash cannot stall an attach or disturb fcp-server's start. Leaves c->serial empty on failure.
  */
 static void clarett_read_serial(struct clarett *c)
 {
@@ -1425,6 +1426,7 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	mutex_init(&c->mbox_lock);
 	mutex_init(&c->hwdep_lock);
 	mutex_init(&c->pcm_lock);
+	mutex_init(&c->serial_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
 	init_completion(&c->mbox_accepted);
 	init_completion(&c->mbox_landed);
@@ -1560,7 +1562,6 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	/* Seed the shadow from the device so the enable-byte RMW below is safe. Best-effort: if it
 	 * fails we skip the enable writes. */
 	seeded = clarett_seed_shadow(c);
-	clarett_read_serial(c);
 	if (seeded)
 		dev_warn(&pci->dev,
 			 "config shadow seed failed (%d); leaving hardware mute/dim enables untouched\n",
@@ -2084,37 +2085,34 @@ static const struct pci_device_id clarett_ids[] = {
 MODULE_DEVICE_TABLE(pci, clarett_ids);
 
 /*
- * The unit's serial, as the USB core exposes a USB device's: /sys/bus/pci/devices/<bdf>/serial. Only
- * present when the flash read succeeded. The PCI core creates it after a successful probe and removes
- * it on unbind, so drvdata (the card) is valid whenever it can be read.
+ * The unit's serial, as the USB core exposes a USB device's: /sys/bus/pci/devices/<bdf>/serial. Read
+ * from flash on the first read and cached; one attempt, so a unit whose flash will not answer is not
+ * asked again (-ENODATA thereafter). The PCI core creates the file after a successful probe and removes
+ * it, waiting out any reader, before remove() runs, so drvdata (the card) is valid whenever it is read.
  */
 static ssize_t serial_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct clarett *c = card->private_data;
+	int state;
 
-	return sysfs_emit(buf, "%s\n", c->serial);
+	mutex_lock(&c->serial_lock);
+	if (!c->serial_state) {
+		clarett_read_serial(c);
+		c->serial_state = c->serial[0] ? 1 : -1;
+	}
+	state = c->serial_state;
+	mutex_unlock(&c->serial_lock);
+
+	return state > 0 ? sysfs_emit(buf, "%s\n", c->serial) : -ENODATA;
 }
 static DEVICE_ATTR_RO(serial);
-
-static umode_t clarett_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
-{
-	struct snd_card *card = dev_get_drvdata(kobj_to_dev(kobj));
-	struct clarett *c = card ? card->private_data : NULL;
-
-	return c && c->serial[0] ? attr->mode : 0;
-}
 
 static struct attribute *clarett_attrs[] = {
 	&dev_attr_serial.attr,
 	NULL
 };
-
-static const struct attribute_group clarett_group = {
-	.attrs = clarett_attrs,
-	.is_visible = clarett_attr_visible,
-};
-__ATTRIBUTE_GROUPS(clarett);
+ATTRIBUTE_GROUPS(clarett);
 
 static struct pci_driver clarett_driver = {
 	.name = KBUILD_MODNAME,

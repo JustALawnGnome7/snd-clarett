@@ -77,6 +77,19 @@ MODULE_PARM_DESC(resp_timeout_ms,
 	"LATE or never sent at all. resp_trace=1 prints the landing latency.");
 
 /*
+ * The response deadline for one command: probe's override while it asks for readiness, the long flash
+ * deadline for the FLASH category, else resp_timeout_ms.
+ */
+static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
+{
+	if (c->resp_deadline_ms)
+		return c->resp_deadline_ms;
+	if ((opcode & ~CMD_EXEC_FLAG) >> 12 == 0x004)
+		return CLARETT_FLASH_TIMEOUT_MS;
+	return resp_timeout_ms;
+}
+
+/*
  * True for a stream period-cause block (0x200 TX / 0x300 RX) while the PCM engine is streaming. The
  * mailbox skips these in its DONE sweep so it does not read-to-clear a period event the stream servicer
  * is waiting for (an audible gap). When idle they read 0 and are swept normally.
@@ -103,7 +116,7 @@ static inline bool clarett_skip_cause(const struct clarett *c, u16 reg)
 static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit, s64 *land_us)
 {
 	const u8 *r = c->resp_buf;
-	unsigned int ms = c->resp_deadline_ms ? c->resp_deadline_ms : resp_timeout_ms;
+	unsigned int ms = clarett_resp_ms(c, exp_echo);
 	unsigned long deadline = jiffies + msecs_to_jiffies(max(ms, 1u));
 	ktime_t spin_until = ktime_add_us(ktime_get(), 500);
 	u32 echo;
@@ -232,12 +245,12 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	by_phase = c->irq_ready;
 	if (by_phase) {
 		/*
-		 * Accepted, then landed. Both deadlines follow the response deadline (resp_timeout_ms, or
-		 * ready_resp_ms while probe asks). An unaccepted or unanswered command is not acked, as in
+		 * Accepted, then landed. Both deadlines follow the response deadline (clarett_resp_ms():
+		 * resp_timeout_ms, ready_resp_ms while probe asks, longer for a flash command). An unaccepted or unanswered command is not acked, as in
 		 * the DONE cycle: the device then refuses the next sequence number, and the seq reset below
 		 * is what recovers it.
 		 */
-		unsigned int ms = c->resp_deadline_ms ? c->resp_deadline_ms : resp_timeout_ms;
+		unsigned int ms = clarett_resp_ms(c, opcode);
 
 		polls = 1;
 		if (wait_for_completion_timeout(&c->mbox_accepted, msecs_to_jiffies(max(ms, 1u)))) {

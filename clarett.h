@@ -461,6 +461,10 @@ struct clarett_model {
 #define FCP_RESP_ERR_OK          0x00
 
 #define CLARETT_MBOX_TIMEOUT_MS  100
+/* Response deadline for the FLASH category (0x004xxx). A flash read can take far longer than any other
+ * command: on a Red 8Line, a 64-byte FLASH_READ at attach once outlasted the normal 100 ms, and the
+ * lost response left the session answering every later command with no data. */
+#define CLARETT_FLASH_TIMEOUT_MS 2000
 #define CLARETT_MAX_PAYLOAD      64      /* clarett_set_data single-write cap (small configs) */
 #define CLARETT_MBOX_DATA_MAX    1024    /* mailbox data region past MBOX_DATA; SET_MUX = 412 */
 #define CLARETT_CONFIG_SIZE      256     /* shadow of the device config/app space       */
@@ -510,9 +514,12 @@ struct clarett {
 	dma_addr_t resp_dma;
 	size_t resp_size;
 
-	/* The unit's serial, from flash (clarett_read_serial); empty if it could not be read. Exposed as
-	 * the PCI device's "serial" sysfs attribute, and deliberately never logged. */
+	/* The unit's serial, from flash, read on the first read of the PCI device's "serial" sysfs
+	 * attribute and cached (clarett_read_serial); deliberately never logged. serial_state: 0 = not yet
+	 * read, 1 = read, -1 = the read failed (not retried). */
 	char serial[CLARETT_SERIAL_LEN];
+	int serial_state;
+	struct mutex serial_lock;
 
 	/* MSI / async notifications (vec0). With MSI up the ISR IS the mailbox completion path: while
 	 * cmd_inflight it clears 0x100, then completes mbox_accepted/mbox_landed on the 0x400 phase

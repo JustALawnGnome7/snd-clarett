@@ -264,9 +264,14 @@ appspace words (App at 8, the FPGA build in the low 16 bits of 12, Front at 20),
 probe seeds, and match the versions the device descriptors name. The BAR0 words at `0x010`/`0x014` and
 `0x8000` look like a serial and firmware ids but read the same placeholders on every unit, so the
 driver ignores them. **The unit's serial** is the first line of the flash `App_Env` segment
-(`SERIAL_NO = <digits>`), read at probe with `FLASH_INFO`/`FLASH_SEGMENT_INFO`/`FLASH_READ`. It is
-exposed as `/sys/bus/pci/devices/<bdf>/serial`, as the USB core exposes a USB device's, and never
-logged: a kernel log is what gets pasted into public bug reports.
+(`SERIAL_NO = <digits>`). It is exposed as `/sys/bus/pci/devices/<bdf>/serial`, as the USB core
+exposes a USB device's, and never logged: a kernel log is what gets pasted into public bug reports.
+It is read with `FLASH_INFO`/`FLASH_SEGMENT_INFO`/`FLASH_READ` on the file's **first read**, not at
+probe, then cached (one attempt; `-ENODATA` if it failed). A flash read can be slow: on a Red 8Line a
+64-byte read at attach once outlasted the normal 100 ms response deadline, and the lost response left
+the session answering every later command with no data, so fcp-server started on garbage. Flash
+commands (`0x004xxx`) therefore get a 2 s response deadline (`CLARETT_FLASH_TIMEOUT_MS`), and nothing
+reads flash on the attach path.
 
 - **info** — the probe summary above, and a `stream-svc:` line for any 2-second window (or any
   stream) in which something went wrong: a late servicer tick, a device-side period overrun, or an
