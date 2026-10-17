@@ -324,7 +324,9 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
   all runtime-writable: the bound on the response-address acknowledgement wait, how long each
   fallback attempt waits for its response, and the budget described above.
 - `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
-- `tx_guard` (default 64) — frames the playback fill keeps clear of the device's read position.
+- `tx_guard` (default 16, one fragment) — frames the playback fill keeps clear of the device's read
+  position. A frame written less than this far ahead of the read is not played, so smaller is better
+  for a client that keeps little queued; a full-buffer client is unaffected.
 
 The rest are diagnostics: `resp_trace` (per-command response telemetry) and `tx_trace` (DMA pointer
 trace while streaming). Their `MODULE_PARM_DESC` strings say more.

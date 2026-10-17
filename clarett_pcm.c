@@ -406,27 +406,31 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos
 
 /*
  * Guard: keep the playback fill this many frames clear of the engine's current TX read position, so a
- * concurrent DMA read is never torn by our write. It only has to exceed the engine's advance during ONE
- * fill memcpy (a few frames — a ~64 KB copy is single-digit microseconds), NOT the whole inter-tick gap:
- * the fill covers the ENTIRE ring ahead of the read, so even a lagged tick reads frames a prior tick
- * already filled. 64 frames is a single fragment-aligned margin comfortably above that. */
-#define CLARETT_TX_GUARD_FRAMES	(4 * CLARETT_FRAG_FRAMES)	/* 64 frames */
+ * concurrent DMA read is never torn by our write. One fragment (the unit the engine reads) is enough:
+ * the fill covers the ENTIRE ring ahead of the read, so near the read position it rewrites frames a
+ * prior fill already placed, with the same data — unless the app supplied them late. So the guard only
+ * matters for a client keeping a short queue, and there a larger guard LOSES audio: a frame the app
+ * writes less than the guard ahead of the read is never copied, and plays as the silence placed there
+ * earlier. Measured on hardware (8Pre, digital loopback, 48 kHz): a full-buffer client was sample-exact
+ * at guards 16, 32 and 64, at periods 32 and 64; a client holding a 48-frame lead at period 32 lost
+ * ~0.1% of its frames at 16, half at 32, and all at 64. No guard produced a torn or misplaced frame. */
+#define CLARETT_TX_GUARD_FRAMES	CLARETT_FRAG_FRAMES		/* 16 frames */
 
 /*
  * Smallest ALSA buffer offered. The buffer is a power-of-two divisor of the 4096-frame ring, which keeps
- * ALSA frame k and ring frame k wrapping coherently.
- *
- * The floor is twice CLARETT_TX_GUARD_FRAMES, so that even a minimal buffer leaves room for the guard
- * (which the fill clamps to half the buffer).
+ * ALSA frame k and ring frame k wrapping coherently. 128 frames (2.7 ms at 48 kHz) is a measured clean
+ * floor, the floor CLARETT_MAX_PERIODS works against, and leaves room for a tx_guard raised to 64 (the
+ * fill clamps the guard to half the buffer).
  */
-#define CLARETT_MIN_BUFFER_FRAMES	(2 * CLARETT_TX_GUARD_FRAMES)	/* 128 frames */
+#define CLARETT_MIN_BUFFER_FRAMES	128
 
 /*
  * The guard as a lever. Its job is ANTI-TEARING: keeping the fill clear of the engine's current read
  * position. It is not a latency term — the ALSA buffer and the reported delay do not change with it. It
- * sets a deadline instead: a frame has to be in the ALSA buffer roughly this many frames before the
- * engine reaches its ring slot, or the engine plays whatever was already there. With an ordinary
- * full-buffer client, guards from 16 to 96 frames behave the same.
+ * sets a deadline instead: a frame has to be in the ALSA buffer this many frames (plus up to one period,
+ * since the fill measures from the last period event) before the engine reaches its ring slot, or the
+ * engine plays the silence already there. With an ordinary full-buffer client the value makes no
+ * difference; with a short-queue client, smaller is better (see CLARETT_TX_GUARD_FRAMES).
  *
  * Clamped per fill to half the ALSA buffer, so the guard is satisfied by any app that keeps its buffer
  * even half full, and floored at one fragment. The fill copies only what the app has written
@@ -435,7 +439,7 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos, u32 pos
 static unsigned int tx_guard = CLARETT_TX_GUARD_FRAMES;
 module_param(tx_guard, uint, 0644);
 MODULE_PARM_DESC(tx_guard,
-		 "Frames the playback fill stays clear of the engine's TX read position (default 64, "
+		 "Frames the playback fill stays clear of the engine's TX read position (default 16, "
 		 "clamped to half the ALSA buffer, floored at one 16-frame fragment). Does not affect "
 		 "reported latency; see clarett_pcm.c before changing it.");
 
