@@ -948,12 +948,13 @@ int clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len);
 void clarett_mbox_clear_causes(struct clarett *c);
 int clarett_fcp_cmd(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
 		    u8 *resp, u16 resp_len);
+int clarett_fcp_read(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
+		     u8 *resp, u16 resp_len, u16 *size, u32 *status);
 
 /* hwdep.c */
 int clarett_hwdep_init(struct clarett *c);	/* create the FCP hwdep (fcp-server transport) */
 void clarett_hwdep_notify(struct clarett *c, u32 ev);	/* relay a device notification to fcp-server */
 void clarett_hwdep_free(struct clarett *c);	/* stop the relay before c is freed (UAF guard) */
-int clarett_get_data(struct clarett *c, u32 offset, u32 len);
 int clarett_set_data(struct clarett *c, u32 offset, u32 len, const u8 *val);
 int clarett_data_cmd(struct clarett *c, u32 activate);
 int clarett_write_u8(struct clarett *c, u32 offset, u8 val, u32 activate);

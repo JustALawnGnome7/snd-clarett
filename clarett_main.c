@@ -175,28 +175,24 @@ static int clarett_unit_tb_gen(struct pci_dev *pdev)
 /*
  * STREAM_INFO{band}: the device's stream geometry at one speed band. Returns 0 with the pair filled
  * in, -EIO if the device refused the read (status != 0, or a reply too short to hold the pair), or
- * the transport error. The reply arrives by DMA and is read out of resp_buf, so this runs only while
- * nothing else can issue a command (probe, before the card is registered). When not quiet, every
- * failure logs the raw response.
+ * the transport error. The reply is copied out under mbox_lock, so a command from the meter worker
+ * cannot overwrite it mid-parse. When not quiet, every failure logs the raw response.
  */
 static int clarett_stream_info(struct clarett *c, u8 band, u16 *playback, u16 *capture, bool quiet)
 {
-	const u8 *r = c->resp_buf;
+	u8 r[4];
 	u16 size;
-	u8 status;
+	u32 status;
 	int err;
 
-	err = clarett_fcp(c, FCP_STREAM_INFO, &band, 1);
+	err = clarett_fcp_read(c, FCP_STREAM_INFO, &band, 1, r, sizeof(r), &size, &status);
 	if (err) {
 		if (!quiet)
 			dev_warn(&c->pci->dev, "STREAM_INFO{%u}: transport failed (%d)\n", band, err);
 		return err;
 	}
-	dma_rmb();	/* order the DMAed response before we read resp_buf */
-	status = r[FCP_RESP_STATUS_OFF];
-	size = clarett_get_le16(r + FCP_RESP_SIZE_OFF);
-	*playback = clarett_get_le16(r + FCP_RESP_DATA_OFF);
-	*capture  = clarett_get_le16(r + FCP_RESP_DATA_OFF + 2);
+	*playback = clarett_get_le16(r);
+	*capture  = clarett_get_le16(r + 2);
 	if (status != FCP_RESP_ERR_OK || size < 4) {
 		if (!quiet)
 			dev_warn(&c->pci->dev,
@@ -209,8 +205,7 @@ static int clarett_stream_info(struct clarett *c, u8 band, u16 *playback, u16 *c
 
 /*
  * Ask the device who it is: STREAM_INFO{band 0} returns {u16 playback_ch, u16 capture_ch}, a pair
- * unique per model (bar the Red twins below). Runs before the meter heartbeat starts, so nothing
- * else touches resp_buf between the (landed-gated) completion and the parse.
+ * unique per model (bar the Red twins below).
  * Returns NULL if the query fails or the pair matches no known model.
  *
  * A NULL return is fatal to probe either way — there is no fallback model — but *collapsed
@@ -427,26 +422,27 @@ static void clarett_read_serial(struct clarett *c)
  * Seed the whole config shadow from the device. clarett_hw_init() zeroes the shadow; the seed
  * gives the command-3 enable bytes (72/73) their real values, which their packed bits need for a
  * safe read-modify-write. The first GET after programming the DMA address can come back empty
- * (echo word 0), so retry briefly. Guard on BOTH the echo word AND the response size: a refusing
- * device returns the header with size=0 and no payload, and copying that would seed stale bytes.
+ * (echo word 0), so retry briefly. The mailbox checks the echo; guard on the response size too: a
+ * refusing device returns the header with size=0 and no payload, and copying that would seed stale
+ * bytes.
  */
 static int clarett_seed_shadow(struct clarett *c)
 {
-	const u8 *r = c->resp_buf;
-	u32 echo;
+	u8 req[8], buf[CLARETT_CONFIG_SIZE];
 	u16 size;
 	int err, attempt;
 
+	clarett_put_le32(req, 0);
+	clarett_put_le32(req + 4, CLARETT_CONFIG_SIZE);
 	for (attempt = 0; attempt < 3; attempt++) {
-		err = clarett_get_data(c, 0, CLARETT_CONFIG_SIZE);
+		/* copied out under mbox_lock: the meter worker may already be issuing commands */
+		err = clarett_fcp_read(c, FCP_GET_DATA, req, sizeof(req), buf, sizeof(buf),
+				       &size, NULL);
 		if (err)
 			return err;
 
-		dma_rmb();	/* order the DMAed response before we read resp_buf */
-		echo = clarett_get_le32(r + FCP_RESP_ECHO_OFF);
-		size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
-		if (echo == (CMD_EXEC_FLAG | FCP_GET_DATA) && size >= CLARETT_CONFIG_SIZE) {
-			memcpy(c->shadow, r + FCP_RESP_DATA_OFF, CLARETT_CONFIG_SIZE);
+		if (size >= CLARETT_CONFIG_SIZE) {
+			memcpy(c->shadow, buf, CLARETT_CONFIG_SIZE);
 			/* Only 24/28/112 are known to read back live; mark just those known. The rest of
 			 * the seed — preamp Mode/Air in particular — is not device-reported, so it stays
 			 * unknown and its first write goes through. */

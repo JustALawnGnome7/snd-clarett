@@ -185,16 +185,17 @@ static void clarett_resp_tail_wait(struct clarett *c)
  * completely, with the sequence continuing from the lost command. So: wait up to that command's own
  * deadline for the response, ack it and carry on; if it never lands (a device asked too early after
  * power-up answers nothing at all), start the sequence over at 0, which is what recovers that case.
- * Called with mbox_lock held, before the response buffer is reset for the next command.
+ * Returns true if it waited and nothing landed. Called with mbox_lock held, before the response
+ * buffer is reset for the next command.
  */
-static void clarett_retire_lost(struct clarett *c)
+static bool clarett_retire_lost(struct clarett *c)
 {
 	const u8 *r = c->resp_buf;
 	unsigned long deadline;
 	u32 echo;
 
 	if (!c->lost_pending)
-		return;
+		return false;
 	c->lost_pending = false;
 	deadline = jiffies + msecs_to_jiffies(max(clarett_resp_ms(c, c->lost_echo), 1u));
 	for (;;) {
@@ -207,29 +208,31 @@ static void clarett_retire_lost(struct clarett *c)
 			dev_warn_ratelimited(&c->pci->dev,
 				"FCP op=0x%06x seq=%u: late response acknowledged\n",
 				c->lost_echo & ~CMD_EXEC_FLAG, c->lost_seq);
-			return;
+			return false;
 		}
 		if (time_after(jiffies, deadline))
 			break;
 		usleep_range(200, 400);
 	}
 	c->seq = 0;
+	return true;
 }
 
 /*
  * Core mailbox transaction. If resp_out/resp_len are given, the response *payload* (the bytes after
  * the 16-byte echoed header) is copied out under mbox_lock on success — race-free, unlike reading
- * c->resp_buf after the call. clarett_fcp() is the response-less wrapper; clarett_fcp_cmd() is the
- * hwdep CMD path that needs the payload.
+ * c->resp_buf after the call — and size_out/status_out, if given, get the response's size and FCP
+ * status. clarett_fcp() is the response-less wrapper; clarett_fcp_cmd() is the hwdep CMD path that
+ * needs the payload; clarett_fcp_read() also returns the size and status.
  */
 static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
-			 u8 *resp_out, u16 resp_len)
+			 u8 *resp_out, u16 resp_len, u16 *size_out, u32 *status_out)
 {
 	unsigned long deadline;
 	u32 cause = 0, first_cause = 0, resp_echo = 0, fcp_status = 0;
 	ktime_t t_submit;
 	s64 done_us = -1, land_us = -1, acc_us = -1;
-	bool by_phase = false;
+	bool by_phase = false, retire_failed;
 	int i, ret = 0, polls = 0;
 
 	if (len > CLARETT_MBOX_DATA_MAX)
@@ -246,7 +249,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 
 	mutex_lock(&c->mbox_lock);
 
-	clarett_retire_lost(c);
+	retire_failed = clarett_retire_lost(c);
 
 	/* zero the response header so clarett_resp_wait can't match a stale echo of a
 	 * repeated opcode */
@@ -462,18 +465,24 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		} else {
 			memcpy(resp_out, r + FCP_RESP_DATA_OFF, resp_len);
 		}
+		if (size_out)
+			*size_out = have;
+		if (status_out)
+			*status_out = fcp_status;
 	}
 
 	/*
-	 * Advance the sequence number for a command the device answered as ours. One it accepted but whose
-	 * response has not landed is retired by the next command (clarett_retire_lost(), which sets the
-	 * sequence). Otherwise — not accepted, or another command's answer — start over at 0: measured on
-	 * a Clarett asked too early after power-up, re-asking as seq 1 stays refused (err=3, stale echoed
-	 * seq) indefinitely, re-asking as seq 0 is answered.
+	 * Advance the sequence number for a command the device answered as ours. One with no answer —
+	 * accepted but not landed, or not seen accepted at all (it may yet be, late) — is retired by the
+	 * next command (clarett_retire_lost(), which sets the sequence). Except a command not accepted
+	 * straight after a retire found nothing: the device is not answering, so don't make every later
+	 * command wait out a second deadline as well. Otherwise — another command's answer — start over
+	 * at 0: measured on a Clarett asked too early after power-up, re-asking as seq 1 stays refused
+	 * (err=3, stale echoed seq) indefinitely, re-asking as seq 0 is answered.
 	 */
 	if (resp_echo && !c->mbox_wedged) {
 		c->seq++;
-	} else if (!resp_echo && (cause & IRQ_DONE_BIT)) {
+	} else if (!resp_echo && ((cause & IRQ_DONE_BIT) || !retire_failed)) {
 		c->lost_pending = true;
 		c->lost_echo = CMD_EXEC_FLAG | opcode;
 		c->lost_seq = c->seq;
@@ -502,26 +511,21 @@ void clarett_mbox_clear_causes(struct clarett *c)
 
 int clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len)
 {
-	return __clarett_fcp(c, opcode, data, len, NULL, 0);
+	return __clarett_fcp(c, opcode, data, len, NULL, 0, NULL, NULL);
 }
 
 /* hwdep FCP_IOCTL_CMD: run one command and return `resp_len` bytes of its response payload. */
 int clarett_fcp_cmd(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
 		    u8 *resp, u16 resp_len)
 {
-	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len);
+	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len, NULL, NULL);
 }
 
-/* GET_DATA: request `len` bytes from config `offset`. The response is DMAed into
- * the buffer programmed at REG_DMA_ADDR_LO/HI (c->resp_buf), not returned via MMIO:
- * a 16-byte echoed FCP header, then the requested bytes at FCP_RESP_DATA_OFF. */
-int clarett_get_data(struct clarett *c, u32 offset, u32 len)
+/* As clarett_fcp_cmd(), also returning the response's size field and FCP status (on success only). */
+int clarett_fcp_read(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
+		     u8 *resp, u16 resp_len, u16 *size, u32 *status)
 {
-	u8 buf[8];
-
-	clarett_put_le32(buf, offset);
-	clarett_put_le32(buf + 4, len);
-	return clarett_fcp(c, FCP_GET_DATA, buf, 8);
+	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len, size, status);
 }
 
 /* SET_DATA: write `len` bytes into the config space at `offset`. */
