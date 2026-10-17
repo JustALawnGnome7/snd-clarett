@@ -460,8 +460,8 @@ static unsigned int max_buffer;
 module_param(max_buffer, uint, 0644);
 MODULE_PARM_DESC(max_buffer,
 		 "Largest ALSA buffer offered, in frames (rounded down to a power of two, floored at "
-		 "128; default 0 = the full 4096-frame ring). Buffers are otherwise limited to four "
-		 "periods of the app's own period, so this is only needed as a hard cap.");
+		 "128; default 0 = the full ring: 4096 frames, 2048 on a Red). Buffers are otherwise "
+		 "limited to four periods of the app's own period, so this is only needed as a hard cap.");
 
 /* The advertised buffer ceiling in frames: the ring, or the max_buffer override rounded down to a power
  * of two so the ceiling is itself an attainable value under the pow2 constraint. */
@@ -795,8 +795,17 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 	struct snd_pcm_runtime *runtime = ss->runtime;
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	u8 chans   = play ? c->model->playback_channels : c->model->capture_channels;
-	size_t buf = play ? clarett_tx_ring_bytes(c) : clarett_rx_ring_bytes(c);
 	u32 frame  = (u32)chans * 4;
+	/*
+	 * Both directions get the SHORTER ring's ceiling. A Red's playback ring is half its capture ring
+	 * (2048 frames against 4096), so their defaults differed (aplay 512/2048, arecord 1024/4096), and
+	 * when two clients configured in the same instant the second's hw_params failed the period lock
+	 * pinned by the first. With one ceiling the defaults agree. No change where the rings match.
+	 */
+	u32 ring_frames = min_t(u32,
+				clarett_tx_ring_bytes(c) / ((u32)c->model->playback_channels * 4),
+				clarett_rx_ring_bytes(c) / ((u32)c->model->capture_channels * 4));
+	size_t buf = (size_t)ring_frames * frame;
 	/*
 	 * Minimum period: the finest cadence (CLARETT_DYN_MIN_FRAMES); the marker cadence follows whatever
 	 * period the app picks (clarett_pcm_prepare). The BUFFER is any power-of-two fraction of the ring,
