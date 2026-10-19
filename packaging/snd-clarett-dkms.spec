@@ -13,6 +13,7 @@
 #
 # Keep Version in step with dkms.conf's PACKAGE_VERSION — that file is the source of
 # truth, and the module compiles its value in as MODULE_VERSION.
+# Add a %changelog entry with each version (release dates are fine here).
 
 %global module_name snd-clarett
 
@@ -20,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.1.1
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -81,3 +82,19 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %doc README.md DEVELOPMENT.md
 %{_usrsrc}/%{module_name}-%{version}
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
+
+%changelog
+* Mon Oct 19 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.0-1
+- Add the Red 16Line, 4Pre and 8Pre; Red 8Line up to 192 kHz
+- Mailbox completes on the interrupt phase bits; device events relayed
+  as the notification word; no periodic polling when idle
+- Recover from a late mailbox response; refused commands fail cleanly
+- Faster attach: wait for the response-address acknowledgement
+- S/MUX capture widths read from the device; Clarett capture channels
+  ordered to match the router's PCM names
+- Clock Source changes apply at once, even while streaming
+- Real firmware versions in the probe line; serial in sysfs
+- MIDI: TX flow control, one-pass RX drain, packed RX words decoded
+- Playback: every frame from the start, TX guard one fragment (16 frames),
+  one buffer ceiling for both directions
+- Fewer module parameters
