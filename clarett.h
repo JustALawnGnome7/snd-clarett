@@ -283,12 +283,16 @@ struct snd_rawmidi_substream;
  * cur_rate from the configured one (FCP_SYNC_RATE_CFG, below) and /proc/asound/cardN/clarett is
  * truthful before the first stream.
  *
- * FCP_SYNC_READ is a bitfield: bit 0 = locked, bit 1 = the sync state changed since the last read (a
- * latch set by a clock event, such as the SET_CLOCK at every arm, and cleared by reading it). Measured on
- * a Red 8Line and a Clarett 4Pre: Internal reads 1 idle and streaming; an external source with no signal
- * reads 0; the first read after a stream starts reads 3 (2 if unlocked) and every later read 1 (0).
+ * FCP_SYNC_READ is a bitfield: bit 0 = locked, bit 1 = lock was lost since the last read (a latch,
+ * cleared by reading it). Measured on a Red 8Line and a Clarett 4Pre: Internal reads 1 idle and
+ * streaming; an external source with no signal reads 0; the first read after a stream starts reads 3
+ * (2 if unlocked) and every later read 1 (0), so the re-clock at every arm drops the lock for a moment.
  * Whether a caller sees the latch depends on whether the event lands before or after this handshake's
- * own read, which is why it seemed to vary by model. A lock indicator must test bit 0, not "non-zero".
+ * own read, which is why it seemed to vary by model. Checked on a Clarett 2Pre: switching to an absent
+ * S/PDIF source and reading nothing for 2 s reads 2, then 0; polling every 30 ms instead shows the 2 on
+ * exactly one read, so it is not a window that expires on its own. Switching back to Internal reads 0
+ * until the lock arrives ~85 ms later, then 1: gaining lock does not set the latch. A lock indicator
+ * must test bit 0, not "non-zero".
  *
  * The rate queries differ the same way: 0x006002 returns the configured rate, while FCP_SYNC_RATE
  * (0x006005) returns the rate the clock is actually running at -- equal when locked, but 192000 on an
