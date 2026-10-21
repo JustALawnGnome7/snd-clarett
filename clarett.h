@@ -584,6 +584,7 @@ struct clarett {
 	/* Periodic GET_METER heartbeat. See FCP_GET_METER / clarett_meter_work(). */
 	struct delayed_work meter_work;
 	struct delayed_work follow_work;	/* hw_gain_follow, run on an event (clarett_schedule_follow) */
+	struct delayed_work resume_work;	/* system resume: re-attach after the host is awake */
 
 	/*
 	 * FCP hwdep level meter. fcp-server creates the "Level Meter" control(s) via
@@ -991,10 +992,14 @@ int clarett_create_pcm(struct clarett *c);
 int clarett_add_clock_control(struct clarett *c);
 void clarett_pcm_tick(struct clarett *c, u32 add_frames);
 void clarett_pcm_tx_refill(struct clarett *c);	/* servicer: refill TX if the app wrote since the tick */
+void clarett_pcm_suspend(struct clarett *c);	/* system sleep: tear the engine down, silence TX */
+void clarett_pcm_resume(struct clarett *c);	/* system sleep: re-send the Clock Source */
 
 /* midi.c */
 int clarett_create_midi(struct clarett *c);	/* register the DIN MIDI rawmidi (no-op if enable_midi off) */
 void clarett_midi_irq(struct clarett *c);	/* drain the RX FIFO from the ISR */
 void clarett_midi_stop(struct clarett *c);	/* cancel TX work before teardown (safe if no MIDI) */
+void clarett_midi_suspend(struct clarett *c);	/* system sleep: park the TX drain, keep the gates */
+void clarett_midi_resume(struct clarett *c);	/* system sleep: restart the TX drain if output is up */
 
 #endif /* CLARETT_H */

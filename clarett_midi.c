@@ -282,3 +282,20 @@ void clarett_midi_stop(struct clarett *c)
 	WRITE_ONCE(c->midi_in_up, false);
 	cancel_work_sync(&c->midi_tx_work);
 }
+
+/*
+ * System sleep. Unlike clarett_midi_stop() the trigger gates stay as the open substreams left them, so
+ * MIDI carries on after resume without a reopen: suspend only parks the TX drain (bytes still queued in
+ * the rawmidi buffer stay there), and resume restarts it.
+ */
+void clarett_midi_suspend(struct clarett *c)
+{
+	if (READ_ONCE(c->rmidi))
+		cancel_work_sync(&c->midi_tx_work);
+}
+
+void clarett_midi_resume(struct clarett *c)
+{
+	if (READ_ONCE(c->rmidi) && READ_ONCE(c->midi_out_up))
+		schedule_work(&c->midi_tx_work);
+}

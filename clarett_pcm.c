@@ -934,6 +934,39 @@ static int clarett_pcm_hw_free(struct snd_pcm_substream *ss)
 }
 
 /*
+ * System sleep. By the time the device suspends, the core has suspended every running stream (trigger
+ * SUSPEND), so nothing reports periods; stop the engine itself, which a stream otherwise keeps until it
+ * closes. The substreams stay attached, and the first re-prepare after resume finds the engine down and
+ * arms it, at a fresh clock. Silence the TX ring too: the re-armed engine reads it before the new
+ * servicer's first fill.
+ */
+void clarett_pcm_suspend(struct clarett *c)
+{
+	clarett_engine_stop(c);
+	mutex_lock(&c->pcm_lock);
+	if (c->stream_buf)
+		clarett_zero_tx(c);
+	mutex_unlock(&c->pcm_lock);
+}
+
+/*
+ * After resume, give the device the Clock Source again at the rate it last ran, as a control write
+ * does: a stream arm would send it anyway, but an idle card should not wait for one.
+ */
+void clarett_pcm_resume(struct clarett *c)
+{
+	u32 rate = READ_ONCE(c->cur_rate);
+	u8 clk[8];
+
+	if (!c->model->n_clock_srcs)
+		return;
+	clarett_put_le32(clk, rate ? rate : CLARETT_DEFAULT_RATE);
+	clarett_put_le32(clk + 4, clarett_clock_source(c));
+	if (clarett_fcp(c, FCP_SET_CLOCK, clk, sizeof(clk)))
+		dev_dbg(&c->pci->dev, "resume: SET_CLOCK failed\n");
+}
+
+/*
  * Stream-config handshake, run immediately before every engine arm: the device resets its stream config
  * when idle, so nothing established earlier survives to arm time. SET_CLOCK{rate, source}, then the sync
  * queries. The vendor also sends a per-channel 0x005000 burst here, but it only reads fixed port-name
@@ -1104,6 +1137,12 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			WRITE_ONCE(c->pcm_running, true);
 		}
 		return 0;
+	/*
+	 * System sleep: the core suspends a running stream before the device's own suspend callback,
+	 * which then tears the engine down (clarett_pcm_suspend()). There is no RESUME (the hardware
+	 * advertises none), so the app re-prepares after resume and that prepare arms the engine again.
+	 */
+	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_STOP:
 		if (play) {
 			WRITE_ONCE(c->play_running, false);

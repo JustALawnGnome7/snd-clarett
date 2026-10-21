@@ -251,6 +251,32 @@ On some hosts low-latency streaming glitches periodically because of a Thunderbo
 firmware SMI that stalls the whole machine for ~40-60 ms. That is a platform fault, not the driver;
 the servicer telemetry below shows it as `readmax`/`gapmax` in the tens of milliseconds.
 
+## System sleep
+
+Suspend to idle, suspend to RAM and hibernation are supported (`clarett_suspend()` /
+`clarett_resume()`). The unit has its own power supply and keeps its settings in flash, so only the
+host's side of the session is redone:
+
+- **Suspend** marks the card suspended (hwdep and control calls wait), stops the driver's work items,
+  flushes a pending settings save, parks the MIDI output drain, tears the stream engine down and
+  silences the playback ring, then masks the interrupts and drops the device's DMA registration and
+  bus mastering, as unload does. ALSA has already suspended any running stream by then.
+- **The device goes to D3hot**, left to the PCI core, and keeps its state there (No_Soft_Reset). The
+  driver must not save the PCI state itself: the core would then leave the device in D0, and with it
+  the parent bridge in the unit's Thunderbolt controller while the chain above powers down, which
+  froze a laptop behind a Thunderbolt dock on its way into suspend to idle.
+- **Resume** schedules the re-attach to run a second later, once the host is awake, rather than
+  touching a device whose Thunderbolt link is still coming back. The card stays suspended until it
+  finishes: the attach again (response address, acknowledgement wait) with the mailbox sequence at 0,
+  a fresh shadow seed, the monitor Mute/Dim enables, the Clock Source, and a notification that makes
+  `fcp-server` re-read every control in case the front panel moved meanwhile. A unit that is gone is
+  left for the hotplug removal.
+- **Streams are not resumed in place** (no `SNDRV_PCM_INFO_RESUME`): an app re-prepares after resume,
+  and the first prepare arms the engine again, as `aplay`, `arecord` and PipeWire all do.
+
+Tested on a Clarett 2Pre behind a Thunderbolt dock: suspend to idle and to RAM, idle and with a
+capture stream running across the sleep. The other models, and MIDI across a sleep, are untested.
+
 ## Kernel log and diagnostics
 
 A healthy load prints **one** line and then stays quiet, including while streaming:

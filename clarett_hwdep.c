@@ -502,20 +502,37 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 {
 	struct clarett *c = hw->private_data;
 	void __user *argp = (void __user *)arg;
+	int err;
 
-	switch (cmd) {
-	case FCP_IOCTL_PVERSION:
+	if (cmd == FCP_IOCTL_PVERSION)
 		return put_user(FCP_HWDEP_VERSION, (int __user *)argp);
-	case FCP_IOCTL_CMD:
-		return clarett_hwdep_cmd(c, argp);
-	case FCP_IOCTL_INIT:
-		return clarett_hwdep_init_cmd(c, argp);
-	case FCP_IOCTL_SET_METER_MAP:
-		return clarett_hwdep_set_meter_map(c, argp);
-	case FCP_IOCTL_SET_METER_LABELS:
-		return clarett_hwdep_set_meter_labels(c, argp);
+
+	/*
+	 * Everything else reaches the device, so wait out a system suspend the way control ioctls do
+	 * (the control core takes this reference itself; the hwdep core does not). Fails once the card
+	 * is being removed.
+	 */
+	err = snd_power_ref_and_wait(c->card);
+	if (err >= 0) {
+		switch (cmd) {
+		case FCP_IOCTL_CMD:
+			err = clarett_hwdep_cmd(c, argp);
+			break;
+		case FCP_IOCTL_INIT:
+			err = clarett_hwdep_init_cmd(c, argp);
+			break;
+		case FCP_IOCTL_SET_METER_MAP:
+			err = clarett_hwdep_set_meter_map(c, argp);
+			break;
+		case FCP_IOCTL_SET_METER_LABELS:
+			err = clarett_hwdep_set_meter_labels(c, argp);
+			break;
+		default:
+			err = -ENOIOCTLCMD;
+		}
 	}
-	return -ENOIOCTLCMD;
+	snd_power_unref(c->card);
+	return err;
 }
 
 /*** Notification relay ***/
