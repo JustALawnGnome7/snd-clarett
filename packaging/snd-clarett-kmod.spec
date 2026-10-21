@@ -40,7 +40,7 @@
 %global debug_package %{nil}
 
 Name:           %{kmod_name}-kmod
-Version:        0.2.0
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module
 
@@ -121,6 +121,9 @@ done
 %{?akmod_install}
 
 %changelog
+* Wed Oct 21 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.1-1
+- Support system sleep: suspend to idle, suspend to RAM and hibernation
+
 * Mon Oct 19 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.0-1
 - Add the Red 16Line, 4Pre and 8Pre; Red 8Line up to 192 kHz
 - Mailbox completes on the interrupt phase bits; device events relayed
