@@ -21,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.2.1
+Version:        0.2.2
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -84,6 +84,9 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %changelog
+* Fri Oct 23 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.2-1
+- Discard the stale MIDI input a unit returns after system sleep
+
 * Wed Oct 21 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.1-1
 - Support system sleep: suspend to idle, suspend to RAM and hibernation
 

@@ -40,7 +40,7 @@
 %global debug_package %{nil}
 
 Name:           %{kmod_name}-kmod
-Version:        0.2.1
+Version:        0.2.2
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module
 
@@ -121,6 +121,9 @@ done
 %{?akmod_install}
 
 %changelog
+* Fri Oct 23 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.2-1
+- Discard the stale MIDI input a unit returns after system sleep
+
 * Wed Oct 21 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.1-1
 - Support system sleep: suspend to idle, suspend to RAM and hibernation
 
