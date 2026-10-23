@@ -694,6 +694,12 @@ struct clarett {
 	struct snd_rawmidi_substream *midi_out;	/* TX substream (set at output open) */
 	bool midi_in_up;			/* input trigger gate: push RX bytes to ALSA */
 	bool midi_out_up;			/* output trigger gate: TX work may run */
+	/*
+	 * From system suspend until the resume re-attach has finished, RX is drained but not delivered:
+	 * after a sleep the unit's RX FIFO hands back stale bytes (old contents of its buffer, ~200 of
+	 * them in one burst, faster than the wire could carry), which must not reach the application.
+	 */
+	bool midi_rx_discard;
 	struct work_struct midi_tx_work;	/* drains rawmidi output -> REG_MIDI_DATA */
 	/*
 	 * Serialises the RX FIFO drain. clarett_midi_irq() runs from clarett_irq for EVERY MSI vector, and

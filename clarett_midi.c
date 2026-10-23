@@ -74,21 +74,14 @@ MODULE_PARM_DESC(enable_midi,
  * data. CLARETT_MIDI_RX_GUARD is a runaway bound in bytes for a stuck count, not a per-interrupt work
  * budget, and it sits above the measured FIFO depth so a legitimate backlog never hits it.
  */
-void clarett_midi_irq(struct clarett *c)
+/*
+ * Drain the RX FIFO, handing the bytes to ss, or discarding them when ss is NULL, and acknowledge the
+ * RX interrupt if anything was read. Caller holds midi_rx_lock.
+ */
+static void clarett_midi_drain(struct clarett *c, struct snd_rawmidi_substream *ss)
 {
-	struct snd_rawmidi_substream *ss;
-	bool deliver, got = false;
+	bool got = false;
 	int guard = CLARETT_MIDI_RX_GUARD;
-
-	/*
-	 * Serialise: this runs for every MSI vector, and while streaming the period vectors fire on other
-	 * CPUs concurrently with vec0 — two drainers of the one FIFO would interleave and reorder the
-	 * bytes (corrupting multi-byte messages). Hardirq-only, so plain spin_lock (local IRQs already off).
-	 */
-	spin_lock(&c->midi_rx_lock);
-
-	ss = READ_ONCE(c->midi_in);
-	deliver = ss && READ_ONCE(c->midi_in_up);
 
 	while (guard > 0) {
 		u32 v = clarett_rl(c, REG_MIDI_DATA);
@@ -103,12 +96,29 @@ void clarett_midi_irq(struct clarett *c)
 			bytes[i] = v >> (i * 8);
 		guard -= n;
 		got = true;
-		if (deliver)
+		if (ss)
 			snd_rawmidi_receive(ss, bytes, n);
 	}
 
 	if (got)
 		clarett_wl(c, REG_MIDI_ACK, MIDI_IRQ_ACK_VAL);
+}
+
+void clarett_midi_irq(struct clarett *c)
+{
+	struct snd_rawmidi_substream *ss;
+
+	/*
+	 * Serialise: this runs for every MSI vector, and while streaming the period vectors fire on other
+	 * CPUs concurrently with vec0 — two drainers of the one FIFO would interleave and reorder the
+	 * bytes (corrupting multi-byte messages). Also taken by clarett_midi_resume(), with IRQs off.
+	 */
+	spin_lock(&c->midi_rx_lock);
+
+	ss = READ_ONCE(c->midi_in);
+	if (!READ_ONCE(c->midi_in_up) || READ_ONCE(c->midi_rx_discard))
+		ss = NULL;
+	clarett_midi_drain(c, ss);
 
 	spin_unlock(&c->midi_rx_lock);
 }
@@ -287,15 +297,33 @@ void clarett_midi_stop(struct clarett *c)
  * System sleep. Unlike clarett_midi_stop() the trigger gates stay as the open substreams left them, so
  * MIDI carries on after resume without a reopen: suspend only parks the TX drain (bytes still queued in
  * the rawmidi buffer stay there), and resume restarts it.
+ *
+ * RX is muted across the sleep (midi_rx_discard). After a sleep the unit's RX FIFO reports old buffer
+ * contents as new: measured on an 8PreX with a cable from MIDI Out to In, a stream crossing s2idle got
+ * ~220 stale bytes injected in one burst within 2 ms of the wake, then carried on in order with nothing
+ * lost. So the ISR discards until the re-attach is done, and resume drains whatever is left before
+ * delivery starts again. Bytes sent to the unit while the host was asleep are lost either way.
  */
 void clarett_midi_suspend(struct clarett *c)
 {
-	if (READ_ONCE(c->rmidi))
-		cancel_work_sync(&c->midi_tx_work);
+	if (!READ_ONCE(c->rmidi))
+		return;
+	WRITE_ONCE(c->midi_rx_discard, true);
+	cancel_work_sync(&c->midi_tx_work);
 }
 
 void clarett_midi_resume(struct clarett *c)
 {
-	if (READ_ONCE(c->rmidi) && READ_ONCE(c->midi_out_up))
+	unsigned long flags;
+
+	if (!READ_ONCE(c->rmidi))
+		return;
+
+	spin_lock_irqsave(&c->midi_rx_lock, flags);
+	clarett_midi_drain(c, NULL);
+	WRITE_ONCE(c->midi_rx_discard, false);
+	spin_unlock_irqrestore(&c->midi_rx_lock, flags);
+
+	if (READ_ONCE(c->midi_out_up))
 		schedule_work(&c->midi_tx_work);
 }

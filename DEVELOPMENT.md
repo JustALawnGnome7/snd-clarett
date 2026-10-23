@@ -273,6 +273,20 @@ host's side of the session is redone:
   left for the hotplug removal.
 - **Streams are not resumed in place** (no `SNDRV_PCM_INFO_RESUME`): an app re-prepares after resume,
   and the first prepare arms the engine again, as `aplay`, `arecord` and PipeWire all do.
+- **MIDI input is muted from suspend until the re-attach has finished.** After a sleep the unit's
+  MIDI input FIFO reports old contents of its buffer as new: an 8PreX with its MIDI Out cabled to its
+  In, carrying a stream across suspend to idle, got about 220 stale bytes in one burst within 2 ms of
+  the wake (far faster than the wire could carry them), after which the stream went on in order. So
+  the interrupt handler drains the FIFO without delivering while `midi_rx_discard` is set, and
+  `clarett_midi_resume()` drains it once more before delivery and the output drain restart. With
+  that, the same stream crosses suspend to idle and suspend to RAM byte-exact. Bytes sent to the
+  unit while the host is asleep are lost either way.
+- **Known limitation: a unit daisy-chained behind a Red.** Every model, connected on its own, comes
+  back from suspend to idle and suspend to RAM in place. With a Clarett chained behind a Red 8Line,
+  the chain does not survive suspend to idle (the host's Thunderbolt driver reports the link lost
+  during suspend and finds the units again afterwards), and with this driver bound to the Red the
+  host has frozen on resume. Until that is resolved, disconnect a unit chained behind a Red before
+  suspending, or leave the host awake.
 
 Tested on a Clarett 2Pre behind a Thunderbolt dock: suspend to idle and to RAM, idle and with a
 capture stream running across the sleep. The other models, and MIDI across a sleep, are untested.
