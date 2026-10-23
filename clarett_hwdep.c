@@ -210,6 +210,10 @@ static int clarett_hwdep_meter_get(struct snd_kcontrol *kctl,
 	int i, err = 0, n = c->hwdep_n_meter_slots;
 
 	mutex_lock(&c->hwdep_lock);
+	if (c->hw_gone) {		/* the map and level buffers are devres, freed at remove */
+		mutex_unlock(&c->hwdep_lock);
+		return -ENODEV;
+	}
 	/*
 	 * Rate-limit the device poll: the mixer GUI reads this control at 30-60 Hz, and a GET_METER per read
 	 * floods the mailbox and disrupts streaming (audible skips + fcp-server command timeouts — control and
@@ -330,6 +334,10 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 		goto out_free;
 
 	mutex_lock(&c->hwdep_lock);
+	if (c->hw_gone) {		/* a devm allocation now would outlive the device's devres */
+		err = -ENODEV;
+		goto out_unlock;
+	}
 	if (!c->hwdep_meter_parts) {
 		int parts = DIV_ROUND_UP(map.map_size, CLARETT_METER_MAX_CHANNELS);
 		s16 *new_map = devm_kmalloc_array(&c->pci->dev, map.map_size,
@@ -465,6 +473,10 @@ static int clarett_hwdep_set_meter_labels(struct clarett *c, struct fcp_meter_la
 	}
 
 	mutex_lock(&c->hwdep_lock);
+	if (c->hw_gone) {		/* a devm allocation now would outlive the device's devres */
+		err = -ENODEV;
+		goto out;
+	}
 	if (!c->hwdep_meter_parts) {	/* map (hence the controls) must be set first */
 		err = -EINVAL;
 		goto out;

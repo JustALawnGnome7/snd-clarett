@@ -324,13 +324,19 @@ static void clarett_read_rx_live(struct clarett *c)
 		c->rx_live[0], c->rx_live[1], c->rx_live[2]);
 }
 
+/* After clarett_hw_teardown() the BAR mapping may be gone: writes are dropped and reads return all
+ * ones, as a removed device's do. */
 void clarett_wl(struct clarett *c, u32 off, u32 val)
 {
+	if (READ_ONCE(c->hw_gone))
+		return;
 	writel(val, c->bar0 + off);
 }
 
 u32 clarett_rl(struct clarett *c, u32 off)
 {
+	if (READ_ONCE(c->hw_gone))
+		return ~0u;
 	return readl(c->bar0 + off);
 }
 
@@ -877,11 +883,11 @@ void clarett_engine_stop(struct clarett *c)
 
 	if (svc)
 		kthread_stop(svc);			/* stop acking 0x300 before the engine is torn down */
-	writel(0, c->bar0 + STREAM_BLK0 + STREAM_OFF_CTRL);	/* disable ring 0 */
-	writel(0, c->bar0 + STREAM_BLK1 + STREAM_OFF_CTRL);	/* disable ring 1 */
-	writel(0, c->bar0 + REG_STREAM_IRQ_ARM);
-	writel(0, c->bar0 + REG_STREAM_IRQ_CFG);
-	readl(c->bar0 + STREAM_BLK0 + STREAM_OFF_CTRL);		/* flush posted writes */
+	clarett_wl(c, STREAM_BLK0 + STREAM_OFF_CTRL, 0);	/* disable ring 0 */
+	clarett_wl(c, STREAM_BLK1 + STREAM_OFF_CTRL, 0);	/* disable ring 1 */
+	clarett_wl(c, REG_STREAM_IRQ_ARM, 0);
+	clarett_wl(c, REG_STREAM_IRQ_CFG, 0);
+	clarett_rl(c, STREAM_BLK0 + STREAM_OFF_CTRL);		/* flush posted writes */
 }
 
 /*
@@ -1349,29 +1355,30 @@ static void clarett_teardown_irq(struct clarett *c)
 }
 
 /*
- * card->private_free: runs inside snd_card_free AFTER userspace is disconnected and the
- * last file handle has closed — after the final possible mailbox transaction — but before
- * c (card private data) is freed, and with the MSI completion path still hooked, so those
- * last transactions run the normal MSI-paced cycle rather than a 100 ms degraded wait.
- * Must tolerate a partially initialized card (probe error
- * paths reach here through the same snd_card_free).
+ * Everything that touches the device or its devres-managed resources (BAR mapping, response
+ * buffer, stream rings, MSI vectors), done while they still exist: from remove(), before it
+ * returns and devres frees them, or from clarett_card_free() on a probe error. Runs once.
+ *
+ * remove() cannot leave this to the card's last close. A unit removed during system resume
+ * (a Thunderbolt chain that did not survive the sleep) is removed while userspace is still
+ * frozen, so fcp-server and alsactl cannot close their handles until the resume completes;
+ * waiting for them in remove deadlocked the resume (a black screen on wake).
+ *
+ * Mailbox commands still run the normal MSI-paced cycle until the IRQs are freed, so a pending
+ * settings save is flushed first; on a device that is already gone it fails at once.
  */
-static void clarett_card_free(struct snd_card *card)
+static void clarett_hw_teardown(struct clarett *c)
 {
-	struct clarett *c = card->private_data;
-
+	if (c->hw_gone)
+		return;
 	WRITE_ONCE(c->ctl_ready, false);	/* stop the ISR queueing new notify work */
 	cancel_delayed_work_sync(&c->resume_work);
 	cancel_delayed_work_sync(&c->meter_work);
 	cancel_delayed_work_sync(&c->follow_work);
-	/* Flush a pending debounced persist so a change made within the last CLARETT_SAVE_DELAY_MS
-	 * still reaches NVRAM. Done here — after the meter worker is stopped (it shares the mailbox
-	 * resp_buf) but while the MSI completion path is still hooked — so the DATA_CMD completes
-	 * normally. cancel_delayed_work_sync returns true only if a save was actually queued. */
 	if (cancel_delayed_work_sync(&c->save_work))
 		clarett_data_cmd(c, FCP_ACTIVATE_PERSIST);
 	cancel_work_sync(&c->notify_work);
-	clarett_midi_stop(c);			/* cancel the MIDI TX drain before the rawmidi is freed */
+	clarett_midi_stop(c);			/* cancel the MIDI TX drain */
 	clarett_engine_stop(c);			/* halt streaming DMA before devres frees the ring */
 	if (c->bar0)
 		writel(0, c->bar0 + REG_IRQ0_ENABLE);	/* mask causes before freeing handlers */
@@ -1381,6 +1388,41 @@ static void clarett_card_free(struct snd_card *card)
 	 * (a straggler that already started runs its GET on the poll fallback — harmless). */
 	cancel_work_sync(&c->notify_work);
 	cancel_delayed_work_sync(&c->follow_work);	/* notify_work may have queued one */
+
+	/* Taking each lock waits out whoever holds it: an in-flight TX-ring write, mailbox command,
+	 * meter read or meter-map ioctl finishes, and every later one sees hw_gone. */
+	mutex_lock(&c->pcm_lock);
+	WRITE_ONCE(c->hw_gone, true);
+	mutex_unlock(&c->pcm_lock);
+	mutex_lock(&c->mbox_lock);
+	mutex_unlock(&c->mbox_lock);
+	mutex_lock(&c->hwdep_lock);
+	mutex_unlock(&c->hwdep_lock);
+
+	clarett_quiesce_dma(c->pci, c->bar0);
+}
+
+/*
+ * card->private_free: runs inside snd_card_free AFTER userspace is disconnected and the
+ * last file handle has closed, but before c (card private data) is freed. After a remove()
+ * that is any time later, and only software state is left: clarett_hw_teardown() has run.
+ * On a probe error it runs the teardown itself. Must tolerate a partially initialized card
+ * (probe error paths reach here through the same snd_card_free).
+ */
+static void clarett_card_free(struct snd_card *card)
+{
+	struct clarett *c = card->private_data;
+
+	clarett_hw_teardown(c);
+	/* A hwdep ioctl that was in flight at remove may have queued work since; the mailbox now
+	 * refuses it, but the items must not outlive c. */
+	WRITE_ONCE(c->ctl_ready, false);
+	cancel_delayed_work_sync(&c->resume_work);
+	cancel_delayed_work_sync(&c->meter_work);
+	cancel_delayed_work_sync(&c->save_work);	/* nothing to flush to: the device is gone */
+	cancel_work_sync(&c->notify_work);
+	cancel_delayed_work_sync(&c->follow_work);
+	clarett_midi_stop(c);
 	/* Last, because notify_work is what re-arms it: the debounced hwdep relay wake. c is freed
 	 * the moment this returns to snd_card_free, and a live timer into freed memory would panic
 	 * the host on a surprise removal (device powered off). */
@@ -1717,7 +1759,6 @@ static void clarett_remove(struct pci_dev *pci)
 {
 	struct snd_card *card = pci_get_drvdata(pci);
 	struct clarett *c = card->private_data;
-	void __iomem *bar0 = c->bar0;
 
 	/*
 	 * Stop the stream servicer FIRST, before any of the card teardown.
@@ -1737,20 +1778,18 @@ static void clarett_remove(struct pci_dev *pci)
 	cancel_delayed_work_sync(&c->follow_work);
 	clarett_engine_stop(c);
 
-	/* Blocks: disconnect → wait for the last userspace handle to close (the final
-	 * mailbox transactions run the normal MSI-paced cycle) → clarett_card_free()
-	 * teardown → frees c. Only then is the device quiesced. */
-	/* Disconnect first and kick the relay waiters: snd_card_free() waits for the last handle to
-	 * close, and fcp-server parked in read()/poll() on hwdep_notify_wait would never be woken by
-	 * the disconnect alone — the wait re-checks card->shutdown, which snd_card_disconnect sets. */
+	/* Disconnect first and kick the relay waiters: fcp-server parked in read()/poll() on
+	 * hwdep_notify_wait would never be woken by the disconnect alone — the wait re-checks
+	 * card->shutdown, which snd_card_disconnect sets. New file operations now fail. */
 	snd_card_disconnect(card);
 	wake_up_interruptible(&c->hwdep_notify_wait);
-	snd_card_free(card);
-	/* Devres releases in REVERSE order after remove returns: the response buffer is
-	 * freed (and IOMMU-unmapped) BEFORE pcim's disable clears bus master — so without
-	 * an explicit quiesce the device holds a live registration to freed memory. */
-	clarett_quiesce_dma(pci, bar0);
-	/* BAR mapping, DMA buffer and device enable are devres-managed */
+	/* Tear the hardware side down now, while the BAR mapping, the buffers and the vectors still
+	 * exist: devres frees them as soon as this returns (in REVERSE order, the response buffer
+	 * before pcim's disable clears bus master, hence the quiesce in there). */
+	clarett_hw_teardown(c);
+	/* Do NOT wait for the last handle to close (snd_card_free would): see clarett_hw_teardown().
+	 * The card and c are freed whenever userspace lets go. */
+	snd_card_free_when_closed(card);
 }
 
 /* remove() never runs on reboot/kexec; without this the device enters the next kernel

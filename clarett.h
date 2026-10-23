@@ -530,6 +530,11 @@ struct clarett {
 	 * bits. Without it, clarett_fcp polls (the fallback cycle). */
 	bool irq_ready;
 	bool ctl_ready;				/* controls registered; notify path may snd_ctl_notify */
+	/* Set once by clarett_hw_teardown(): the device is torn down, and the BAR mapping, the response
+	 * buffer and the stream rings (all devres-managed) are freed as soon as remove() returns, while
+	 * userspace may still hold the card open. Every register access, mailbox command, meter read and
+	 * TX-ring write checks it. Written under pcm_lock, mbox_lock and hwdep_lock in turn. */
+	bool hw_gone;
 	int n_vec;				/* MSI vectors actually allocated (<= CLARETT_NUM_VECTORS) */
 	struct clarett_irqctx irq_ctx[CLARETT_NUM_VECTORS];
 	struct work_struct notify_work;

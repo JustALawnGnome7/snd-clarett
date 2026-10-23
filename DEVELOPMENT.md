@@ -246,6 +246,16 @@ without it, so the driver does not send it. Credit: Geoffrey D. Bennett establis
   router.
 - Surprise removal is handled: the servicer and meter poll stop before the card is disconnected, a
   dead link (all-ones reads) ends the servicer, and the mailbox fails fast on a disconnected device.
+- **Removal does not wait for userspace.** `clarett_remove()` disconnects the card, tears the hardware
+  side down at once (`clarett_hw_teardown()`: settings flush, engine stop, interrupt mask, MSI vectors,
+  DMA quiesce) and frees the card with `snd_card_free_when_closed()`, so the rest happens whenever the
+  last program closes it. Blocking there deadlocked system resume: a Thunderbolt chain that does not
+  survive a sleep is hot-removed while userspace is still frozen, so `fcp-server` and `alsactl` could
+  not close their handles until the resume finished. After the teardown `hw_gone` is set and every
+  register access, mailbox command, meter read and playback-ring write is refused, because the BAR
+  mapping, the response buffer and the stream rings are devres-managed and go when remove returns.
+  For the same reason the ALSA PCM buffers are vmalloc rather than device DMA memory (the device never
+  DMAs them; the driver copies to and from its own rings): they are freed after the device is gone.
 
 On some hosts low-latency streaming glitches periodically because of a Thunderbolt-triggered
 firmware SMI that stalls the whole machine for ~40-60 ms. That is a platform fault, not the driver;
@@ -281,15 +291,16 @@ host's side of the session is redone:
   `clarett_midi_resume()` drains it once more before delivery and the output drain restart. With
   that, the same stream crosses suspend to idle and suspend to RAM byte-exact. Bytes sent to the
   unit while the host is asleep are lost either way.
-- **Known limitation: a unit daisy-chained behind a Red.** Every model, connected on its own, comes
-  back from suspend to idle and suspend to RAM in place. With a Clarett chained behind a Red 8Line,
-  the chain does not survive suspend to idle (the host's Thunderbolt driver reports the link lost
-  during suspend and finds the units again afterwards), and with this driver bound to the Red the
-  host has frozen on resume. Until that is resolved, disconnect a unit chained behind a Red before
-  suspending, or leave the host awake.
+- **A chain that does not survive the sleep is removed and found again.** With a Clarett chained
+  behind a Red 8Line, the host's Thunderbolt driver reports the link to the Red lost during suspend,
+  removes both units while resuming and finds them again about 20 seconds later; the driver probes
+  them afresh (this used to freeze the host on resume, see the removal note above). **Known
+  limitation:** the unit behind the Red is found again but its PCIe link does not come up until it is
+  power-cycled. That happens below the driver, the same with no driver bound.
 
-Tested on a Clarett 2Pre behind a Thunderbolt dock: suspend to idle and to RAM, idle and with a
-capture stream running across the sleep. The other models, and MIDI across a sleep, are untested.
+Tested on every model alone behind a Thunderbolt dock (suspend to idle and to RAM), with a capture
+stream running across the sleep on a 2Pre and a Red 8Line, MIDI across a sleep on an 8PreX, and a
+Clarett 8PreX chained behind a Red 8Line, both bound with `fcp-server` and `alsactl` holding the cards.
 
 ## Kernel log and diagnostics
 

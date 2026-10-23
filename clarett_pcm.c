@@ -907,7 +907,8 @@ static void clarett_pcm_detach(struct clarett *c, struct snd_pcm_substream *ss)
 	if (play) {
 		c->pcm_play_sub = NULL;
 		WRITE_ONCE(c->play_running, false);
-		clarett_zero_tx(c);
+		if (!c->hw_gone)	/* after removal the ring (devres) may be freed */
+			clarett_zero_tx(c);
 	} else {
 		c->pcm_sub = NULL;
 		WRITE_ONCE(c->pcm_running, false);
@@ -1269,11 +1270,13 @@ int clarett_create_pcm(struct clarett *c)
 
 	/* Each direction caps its own buffer at its ring in open() (and may pick any power-of-two fraction
 	 * of it); preallocate the larger so the widest case fits. The ALSA buffers are plain memory we
-	 * memcpy to/from the hardware rings (not DMA'd directly). */
+	 * memcpy to/from the hardware rings (not DMA'd directly), so they are vmalloc, not tied to the
+	 * device: after a removal the card is freed only when userspace closes it, by which time the
+	 * PCI device is gone, and freeing device DMA memory then faults. */
 	rxbuf = clarett_rx_ring_bytes(c);
 	txbuf = clarett_tx_ring_bytes(c);
 	prealloc = max(rxbuf, txbuf);
-	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &c->pci->dev, prealloc, prealloc);
+	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, prealloc, prealloc);
 
 	/* Debug: the probe summary in clarett_probe() already states that a PCM registered and how wide
 	 * it is; this adds the ring/buffer detail. */

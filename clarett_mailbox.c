@@ -248,6 +248,10 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		return -ENODEV;
 
 	mutex_lock(&c->mbox_lock);
+	if (c->hw_gone) {		/* torn down: resp_buf and the BAR may already be freed */
+		mutex_unlock(&c->mbox_lock);
+		return -ENODEV;
+	}
 
 	retire_failed = clarett_retire_lost(c);
 
