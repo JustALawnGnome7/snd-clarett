@@ -183,6 +183,7 @@ static void clarett_resp_tail_wait(struct clarett *c)
 	ktime_t until = ktime_add_us(ktime_get(), CLARETT_RESP_TAIL_US);
 	size_t size, end, from, i;
 
+	/* the header has landed: read its size field after it */
 	dma_rmb();
 	size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 	if (!size)
@@ -194,6 +195,7 @@ static void clarett_resp_tail_wait(struct clarett *c)
 	from = max_t(size_t, end >= 4 ? end - 4 : 0, FCP_RESP_DATA_OFF);
 
 	for (;;) {
+		/* re-read the tail as the device's DMA fills it */
 		dma_rmb();
 		for (i = from; i < end; i++)
 			if (r[i] != CLARETT_RESP_POISON)
@@ -233,6 +235,7 @@ static bool clarett_retire_lost(struct clarett *c)
 	deadline = jiffies +
 		   msecs_to_jiffies(max(clarett_resp_ms(c, c->lost_echo), 1u));
 	for (;;) {
+		/* re-read the late response's header as it lands */
 		dma_rmb();
 		echo = clarett_get_le32(r + FCP_RESP_ECHO_OFF);
 		if (echo == c->lost_echo &&
@@ -286,6 +289,7 @@ static void clarett_mbox_submit(struct clarett *c, struct clarett_fcp_txn *t,
 	 */
 	memset((u8 *)c->resp_buf + FCP_RESP_DATA_OFF, CLARETT_RESP_POISON,
 	       c->resp_size - FCP_RESP_DATA_OFF);
+	/* both in memory before the doorbell lets the device overwrite them */
 	dma_wmb();
 
 	clarett_wl(c, REG_MBOX + MBOX_CMD, CMD_EXEC_FLAG | t->opcode);
@@ -347,6 +351,7 @@ static void clarett_mbox_wait_phase(struct clarett *c,
 						 &t->land_us);
 	if (t->resp_echo) {
 		clarett_resp_tail_wait(c);
+		/* read the status word only after the response has landed */
 		dma_rmb();
 		t->fcp_status = clarett_resp_status(c);
 		clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
@@ -486,6 +491,7 @@ static void clarett_mbox_copy_out(struct clarett *c,
 	const u8 *r = c->resp_buf;
 	u16 have;
 
+	/* read the size and payload only after the response has landed */
 	dma_rmb();
 	have = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 	/*
@@ -583,6 +589,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 	} else {
 		u16 rseq;
 
+		/* read the echoed seq only after the response has landed */
 		dma_rmb();
 		rseq = ((const u8 *)c->resp_buf)[FCP_RESP_SEQ_OFF] |
 		       ((const u8 *)c->resp_buf)[FCP_RESP_SEQ_OFF + 1] << 8;
