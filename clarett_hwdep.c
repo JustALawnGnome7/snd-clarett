@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Focusrite Clarett/Red (Thunderbolt) ALSA driver — FCP hwdep, the transport seam for
- * Geoffrey Bennett's user-space `fcp-server`.
+ * Focusrite Clarett/Red (Thunderbolt) ALSA driver — FCP hwdep, the transport
+ * seam for Geoffrey Bennett's user-space `fcp-server`.
  *
- * Presents the same hwdep ABI as the mainline USB FCP driver (sound/usb/fcp.c), so the unmodified
- * fcp-server can drive this Thunderbolt device: the kernel is a thin transport (relay FCP commands
- * to the mailbox, expose the level meter) and userspace implements the mixer/routing/metering.
- * The FCP wire packet is our mailbox packet exactly (opcode/size/seq/error/pad/data) and the FCP
- * opcodes are our opcodes, so FCP_IOCTL_CMD maps straight onto clarett_fcp_cmd().
+ * Presents the same hwdep ABI as the mainline USB FCP driver (sound/usb/fcp.c),
+ * so the unmodified fcp-server can drive this Thunderbolt device: the kernel is
+ * a thin transport (relay FCP commands to the mailbox, expose the level meter)
+ * and userspace implements the mixer/routing/metering. The FCP wire packet is
+ * our mailbox packet exactly (opcode/size/seq/error/pad/data) and the FCP
+ * opcodes are our opcodes, so FCP_IOCTL_CMD maps straight onto
+ * clarett_fcp_cmd().
  *
- * This is the driver's only control surface. The device is still armed in-kernel at probe
- * (the device self-arms from flash); this just hands the mailbox to userspace.
+ * This is the driver's only control surface. The device is still armed
+ * in-kernel at probe (the device self-arms from flash); this just hands the
+ * mailbox to userspace.
  *
- * STATUS: complete ABI — PVERSION + CMD + INIT + SET_METER_MAP/LABELS + the notification
- * read/poll relay. fcp-server can drive this device end-to-end (bench-testing pending).
+ * STATUS: complete ABI — PVERSION + CMD + INIT + SET_METER_MAP/LABELS + the
+ * notification read/poll relay. fcp-server can drive this device end-to-end
+ * (bench-testing pending).
  */
 #include <linux/module.h>
 #include <linux/uaccess.h>
@@ -35,10 +39,14 @@ static int clarett_hwdep_open(struct snd_hwdep *hw, struct file *file)
 	return 0;
 }
 
-/* FCP_IOCTL_CMD: relay one FCP command to the mailbox and return its response payload. */
+/*
+ * FCP_IOCTL_CMD: relay one FCP command to the mailbox and return its response
+ * payload.
+ */
 static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 {
-	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;	/* response payload space in resp_buf */
+	/* response payload space in resp_buf */
+	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
 	struct fcp_cmd cmd;
 	void *data = NULL;
 	int buf_size, err = 0;
@@ -48,12 +56,18 @@ static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 	if (cmd.req_size > CLARETT_MBOX_DATA_MAX || cmd.resp_size > resp_cap)
 		return -EINVAL;
 
-	/* TODO: validate opcode (fcp.c refuses flash erase/write of the golden firmware segment). */
+	/*
+	 * TODO: validate opcode (fcp.c refuses flash erase/write of the golden
+	 * firmware segment).
+	 */
 
 	buf_size = max(cmd.req_size, cmd.resp_size);
 	if (buf_size) {
-		/* Zeroed: the reply may be shorter than resp_size, and uninitialised kernel memory
-		 * must never reach userspace through the gap. */
+		/*
+		 * Zeroed: the reply may be shorter than resp_size, and
+		 * uninitialised kernel memory must never reach userspace
+		 * through the gap.
+		 */
 		data = kzalloc(buf_size, GFP_KERNEL);
 		if (!data)
 			return -ENOMEM;
@@ -63,31 +77,44 @@ static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 		goto out;
 	}
 
-	err = clarett_fcp_cmd(c, cmd.opcode, data, cmd.req_size, data, cmd.resp_size);
+	err = clarett_fcp_cmd(c, cmd.opcode, data, cmd.req_size, data,
+			      cmd.resp_size);
 	if (err)
 		goto out;
 
-	/* Meter-source follow: fcp-server's Meter Source enum writes only the selector byte @184, but
-	 * the front-panel meter bridge is routed by the per-source tables @136/146/156. When we see that
-	 * write go by, write the selected source's tables so the meters actually switch banks. The SET_DATA
-	 * payload is {u32 offset, u32 len, value...}; a selector write is offset 184, len 1. */
+	/*
+	 * Meter-source follow: fcp-server's Meter Source enum writes only the
+	 * selector byte @184, but the front-panel meter bridge is routed by the
+	 * per-source tables @136/146/156. When we see that write go by, write
+	 * the selected source's tables so the meters actually switch banks. The
+	 * SET_DATA payload is {u32 offset, u32 len, value...}; a selector write
+	 * is offset 184, len 1.
+	 */
 	if (cmd.opcode == FCP_SET_DATA && cmd.req_size >= 9 &&
 	    clarett_get_le32(data) == METER_SOURCE_OFFSET &&
 	    clarett_get_le32((const u8 *)data + 4) == 1)
 		clarett_meter_source_follow(c, ((const u8 *)data)[8]);
 
-	/* Persist fcp-server's config changes to flash. A control change arrives as SET_DATA (stage the
-	 * bytes) + DATA_CMD{activate} (commit live). The device auto-persists only some of its config
-	 * (routing survives a power cycle) and not the rest (output gains, S/PDIF input source revert to
-	 * the flash default), and this relay does not otherwise flush flash — so schedule the driver's
-	 * debounced NVRAM save on the commit, mirroring the in-kernel write path. The DATA_CMD is that
-	 * commit step; skip the persist opcode itself so a relayed save can't reschedule endlessly. */
+	/*
+	 * Persist fcp-server's config changes to flash. A control change
+	 * arrives as SET_DATA (stage the bytes) + DATA_CMD{activate} (commit
+	 * live). The device auto-persists only some of its config (routing
+	 * survives a power cycle) and not the rest (output gains, S/PDIF input
+	 * source revert to the flash default), and this relay does not
+	 * otherwise flush flash — so schedule the driver's debounced NVRAM
+	 * save on the commit, mirroring the in-kernel write path. The DATA_CMD
+	 * is that commit step; skip the persist opcode itself so a relayed save
+	 * can't reschedule endlessly.
+	 */
 	if (cmd.opcode == FCP_DATA_CMD && cmd.req_size >= 4 &&
 	    clarett_get_le32(data) != FCP_ACTIVATE_PERSIST)
 		clarett_schedule_persist(c);
 
-	/* A committed SW/HW switch: the device raises no event for it, so bring the newly HW-controlled
-	 * output's stored SW gain to the knob now (clarett_hw_gain_follow). */
+	/*
+	 * A committed SW/HW switch: the device raises no event for it, so bring
+	 * the newly HW-controlled output's stored SW gain to the knob now
+	 * (clarett_hw_gain_follow).
+	 */
 	if (cmd.opcode == FCP_DATA_CMD && cmd.req_size >= 4 &&
 	    clarett_get_le32(data) == HWEN_ACTIVATE)
 		clarett_schedule_follow(c);
@@ -100,26 +127,31 @@ out:
 }
 
 /*
- * FCP_IOCTL_INIT: the protocol-start handshake. fcp-server calls this once, requires it to
- * succeed, and reads the firmware version from step2[8]; it ignores step0's content.
+ * FCP_IOCTL_INIT: the protocol-start handshake. fcp-server calls this once,
+ * requires it to succeed, and reads the firmware version from step2[8]; it
+ * ignores step0's content.
  *
- * The USB reference (fcp.c fcp_init) does: a STEP0 USB class request -> INIT_1 -> INIT_2, and
- * resets seq to 0. Two adaptations for this Thunderbolt device:
+ * The USB reference (fcp.c fcp_init) does: a STEP0 USB class request -> INIT_1
+ * -> INIT_2, and resets seq to 0. Two adaptations for this Thunderbolt device:
  *
- *  - STEP0 has no mailbox equivalent. On USB it is a vendor class request (FCP_USB_REQ_STEP0),
- *    not an FCP opcode; the device-info it returns (serial, firmware ids) the driver reads at
- *    probe instead (the serial from flash, the versions from the appspace). We return
- *    step0 zeroed; fcp-server only inspects step2, so this is honest, not a fabricated layout.
+ *  - STEP0 has no mailbox equivalent. On USB it is a vendor class request
+ *    (FCP_USB_REQ_STEP0), not an FCP opcode; the device-info it returns
+ *    (serial, firmware ids) the driver reads at probe instead (the serial from
+ *    flash, the versions from the appspace). We return step0 zeroed; fcp-server
+ *    only inspects step2, so this is honest, not a fabricated layout.
  *
- *  - We do NOT reset c->seq. fcp.c can zero it because fcp-server is the device's only mailbox
- *    user; here the in-kernel GET_METER heartbeat shares c->seq, so a reset would race it. The
- *    device only echoes seq (it does not require a 0 start), and fcp-server never inspects seq,
- *    so continuing the monotonic counter is correct and race-free.
+ *  - We do NOT reset c->seq. fcp.c can zero it because fcp-server is the
+ *    device's only mailbox user; here the in-kernel GET_METER heartbeat shares
+ *    c->seq, so a reset would race it. The device only echoes seq (it does not
+ *    require a 0 start), and fcp-server never inspects seq, so continuing the
+ *    monotonic counter is correct and race-free.
  *
- * INIT_1/INIT_2 are safe to issue on a device whose session is already running (fcp.c's
- * fcp_reinit does the same); INIT_1 may report a nonzero FCP status there while still working.
+ * INIT_1/INIT_2 are safe to issue on a device whose session is already running
+ * (fcp.c's fcp_reinit does the same); INIT_1 may report a nonzero FCP status
+ * there while still working.
  */
-static int clarett_hwdep_init_cmd(struct clarett *c, struct fcp_init __user *arg)
+static int clarett_hwdep_init_cmd(struct clarett *c,
+				  struct fcp_init __user *arg)
 {
 	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
 	struct fcp_init init;
@@ -129,14 +161,17 @@ static int clarett_hwdep_init_cmd(struct clarett *c, struct fcp_init __user *arg
 	if (copy_from_user(&init, arg, sizeof(init)))
 		return -EFAULT;
 
-	/* Match fcp.c's bounds: each step response is a single byte-counted block. */
+	/*
+	 * Match fcp.c's bounds: each step response is a single byte-counted
+	 * block.
+	 */
 	if (init.step0_resp_size < 1 || init.step0_resp_size > 255 ||
 	    init.step2_resp_size < 1 || init.step2_resp_size > 255 ||
 	    init.step2_resp_size > resp_cap)
 		return -EINVAL;
 
 	buf_size = init.step0_resp_size + init.step2_resp_size;
-	resp = kzalloc(buf_size, GFP_KERNEL);	/* step0 stays zero (see above) */
+	resp = kzalloc(buf_size, GFP_KERNEL); /* step0 stays zero (see above) */
 	if (!resp)
 		return -ENOMEM;
 
@@ -145,9 +180,13 @@ static int clarett_hwdep_init_cmd(struct clarett *c, struct fcp_init __user *arg
 	if (err)
 		goto out;
 
-	/* INIT_2: returns the firmware-info block; fcp-server reads fw version at step2[8]. */
+	/*
+	 * INIT_2: returns the firmware-info block; fcp-server reads fw version
+	 * at step2[8].
+	 */
 	err = clarett_fcp_cmd(c, init.init2_opcode, NULL, 0,
-			      resp + init.step0_resp_size, init.step2_resp_size);
+			      resp + init.step0_resp_size,
+			      init.step2_resp_size);
 	if (err)
 		goto out;
 
@@ -161,22 +200,27 @@ out:
 /*** Level Meter (FCP_IOCTL_SET_METER_MAP / _LABELS) ***/
 
 /*
- * fcp-server owns metering on this path: it reads the device's raw meter count, chooses a
- * channel->slot map, and installs both here. The "Level Meter" control is created on the first
- * SET_METER_MAP; its .get polls GET_METER (the same {pad,num_meters,magic=1} request the in-kernel
- * heartbeat uses) and projects the raw levels through the map. SET_METER_LABELS attaches an
- * FCP_CHANNEL_LABELS TLV naming each channel. Mirrors sound/usb/fcp.c's meter control.
+ * fcp-server owns metering on this path: it reads the device's raw meter count,
+ * chooses a channel->slot map, and installs both here. The "Level Meter"
+ * control is created on the first SET_METER_MAP; its .get polls GET_METER (the
+ * same {pad,num_meters,magic=1} request the in-kernel heartbeat uses) and
+ * projects the raw levels through the map. SET_METER_LABELS attaches an
+ * FCP_CHANNEL_LABELS TLV naming each channel. Mirrors sound/usb/fcp.c's meter
+ * control.
  *
- * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT. The reply is 48 u32 words, one per slot, and
- * each word carries the same 16-bit level (0..4095) in both halves — e.g. 0x020a020a = 522. Read
- * only the low half: the whole word is ~8000x full scale. num_meters is assumed to count slots 1:1.
+ * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT. The reply is 48 u32 words,
+ * one per slot, and each word carries the same 16-bit level (0..4095) in both
+ * halves — e.g. 0x020a020a = 522. Read only the low half: the whole word is
+ * ~8000x full scale. num_meters is assumed to count slots 1:1.
  *
- * MORE THAN 128 CHANNELS. An INTEGER control holds at most CLARETT_METER_MAX_CHANNELS values, and a
- * Red has more metered destinations than that, so a wider map is split into several controls named
- * "Level Meter" with ALSA index 0, 1, ...: part p carries channels [p * 128, p * 128 + 128). Each part
- * gets its own slice of the labels, so a client that only reads index 0 still sees the first 128
- * channels correctly labelled. All parts share one GET_METER cache, so a second part costs no extra
- * device traffic. kctl->private_value holds the part number.
+ * MORE THAN 128 CHANNELS. An INTEGER control holds at most
+ * CLARETT_METER_MAX_CHANNELS values, and a Red has more metered destinations
+ * than that, so a wider map is split into several controls named "Level Meter"
+ * with ALSA index 0, 1, ...: part p carries channels [p * 128, p * 128 + 128).
+ * Each part gets its own slice of the labels, so a client that only reads index
+ * 0 still sees the first 128 channels correctly labelled. All parts share one
+ * GET_METER cache, so a second part costs no extra device traffic.
+ * kctl->private_value holds the part number.
  */
 static int clarett_hwdep_meter_part_first(int part)
 {
@@ -185,7 +229,8 @@ static int clarett_hwdep_meter_part_first(int part)
 
 static int clarett_hwdep_meter_part_count(const struct clarett *c, int part)
 {
-	return min(c->hwdep_meter_channels - clarett_hwdep_meter_part_first(part),
+	return min(c->hwdep_meter_channels -
+		   clarett_hwdep_meter_part_first(part),
 		   CLARETT_METER_MAX_CHANNELS);
 }
 
@@ -210,34 +255,46 @@ static int clarett_hwdep_meter_get(struct snd_kcontrol *kctl,
 	int i, err = 0, n = c->hwdep_n_meter_slots;
 
 	mutex_lock(&c->hwdep_lock);
-	if (c->hw_gone) {		/* the map and level buffers are devres, freed at remove */
+	/* the map and level buffers are devres, freed at remove */
+	if (c->hw_gone) {
 		mutex_unlock(&c->hwdep_lock);
 		return -ENODEV;
 	}
 	/*
-	 * Rate-limit the device poll: the mixer GUI reads this control at 30-60 Hz, and a GET_METER per read
-	 * floods the mailbox and disrupts streaming (audible skips + fcp-server command timeouts — control and
-	 * stream contend on this Thunderbolt device). Poll at most every CLARETT_METER_CACHE_MS and serve the
-	 * cached hwdep_meter_levels between polls; the meter stays live at ~30 Hz with a fraction of the traffic.
+	 * Rate-limit the device poll: the mixer GUI reads this control at 30-60
+	 * Hz, and a GET_METER per read floods the mailbox and disrupts
+	 * streaming (audible skips + fcp-server command timeouts — control
+	 * and stream contend on this Thunderbolt device). Poll at most every
+	 * CLARETT_METER_CACHE_MS and serve the cached hwdep_meter_levels
+	 * between polls; the meter stays live at ~30 Hz with a fraction of the
+	 * traffic.
 	 */
 	if (!c->hwdep_meter_polled ||
-	    time_after(jiffies, c->hwdep_meter_polled + msecs_to_jiffies(CLARETT_METER_CACHE_MS))) {
-		u8 req[8];		/* {pad:u16=0, num_meters:u16, magic:u32=1} */
+	    time_after(jiffies, c->hwdep_meter_polled +
+		       msecs_to_jiffies(CLARETT_METER_CACHE_MS))) {
+		u8 req[8];	/* {pad:u16=0, num_meters:u16, magic:u32=1} */
 
 		clarett_put_le16(req, 0);
 		clarett_put_le16(req + 2, n);
 		clarett_put_le32(req + 4, 1);
 		err = clarett_fcp_cmd(c, FCP_GET_METER, req, sizeof(req),
-				      (u8 *)c->hwdep_meter_levels, n * sizeof(__le32));
+				      (u8 *)c->hwdep_meter_levels,
+				      n * sizeof(__le32));
 		if (!err)
-			c->hwdep_meter_polled = jiffies ? jiffies : 1;	/* 0 means "never" */
+			/* 0 means "never" */
+			c->hwdep_meter_polled = jiffies ? jiffies : 1;
 	}
 	if (!err) {
-		for (i = 0; i < clarett_hwdep_meter_part_count(c, kctl->private_value); i++) {
-			int idx = c->hwdep_meter_map[first + i];
-			u32 v = idx < 0 ? 0 : (le32_to_cpu(c->hwdep_meter_levels[idx]) & 0xffff);
+		int count = clarett_hwdep_meter_part_count(c,
+							   kctl->private_value);
 
-			uc->value.integer.value[i] = min(v, (u32)CLARETT_METER_MAX);
+		for (i = 0; i < count; i++) {
+			int idx = c->hwdep_meter_map[first + i];
+			u32 v = idx < 0 ? 0 :
+				le32_to_cpu(c->hwdep_meter_levels[idx]);
+
+			uc->value.integer.value[i] =
+				min(v & 0xffff, (u32)CLARETT_METER_MAX);
 		}
 	}
 	mutex_unlock(&c->hwdep_lock);
@@ -287,8 +344,12 @@ static int clarett_hwdep_validate_map(const s16 *map, int map_size, int slots)
 	return 0;
 }
 
-/* FCP_IOCTL_SET_METER_MAP: install the channel->slot map, creating the controls on first call. */
-static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map __user *arg)
+/*
+ * FCP_IOCTL_SET_METER_MAP: install the channel->slot map, creating the controls
+ * on first call.
+ */
+static int clarett_hwdep_set_meter_map(struct clarett *c,
+				       struct fcp_meter_map __user *arg)
 {
 	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
 	struct fcp_meter_map map;
@@ -298,28 +359,33 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 	if (copy_from_user(&map, arg, sizeof(map)))
 		return -EFAULT;
 
-	/* Geometry is frozen once the controls exist (fcp.c does the same: an ALSA control's channel
-	 * count cannot change live). A map that changed size — e.g. after editing fcp-server-data — is
-	 * rejected until the controls are recreated, which means a driver reload. Say so: the bare EINVAL
-	 * surfaces in fcp-server only as "Cannot set meter map: Invalid argument". */
+	/*
+	 * Geometry is frozen once the controls exist (fcp.c does the same: an
+	 * ALSA control's channel count cannot change live). A map that changed
+	 * size — e.g. after editing fcp-server-data — is rejected until the
+	 * controls are recreated, which means a driver reload. Say so: the bare
+	 * EINVAL surfaces in fcp-server only as "Cannot set meter map: Invalid
+	 * argument".
+	 */
 	if (c->hwdep_meter_parts &&
 	    (map.map_size != c->hwdep_meter_channels ||
 	     map.meter_slots != c->hwdep_n_meter_slots)) {
 		dev_warn(&c->pci->dev,
-			 "meter map geometry changed (%u->%u channels, %u->%u slots) but the Level Meter "
-			 "control already exists; reload the module to apply the new map\n",
+			 "meter map geometry changed (%u->%u channels, %u->%u slots) but the Level Meter control already exists; reload the module to apply the new map\n",
 			 c->hwdep_meter_channels, map.map_size,
 			 c->hwdep_n_meter_slots, map.meter_slots);
 		return -EINVAL;
 	}
 	/*
-	 * map_size is the total channel count across the Level Meter parts; each part is an INTEGER control
-	 * holding at most CLARETT_METER_MAX_CHANNELS values. meter_slots only sizes the GET_METER read,
-	 * which lands in resp_buf, so it may exceed that.
+	 * map_size is the total channel count across the Level Meter parts;
+	 * each part is an INTEGER control holding at most
+	 * CLARETT_METER_MAX_CHANNELS values. meter_slots only sizes the
+	 * GET_METER read, which lands in resp_buf, so it may exceed that.
 	 */
 	if (map.map_size < 1 || map.map_size > CLARETT_METER_MAX_MAP ||
 	    map.meter_slots < 1 || map.meter_slots > 255 ||
-	    map.meter_slots * sizeof(__le32) > resp_cap)	/* GET_METER response must fit resp_buf */
+	    /* GET_METER response must fit resp_buf */
+	    map.meter_slots * sizeof(__le32) > resp_cap)
 		return -EINVAL;
 
 	tmp = kmalloc_array(map.map_size, sizeof(s16), GFP_KERNEL);
@@ -334,15 +400,18 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 		goto out_free;
 
 	mutex_lock(&c->hwdep_lock);
-	if (c->hw_gone) {		/* a devm allocation now would outlive the device's devres */
+	/* a devm allocation now would outlive the device's devres */
+	if (c->hw_gone) {
 		err = -ENODEV;
 		goto out_unlock;
 	}
 	if (!c->hwdep_meter_parts) {
-		int parts = DIV_ROUND_UP(map.map_size, CLARETT_METER_MAX_CHANNELS);
+		int parts = DIV_ROUND_UP(map.map_size,
+					 CLARETT_METER_MAX_CHANNELS);
 		s16 *new_map = devm_kmalloc_array(&c->pci->dev, map.map_size,
 						  sizeof(s16), GFP_KERNEL);
-		__le32 *levels = devm_kmalloc_array(&c->pci->dev, map.meter_slots,
+		__le32 *levels = devm_kmalloc_array(&c->pci->dev,
+						    map.meter_slots,
 						    sizeof(__le32), GFP_KERNEL);
 
 		if (!new_map || !levels) {
@@ -351,7 +420,10 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 			err = -ENOMEM;
 			goto out_unlock;
 		}
-		/* Geometry must be visible before the controls are added (info() reads it). */
+		/*
+		 * Geometry must be visible before the controls are added
+		 * (info() reads it).
+		 */
 		c->hwdep_meter_channels = map.map_size;
 		c->hwdep_n_meter_slots = map.meter_slots;
 		c->hwdep_meter_map = new_map;
@@ -359,7 +431,9 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 		memcpy(c->hwdep_meter_map, tmp, map.map_size * sizeof(s16));
 		while (c->hwdep_meter_parts < parts) {
 			int p = c->hwdep_meter_parts;
-			struct snd_kcontrol *kctl = snd_ctl_new1(&clarett_hwdep_meter_tmpl, c);
+			struct snd_kcontrol *kctl;
+
+			kctl = snd_ctl_new1(&clarett_hwdep_meter_tmpl, c);
 
 			if (!kctl) {
 				err = -ENOMEM;
@@ -367,20 +441,25 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 			}
 			kctl->id.index = p;
 			kctl->private_value = p;
-			err = snd_ctl_add(c->card, kctl);	/* frees kctl on failure */
+			/* frees kctl on failure */
+			err = snd_ctl_add(c->card, kctl);
 			if (err)
 				break;
 			c->hwdep_meter_ctl[p] = kctl;
 			c->hwdep_meter_parts++;
 		}
 		/*
-		 * A later part failing leaves the earlier ones working: they are already published and stay
-		 * correct, so only the channels past them go unmetered. Only a failure on part 0 is fatal.
+		 * A later part failing leaves the earlier ones working: they
+		 * are already published and stay correct, so only the channels
+		 * past them go unmetered. Only a failure on part 0 is fatal.
 		 */
 		if (err && c->hwdep_meter_parts) {
-			dev_warn(&c->pci->dev, "Level Meter part %d not created (%d); channels from %d unmetered\n",
-				 c->hwdep_meter_parts, err,
-				 clarett_hwdep_meter_part_first(c->hwdep_meter_parts));
+			int made = c->hwdep_meter_parts;
+
+			dev_warn(&c->pci->dev,
+				 "Level Meter part %d not created (%d); channels from %d unmetered\n",
+				 made, err,
+				 clarett_hwdep_meter_part_first(made));
 			err = 0;
 		} else if (err) {
 			c->hwdep_meter_map = NULL;
@@ -391,10 +470,14 @@ static int clarett_hwdep_set_meter_map(struct clarett *c, struct fcp_meter_map _
 		goto out_unlock;
 	} else if (map.map_size != c->hwdep_meter_channels ||
 		   map.meter_slots != c->hwdep_n_meter_slots) {
-		/* Re-mapping an existing control is supported (fcp-server re-pushes when the device
-		 * changes speed band, because the meter slot array compacts under ADAT S/MUX), but only
-		 * with the SAME geometry: the map and level buffers were sized on the first call, and the
-		 * control's channel count is already published. A larger map here would overrun both. */
+		/*
+		 * Re-mapping an existing control is supported (fcp-server
+		 * re-pushes when the device changes speed band, because the
+		 * meter slot array compacts under ADAT S/MUX), but only with
+		 * the SAME geometry: the map and level buffers were sized on
+		 * the first call, and the control's channel count is already
+		 * published. A larger map here would overrun both.
+		 */
 		err = -EINVAL;
 		goto out_unlock;
 	}
@@ -406,14 +489,18 @@ out_free:
 	return err;
 }
 
-/* Drop part `p`'s labels TLV and stop advertising TLV read on it. Caller holds hwdep_lock. */
+/*
+ * Drop part `p`'s labels TLV and stop advertising TLV read on it. Caller holds
+ * hwdep_lock.
+ */
 static void clarett_hwdep_meter_clear_labels(struct clarett *c, int p)
 {
 	struct snd_kcontrol *kctl = c->hwdep_meter_ctl[p];
 
 	if (!c->hwdep_meter_labels_tlv[p])
 		return;
-	kctl->vd[0].access &= ~(SNDRV_CTL_ELEM_ACCESS_TLV_READ | SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK);
+	kctl->vd[0].access &= ~(SNDRV_CTL_ELEM_ACCESS_TLV_READ |
+				SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK);
 	snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
 	devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv[p]);
 	c->hwdep_meter_labels_tlv[p] = NULL;
@@ -421,14 +508,16 @@ static void clarett_hwdep_meter_clear_labels(struct clarett *c, int p)
 }
 
 /*
- * Give part `p` the labels in data[0..len) (NUL-separated, one per channel of that part) as its
- * FCP_CHANNEL_LABELS TLV. Caller holds hwdep_lock.
+ * Give part `p` the labels in data[0..len) (NUL-separated, one per channel of
+ * that part) as its FCP_CHANNEL_LABELS TLV. Caller holds hwdep_lock.
  */
-static int clarett_hwdep_meter_set_labels(struct clarett *c, int p, const char *data, size_t len)
+static int clarett_hwdep_meter_set_labels(struct clarett *c, int p,
+					  const char *data, size_t len)
 {
 	struct snd_kcontrol *kctl = c->hwdep_meter_ctl[p];
 	unsigned int data_size = ALIGN(len, sizeof(unsigned int));
-	unsigned int tlv_size = sizeof(unsigned int) * 2 + data_size;	/* type + length + payload */
+	/* type + length + payload */
+	unsigned int tlv_size = sizeof(unsigned int) * 2 + data_size;
 	unsigned int *tlv = devm_kzalloc(&c->pci->dev, tlv_size, GFP_KERNEL);
 
 	if (!tlv)
@@ -437,8 +526,10 @@ static int clarett_hwdep_meter_set_labels(struct clarett *c, int p, const char *
 	tlv[1] = data_size;
 	memcpy(&tlv[2], data, len);
 
-	if (!c->hwdep_meter_labels_tlv[p]) {	/* first labels: advertise TLV read */
-		kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ | SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK;
+	/* first labels: advertise TLV read */
+	if (!c->hwdep_meter_labels_tlv[p]) {
+		kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ |
+				      SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK;
 		snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
 	} else {
 		devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv[p]);
@@ -449,13 +540,16 @@ static int clarett_hwdep_meter_set_labels(struct clarett *c, int p, const char *
 }
 
 /*
- * FCP_IOCTL_SET_METER_LABELS: attach (or clear, size 0) the channel-name TLVs. fcp-server sends one
- * NUL-separated blob for every channel; each Level Meter part gets the slice for its own channels, so
- * every control's labels line up with its values on their own.
+ * FCP_IOCTL_SET_METER_LABELS: attach (or clear, size 0) the channel-name TLVs.
+ * fcp-server sends one NUL-separated blob for every channel; each Level Meter
+ * part gets the slice for its own channels, so every control's labels line up
+ * with its values on their own.
  */
-#define CLARETT_METER_LABELS_MAX	8192	/* blob ceiling; a full 255-channel map stays well inside */
+/* blob ceiling; a full 255-channel map stays well inside */
+#define CLARETT_METER_LABELS_MAX	8192
 
-static int clarett_hwdep_set_meter_labels(struct clarett *c, struct fcp_meter_labels __user *arg)
+static int clarett_hwdep_set_meter_labels(struct clarett *c,
+					  struct fcp_meter_labels __user *arg)
 {
 	struct fcp_meter_labels labels;
 	const char *pos, *end;
@@ -473,11 +567,13 @@ static int clarett_hwdep_set_meter_labels(struct clarett *c, struct fcp_meter_la
 	}
 
 	mutex_lock(&c->hwdep_lock);
-	if (c->hw_gone) {		/* a devm allocation now would outlive the device's devres */
+	/* a devm allocation now would outlive the device's devres */
+	if (c->hw_gone) {
 		err = -ENODEV;
 		goto out;
 	}
-	if (!c->hwdep_meter_parts) {	/* map (hence the controls) must be set first */
+	/* map (hence the controls) must be set first */
+	if (!c->hwdep_meter_parts) {
 		err = -EINVAL;
 		goto out;
 	}
@@ -488,16 +584,20 @@ static int clarett_hwdep_set_meter_labels(struct clarett *c, struct fcp_meter_la
 		goto out;
 	}
 
-	/* Walk the blob label by label; each part takes the run covering its channels. */
+	/*
+	 * Walk the blob label by label; each part takes the run covering its
+	 * channels.
+	 */
 	pos = blob;
 	end = blob + labels.labels_size;
 	for (p = 0; p < c->hwdep_meter_parts && pos < end; p++) {
 		const char *start = pos;
+		int count = clarett_hwdep_meter_part_count(c, p);
 		int n;
 
-		for (n = 0; n < clarett_hwdep_meter_part_count(c, p) && pos < end; n++)
+		for (n = 0; n < count && pos < end; n++)
 			pos += strnlen(pos, end - pos) + 1;
-		if (pos > end)			/* last label unterminated: keep what fits */
+		if (pos > end)	/* last label unterminated: keep what fits */
 			pos = end;
 		err = clarett_hwdep_meter_set_labels(c, p, start, pos - start);
 		if (err)
@@ -520,9 +620,9 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 		return put_user(FCP_HWDEP_VERSION, (int __user *)argp);
 
 	/*
-	 * Everything else reaches the device, so wait out a system suspend the way control ioctls do
-	 * (the control core takes this reference itself; the hwdep core does not). Fails once the card
-	 * is being removed.
+	 * Everything else reaches the device, so wait out a system suspend the
+	 * way control ioctls do (the control core takes this reference itself;
+	 * the hwdep core does not). Fails once the card is being removed.
 	 */
 	err = snd_power_ref_and_wait(c->card);
 	if (err >= 0) {
@@ -550,46 +650,58 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 /*** Notification relay ***/
 
 /*
- * Relay a device notification to a waiting fcp-server (called from clarett_notify_work on the
- * hwdep path). fcp-server's read() returns a u32 bitmask and re-reads every control whose
- * devmap "notify-client" mask intersects it.
+ * Relay a device notification to a waiting fcp-server (called from
+ * clarett_notify_work on the hwdep path). fcp-server's read() returns a u32
+ * bitmask and re-reads every control whose devmap "notify-client" mask
+ * intersects it.
  *
- * The USB FCP device delivers that bitmask in its interrupt message; this Thunderbolt device carries
- * it in the event bits of the 0x400 cause register (ev, phase bits already removed), so it is relayed
- * as is on a model whose device map is written against it (clarett_model.notify_word, every model
- * the driver knows). A model without it gets an all-categories wildcard (~0), so fcp-server does a
- * correct, if broad, re-read of all notifiable controls.
+ * The USB FCP device delivers that bitmask in its interrupt message; this
+ * Thunderbolt device carries it in the event bits of the 0x400 cause register
+ * (ev, phase bits already removed), so it is relayed as is on a model whose
+ * device map is written against it (clarett_model.notify_word, every model the
+ * driver knows). A model without it gets an all-categories wildcard (~0), so
+ * fcp-server does a correct, if broad, re-read of all notifiable controls.
  */
 /*
  * Minimum gap between notification wakes. Writable at runtime:
- *   echo 0 > /sys/module/snd_clarett/parameters/notify_ms       # no limiting at all
- * Each wake costs userspace a re-read of every control it marks notifiable — ~17 mailbox round
- * trips on a 2Pre (the routing and mixer controls are not notifiable, so they cost nothing), so
- * 20 Hz would be roughly 160 round trips a second.
+ *   echo 0 > /sys/module/snd_clarett/parameters/notify_ms  # no limiting
+ * Each wake costs userspace a re-read of every control it marks notifiable —
+ * ~17 mailbox round trips on a 2Pre (the routing and mixer controls are not
+ * notifiable, so they cost nothing), so 20 Hz would be roughly 160 round trips
+ * a second.
  *
- * Turning a Clarett's monitor knob raises its event bit ~46 times a second; 50 ms collapses that to
- * one re-read per 50 ms, which tracks the knob smoothly. An idle Clarett raises no event bits at all.
- * (The steady ~8-13 Hz "notification" seen before the event bits were separated out was the mailbox
+ * Turning a Clarett's monitor knob raises its event bit ~46 times a second; 50
+ * ms collapses that to one re-read per 50 ms, which tracks the knob smoothly.
+ * An idle Clarett raises no event bits at all. (The steady ~8-13 Hz
+ * "notification" seen before the event bits were separated out was the mailbox
  * phase bits of the driver's own commands, relayed by mistake.)
  */
 static uint notify_ms = 50;
 module_param(notify_ms, uint, 0644);
 
 MODULE_PARM_DESC(notify_ms,
-		 "Minimum ms between notification wakes to userspace (default 50; 0 = every "
-		 "notification). Raise it to cut mailbox traffic while a front-panel control moves.");
+		 "Minimum ms between notification wakes to userspace "
+		 "(default 50; 0 = every notification). Raise it to cut "
+		 "mailbox traffic while a front-panel control moves.");
 
-/* The relay's rate limit, shared by the hw_gain_follow trigger (clarett_schedule_follow). */
+/*
+ * The relay's rate limit, shared by the hw_gain_follow trigger
+ * (clarett_schedule_follow).
+ */
 unsigned int clarett_hwdep_notify_ms(void)
 {
 	return READ_ONCE(notify_ms);
 }
 
-/* Coalesced wake: fires ~notify_ms after the FIRST notification of a burst — see the rate-limit
- * note in clarett_hwdep_notify() for why it must not be the last one. */
+/*
+ * Coalesced wake: fires ~notify_ms after the FIRST notification of a burst —
+ * see the rate-limit note in clarett_hwdep_notify() for why it must not be the
+ * last one.
+ */
 static void clarett_hwdep_notify_wake(struct work_struct *work)
 {
-	struct clarett *c = container_of(work, struct clarett, hwdep_notify_dwork.work);
+	struct clarett *c = container_of(work, struct clarett,
+					 hwdep_notify_dwork.work);
 
 	wake_up_interruptible(&c->hwdep_notify_wait);
 }
@@ -597,15 +709,17 @@ static void clarett_hwdep_notify_wake(struct work_struct *work)
 void clarett_hwdep_notify(struct clarett *c, u32 ev)
 {
 	/*
-	 * A moving front-panel control raises events far faster than anyone can see (~46/s for the
-	 * monitor knob), and every wake makes fcp-server re-read each control the word matches.
-	 * Coalesce: set the event now, and wake at most once per notify_ms.
+	 * A moving front-panel control raises events far faster than anyone can
+	 * see (~46/s for the monitor knob), and every wake makes fcp-server
+	 * re-read each control the word matches. Coalesce: set the event now,
+	 * and wake at most once per notify_ms.
 	 *
-	 * schedule_delayed_work(), NOT mod_delayed_work(): it is a no-op while the work is already
-	 * queued, so the wake lands notify_ms after the FIRST notification of a burst.
-	 * mod_delayed_work() pushes the deadline out on every arrival, which is a debounce — and
-	 * against a source that never goes idle it never fires at all, so userspace would see one
-	 * notification and nothing afterwards.
+	 * schedule_delayed_work(), NOT mod_delayed_work(): it is a no-op while
+	 * the work is already queued, so the wake lands notify_ms after the
+	 * FIRST notification of a burst. mod_delayed_work() pushes the deadline
+	 * out on every arrival, which is a debounce — and against a source
+	 * that never goes idle it never fires at all, so userspace would see
+	 * one notification and nothing afterwards.
 	 */
 	if (!c->hwdep_ready)
 		return;
@@ -617,16 +731,19 @@ void clarett_hwdep_notify(struct clarett *c, u32 ev)
 		ev = ~0u;
 	}
 	atomic_or(ev, &c->hwdep_notify_event);
-	schedule_delayed_work(&c->hwdep_notify_dwork, msecs_to_jiffies(notify_ms));
+	schedule_delayed_work(&c->hwdep_notify_dwork,
+			      msecs_to_jiffies(notify_ms));
 }
 
 /*
- * Stop the relay. MUST run before c is freed: the debounced wake holds a timer pointing at c, and
- * because the device notifies at ~30 Hz idle one is essentially always armed — a surprise removal
- * (the device powered off on its Thunderbolt link) that frees c with the timer live fires
- * wake_up_interruptible() into freed memory. Call after the last thing that can re-arm the dwork
- * (clarett_notify_work), and note the flag also covers probe-error teardowns that never reached
- * clarett_hwdep_init(), where the delayed_work is still all zeroes.
+ * Stop the relay. MUST run before c is freed: the debounced wake holds a timer
+ * pointing at c, and because the device notifies at ~30 Hz idle one is
+ * essentially always armed — a surprise removal (the device powered off on
+ * its Thunderbolt link) that frees c with the timer live fires
+ * wake_up_interruptible() into freed memory. Call after the last thing that can
+ * re-arm the dwork (clarett_notify_work), and note the flag also covers
+ * probe-error teardowns that never reached clarett_hwdep_init(), where the
+ * delayed_work is still all zeroes.
  */
 void clarett_hwdep_free(struct clarett *c)
 {
@@ -646,8 +763,11 @@ static long clarett_hwdep_read(struct snd_hwdep *hw, char __user *buf,
 	if (count < sizeof(event))
 		return -EINVAL;
 
-	/* card->shutdown terminates the wait on removal: snd_card_free() blocks until the last
-	 * handle closes, so a reader parked here forever would hang the PCI remove thread. */
+	/*
+	 * card->shutdown terminates the wait on removal: snd_card_free() blocks
+	 * until the last handle closes, so a reader parked here forever would
+	 * hang the PCI remove thread.
+	 */
 	err = wait_event_interruptible(c->hwdep_notify_wait,
 				       atomic_read(&c->hwdep_notify_event) ||
 				       c->card->shutdown);
@@ -685,7 +805,10 @@ int clarett_hwdep_init(struct clarett *c)
 
 	INIT_DELAYED_WORK(&c->hwdep_notify_dwork, clarett_hwdep_notify_wake);
 
-	/* fcp.c leaves iface at the default and fcp-server opens by device, not iface. */
+	/*
+	 * fcp.c leaves iface at the default and fcp-server opens by device, not
+	 * iface.
+	 */
 	hw->private_data = c;
 	hw->exclusive = 1;
 	hw->ops.open = clarett_hwdep_open;
@@ -694,7 +817,8 @@ int clarett_hwdep_init(struct clarett *c)
 	hw->ops.read = clarett_hwdep_read;
 	hw->ops.poll = clarett_hwdep_poll;
 
-	c->hwdep_ready = true;		/* dwork is live from here; clarett_hwdep_free() must run */
+	/* dwork is live from here; clarett_hwdep_free() must run */
+	c->hwdep_ready = true;
 
 	dev_dbg(&c->pci->dev,
 		"FCP hwdep created (fcp-server transport; PVERSION+CMD+INIT+METER+notify)\n");

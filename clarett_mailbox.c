@@ -2,11 +2,12 @@
 /*
  * Focusrite Clarett/Red (Thunderbolt) ALSA driver — FCP mailbox transport.
  *
- * One transaction: fill the request mailbox (cmd/size+seq/error/pad/data), ring the
- * doorbell, wait for the DONE bit in the IRQ-0 cause register and for the response
- * DMA to land, then acknowledge. Mailbox completion is polled by design: MSI is used for async notifications and stream
- * period events, but polling the DONE bit keeps the mailbox from racing the
- * read-to-clear cause register against the ISR.
+ * One transaction: fill the request mailbox (cmd/size+seq/error/pad/data), ring
+ * the doorbell, wait for the DONE bit in the IRQ-0 cause register and for the
+ * response DMA to land, then acknowledge. Mailbox completion is polled by
+ * design: MSI is used for async notifications and stream period events, but
+ * polling the DONE bit keeps the mailbox from racing the read-to-clear cause
+ * register against the ISR.
  */
 #include <linux/io.h>
 #include <linux/jiffies.h>
@@ -19,8 +20,9 @@
 #include "clarett.h"
 
 /*
- * system_wq is deprecated from 6.17, which warns on first use and points at the unbound
- * system_dfl_wq. The deferred flash save has no CPU affinity to keep, so it belongs there.
+ * system_wq is deprecated from 6.17, which warns on first use and points at the
+ * unbound system_dfl_wq. The deferred flash save has no CPU affinity to keep,
+ * so it belongs there.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 #define CLARETT_SAVE_WQ	system_dfl_wq
@@ -29,56 +31,65 @@
 #endif
 
 /*
- * Two completion cycles. With MSI up, a command completes on the device's own 0x400 phase bits,
- * delivered by the vec0 ISR: bit0 when the request is accepted, bit1 when its response has landed.
- * Without MSI (allocation or request_irq failed, which the driver survives), it falls back to polling
+ * Two completion cycles. With MSI up, a command completes on the device's own
+ * 0x400 phase bits, delivered by the vec0 ISR: bit0 when the request is
+ * accepted, bit1 when its response has landed. Without MSI (allocation or
+ * request_irq failed, which the driver survives), it falls back to polling
  * 0x100 for DONE, sweeping the cause blocks and polling the response buffer.
  */
 
 /*
- * Why the trailing ack waits for the response. The doorbell ack (0x408=2) means "response
- * consumed, buffer free", not "completion observed": the device DMAs its response
- * asynchronously AFTER raising DONE, and acking before it lands makes the device refuse the
- * whole session (err=3 on every later command). So each command zeroes the response header
- * before submit (a repeated opcode must not match a stale echo), waits after DONE for THIS
- * command's echoed opcode in resp_buf, and only then acks. A response that never arrives is
- * never acked.
+ * Why the trailing ack waits for the response. The doorbell ack (0x408=2) means
+ * "response consumed, buffer free", not "completion observed": the device DMAs
+ * its response asynchronously AFTER raising DONE, and acking before it lands
+ * makes the device refuse the whole session (err=3 on every later command). So
+ * each command zeroes the response header before submit (a repeated opcode must
+ * not match a stale echo), waits after DONE for THIS command's echoed opcode in
+ * resp_buf, and only then acks. A response that never arrives is never acked.
  *
- * The header is not the whole response. A long reply lands in pieces, header first, and one
- * copied out the moment the echo matched could still hold the previous command's bytes past the
- * first piece (a 245-byte GET_DATA read back intermittently zeroed from about 130 bytes in). So
- * the payload area is poisoned before submit too, and after the echo the wait continues until
- * the last bytes the header's size field promises are no longer poison (clarett_resp_tail_wait).
+ * The header is not the whole response. A long reply lands in pieces, header
+ * first, and one copied out the moment the echo matched could still hold the
+ * previous command's bytes past the first piece (a 245-byte GET_DATA read back
+ * intermittently zeroed from about 130 bytes in). So the payload area is
+ * poisoned before submit too, and after the echo the wait continues until the
+ * last bytes the header's size field promises are no longer poison
+ * (clarett_resp_tail_wait).
  *
- * resp_trace: one log line per command — DONE latency, response-landing latency, echoed
- * seq, FCP status word (resp+8), size. (GET_METER adds ~24 lines/s; meter_poll_ms=0 for a
- * readable log.)
+ * resp_trace: one log line per command — DONE latency, response-landing
+ * latency, echoed seq, FCP status word (resp+8), size. (GET_METER adds ~24
+ * lines/s; meter_poll_ms=0 for a readable log.)
  */
 static bool resp_trace;
 module_param(resp_trace, bool, 0444);
 MODULE_PARM_DESC(resp_trace,
-	"Log per-command response telemetry: DONE and response-landing latencies, echo, FCP "
-	"status (resp+8), size. Use with meter_poll_ms=0. Default 0.");
+	"Log per-command response telemetry: DONE and response-landing "
+	"latencies, echo, FCP status (resp+8), size. Use with meter_poll_ms=0. "
+	"Default 0.");
 
 /*
- * Deadline for a command's response DMA to land, split out from CLARETT_MBOX_TIMEOUT_MS (which still
- * governs the DONE wait) because only this half is in question. A command can complete normally — DONE
- * raised, status clean — and still have its response DMA arrive late; the ack is then withheld, and the
- * device is left holding an unretired command that it answers instead of every later one.
+ * Deadline for a command's response DMA to land, split out from
+ * CLARETT_MBOX_TIMEOUT_MS (which still governs the DONE wait) because only this
+ * half is in question. A command can complete normally — DONE raised, status
+ * clean — and still have its response DMA arrive late; the ack is then
+ * withheld, and the device is left holding an unretired command that it answers
+ * instead of every later one.
  *
- * Runtime-writable because a reload re-runs the pre-mailbox init and clears the device's mailbox state,
- * which would hide a slow response; set it, then power-cycle the unit so probe re-runs.
+ * Runtime-writable because a reload re-runs the pre-mailbox init and clears the
+ * device's mailbox state, which would hide a slow response; set it, then
+ * power-cycle the unit so probe re-runs.
  */
 static uint resp_timeout_ms = CLARETT_MBOX_TIMEOUT_MS;
 module_param(resp_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(resp_timeout_ms,
-	"Deadline (ms) for a command's response DMA to land before the trailing ack is withheld "
-	"(default 100). Diagnostic: raise it to find out whether a slow command's response is merely "
-	"LATE or never sent at all. resp_trace=1 prints the landing latency.");
+	"Deadline (ms) for a command's response DMA to land before the "
+	"trailing ack is withheld (default 100). Diagnostic: raise it to "
+	"find out whether a slow command's response is merely LATE or never "
+	"sent at all. resp_trace=1 prints the landing latency.");
 
 /*
- * The response deadline for one command: probe's override while it asks for readiness, the long flash
- * deadline for the FLASH category, else resp_timeout_ms.
+ * The response deadline for one command: probe's override while it asks for
+ * readiness, the long flash deadline for the FLASH category, else
+ * resp_timeout_ms.
  */
 static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
 {
@@ -90,30 +101,42 @@ static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
 }
 
 /*
- * True for a stream period-cause block (0x200 TX / 0x300 RX) while the PCM engine is streaming. The
- * mailbox skips these in its DONE sweep so it does not read-to-clear a period event the stream servicer
- * is waiting for (an audible gap). When idle they read 0 and are swept normally.
+ * True for a stream period-cause block (0x200 TX / 0x300 RX) while the PCM
+ * engine is streaming. The mailbox skips these in its DONE sweep so it does not
+ * read-to-clear a period event the stream servicer is waiting for (an audible
+ * gap). When idle they read 0 and are swept normally.
  */
 static inline bool clarett_stream_cause(const struct clarett *c, u16 reg)
 {
 	return c->stream_on && (reg == STREAM_BLK0 || reg == STREAM_BLK1);
 }
 
-/* Cause blocks the mailbox sweep leaves alone: the stream blocks while streaming, and 0x400 whenever
- * the vec0 ISR is up, which is then its only reader (the ISR records the phase bits in mbox_phase). */
+/*
+ * Cause blocks the mailbox sweep leaves alone: the stream blocks while
+ * streaming, and 0x400 whenever the vec0 ISR is up, which is then its only
+ * reader (the ISR records the phase bits in mbox_phase).
+ */
 static inline bool clarett_skip_cause(const struct clarett *c, u16 reg)
 {
-	return clarett_stream_cause(c, reg) || (reg == REG_NOTIFY_CAUSE && c->irq_ready);
+	return clarett_stream_cause(c, reg) ||
+	       (reg == REG_NOTIFY_CAUSE && c->irq_ready);
+}
+
+/* The FCP status word of the response that has just landed. */
+static u32 clarett_resp_status(const struct clarett *c)
+{
+	return clarett_get_le32((const u8 *)c->resp_buf + FCP_RESP_STATUS_OFF);
 }
 
 /*
- * Wait for THIS command's response to land in resp_buf. Returns the matched echo word
- * (CMD_EXEC_FLAG | opcode — never zero), or 0 if nothing landed before the deadline;
- * *land_us gets the submit->landing latency (-1 on timeout). Spins briefly (a landing,
- * when it happens, is expected within ~150 us), then backs off to sleeps; called under
- * mbox_lock, sleeping is fine.
+ * Wait for THIS command's response to land in resp_buf. Returns the matched
+ * echo word (CMD_EXEC_FLAG | opcode — never zero), or 0 if nothing landed
+ * before the deadline; *land_us gets the submit->landing latency (-1 on
+ * timeout). Spins briefly (a landing, when it happens, is expected within ~150
+ * us), then backs off to sleeps; called under mbox_lock, sleeping is fine.
  */
-static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit, s64 *land_us)
+static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit,
+			     s64 *land_us)
 {
 	const u8 *r = c->resp_buf;
 	unsigned int ms = clarett_resp_ms(c, exp_echo);
@@ -122,9 +145,12 @@ static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit, 
 	u32 echo;
 
 	for (;;) {
-		dma_rmb();	/* order the DMAed response before we read resp_buf */
-		echo = r[FCP_RESP_ECHO_OFF] | r[FCP_RESP_ECHO_OFF + 1] << 8 |
-		       r[FCP_RESP_ECHO_OFF + 2] << 16 | (u32)r[FCP_RESP_ECHO_OFF + 3] << 24;
+		/* order the DMAed response before we read resp_buf */
+		dma_rmb();
+		echo = r[FCP_RESP_ECHO_OFF] |
+		       r[FCP_RESP_ECHO_OFF + 1] << 8 |
+		       r[FCP_RESP_ECHO_OFF + 2] << 16 |
+		       (u32)r[FCP_RESP_ECHO_OFF + 3] << 24;
 		if (echo == exp_echo) {
 			*land_us = ktime_us_delta(ktime_get(), t_submit);
 			return echo;
@@ -141,10 +167,11 @@ static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit, 
 }
 
 /*
- * Payload poison, and the wait for the tail of the response it makes possible. Posted writes from
- * the device land in order, so once the last payload bytes the header announces are no longer
- * poison, everything before them has landed too. Real data can equal the poison, so the wait is
- * bounded; on expiry the bytes are taken as they are (the old behaviour) and counted.
+ * Payload poison, and the wait for the tail of the response it makes possible.
+ * Posted writes from the device land in order, so once the last payload bytes
+ * the header announces are no longer poison, everything before them has landed
+ * too. Real data can equal the poison, so the wait is bounded; on expiry the
+ * bytes are taken as they are (the old behaviour) and counted.
  */
 #define CLARETT_RESP_POISON	0xa5
 #define CLARETT_RESP_TAIL_US	2000
@@ -158,7 +185,10 @@ static void clarett_resp_tail_wait(struct clarett *c)
 	dma_rmb();
 	size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 	if (!size)
-		return;		/* not every command fills the size field: nothing to wait for */
+		/*
+		 * not every command fills the size field: nothing to wait for
+		 */
+		return;
 	end = min_t(size_t, FCP_RESP_DATA_OFF + size, c->resp_size);
 	from = max_t(size_t, end >= 4 ? end - 4 : 0, FCP_RESP_DATA_OFF);
 
@@ -178,15 +208,17 @@ static void clarett_resp_tail_wait(struct clarett *c)
 }
 
 /*
- * Retire a command whose response missed its deadline, before the next command is sent. Measured on
- * a Clarett 8Pre and a Red 8Line by withholding one GET_DATA's ack: the response did land (it was
- * late, not lost), and until it is acknowledged the device refuses every later command (err=3, no
- * payload) whatever sequence number it carries. Acking it once it has landed restores the session
- * completely, with the sequence continuing from the lost command. So: wait up to that command's own
- * deadline for the response, ack it and carry on; if it never lands (a device asked too early after
- * power-up answers nothing at all), start the sequence over at 0, which is what recovers that case.
- * Returns true if it waited and nothing landed. Called with mbox_lock held, before the response
- * buffer is reset for the next command.
+ * Retire a command whose response missed its deadline, before the next command
+ * is sent. Measured on a Clarett 8Pre and a Red 8Line by withholding one
+ * GET_DATA's ack: the response did land (it was late, not lost), and until it
+ * is acknowledged the device refuses every later command (err=3, no payload)
+ * whatever sequence number it carries. Acking it once it has landed restores
+ * the session completely, with the sequence continuing from the lost command.
+ * So: wait up to that command's own deadline for the response, ack it and carry
+ * on; if it never lands (a device asked too early after power-up answers
+ * nothing at all), start the sequence over at 0, which is what recovers that
+ * case. Returns true if it waited and nothing landed. Called with mbox_lock
+ * held, before the response buffer is reset for the next command.
  */
 static bool clarett_retire_lost(struct clarett *c)
 {
@@ -197,7 +229,8 @@ static bool clarett_retire_lost(struct clarett *c)
 	if (!c->lost_pending)
 		return false;
 	c->lost_pending = false;
-	deadline = jiffies + msecs_to_jiffies(max(clarett_resp_ms(c, c->lost_echo), 1u));
+	deadline = jiffies +
+		   msecs_to_jiffies(max(clarett_resp_ms(c, c->lost_echo), 1u));
 	for (;;) {
 		dma_rmb();
 		echo = clarett_get_le32(r + FCP_RESP_ECHO_OFF);
@@ -219,14 +252,17 @@ static bool clarett_retire_lost(struct clarett *c)
 }
 
 /*
- * Core mailbox transaction. If resp_out/resp_len are given, the response *payload* (the bytes after
- * the 16-byte echoed header) is copied out under mbox_lock on success — race-free, unlike reading
- * c->resp_buf after the call — and size_out/status_out, if given, get the response's size and FCP
- * status. clarett_fcp() is the response-less wrapper; clarett_fcp_cmd() is the hwdep CMD path that
- * needs the payload; clarett_fcp_read() also returns the size and status.
+ * Core mailbox transaction. If resp_out/resp_len are given, the response
+ * *payload* (the bytes after the 16-byte echoed header) is copied out under
+ * mbox_lock on success — race-free, unlike reading c->resp_buf after the call
+ * — and size_out/status_out, if given, get the response's size and FCP
+ * status. clarett_fcp() is the response-less wrapper; clarett_fcp_cmd() is the
+ * hwdep CMD path that needs the payload; clarett_fcp_read() also returns the
+ * size and status.
  */
-static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
-			 u8 *resp_out, u16 resp_len, u16 *size_out, u32 *status_out)
+static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
+			 u16 len, u8 *resp_out, u16 resp_len, u16 *size_out,
+			 u32 *status_out)
 {
 	unsigned long deadline;
 	u32 cause = 0, first_cause = 0, resp_echo = 0, fcp_status = 0;
@@ -239,26 +275,34 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		return -EINVAL;
 
 	/*
-	 * A removed device answers every MMIO read with ~0 and swallows writes, so the gated cycle
-	 * would wait out its full timeout for a response that can never land — once per command, for
-	 * every command still queued when the Thunderbolt cable is pulled or the unit is switched
-	 * off. Fail fast instead; the PCI core sets this the moment the link goes.
+	 * A removed device answers every MMIO read with ~0 and swallows writes,
+	 * so the gated cycle would wait out its full timeout for a response
+	 * that can never land — once per command, for every command still
+	 * queued when the Thunderbolt cable is pulled or the unit is switched
+	 * off. Fail fast instead; the PCI core sets this the moment the link
+	 * goes.
 	 */
 	if (pci_dev_is_disconnected(c->pci))
 		return -ENODEV;
 
 	mutex_lock(&c->mbox_lock);
-	if (c->hw_gone) {		/* torn down: resp_buf and the BAR may already be freed */
+	/* torn down: resp_buf and the BAR may already be freed */
+	if (c->hw_gone) {
 		mutex_unlock(&c->mbox_lock);
 		return -ENODEV;
 	}
 
 	retire_failed = clarett_retire_lost(c);
 
-	/* zero the response header so clarett_resp_wait can't match a stale echo of a
-	 * repeated opcode */
+	/*
+	 * zero the response header so clarett_resp_wait can't match a stale
+	 * echo of a repeated opcode
+	 */
 	memset(c->resp_buf, 0, FCP_RESP_DATA_OFF);
-	/* and poison the payload, so clarett_resp_tail_wait can tell when the tail has landed */
+	/*
+	 * and poison the payload, so clarett_resp_tail_wait can tell when the
+	 * tail has landed
+	 */
 	memset((u8 *)c->resp_buf + FCP_RESP_DATA_OFF, CLARETT_RESP_POISON,
 	       c->resp_size - FCP_RESP_DATA_OFF);
 	dma_wmb();
@@ -268,7 +312,10 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	clarett_wl(c, REG_MBOX + MBOX_ERROR, 0);
 	clarett_wl(c, REG_MBOX + MBOX_PAD, 0);
 
-	/* payload, written as little-endian 32-bit words (last word zero-padded) */
+	/*
+	 * payload, written as little-endian 32-bit words (last word
+	 * zero-padded)
+	 */
 	for (i = 0; i < len; i += 4) {
 		u32 w = 0;
 		int j;
@@ -278,9 +325,13 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		clarett_wl(c, REG_MBOX + MBOX_DATA + i, w);
 	}
 
-	/* Mark the command in flight BEFORE submitting: vec0 fires on the command's phase bits, and the
-	 * ISR must record them for this command rather than relay them (clarett_irq / the 0x400 note in
-	 * clarett.h). Held until just before mutex_unlock so it still covers an MSI delivered late. */
+	/*
+	 * Mark the command in flight BEFORE submitting: vec0 fires on the
+	 * command's phase bits, and the ISR must record them for this command
+	 * rather than relay them (clarett_irq / the 0x400 note in clarett.h).
+	 * Held until just before mutex_unlock so it still covers an MSI
+	 * delivered late.
+	 */
 	reinit_completion(&c->mbox_accepted);
 	reinit_completion(&c->mbox_landed);
 	atomic_set(&c->mbox_phase, 0);
@@ -293,26 +344,29 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	by_phase = c->irq_ready;
 	if (by_phase) {
 		/*
-		 * Accepted, then landed. Both deadlines follow the response deadline (clarett_resp_ms():
-		 * resp_timeout_ms, ready_resp_ms while probe asks, longer for a flash command). A command
-		 * whose response has not landed is not acked here; the next command retires it first
-		 * (clarett_retire_lost()).
+		 * Accepted, then landed. Both deadlines follow the response
+		 * deadline (clarett_resp_ms(): resp_timeout_ms, ready_resp_ms
+		 * while probe asks, longer for a flash command). A command
+		 * whose response has not landed is not acked here; the next
+		 * command retires it first (clarett_retire_lost()).
 		 */
 		unsigned int ms = clarett_resp_ms(c, opcode);
+		unsigned long tmo = msecs_to_jiffies(max(ms, 1u));
+		u32 exp_echo = CMD_EXEC_FLAG | opcode;
 
 		polls = 1;
-		if (wait_for_completion_timeout(&c->mbox_accepted, msecs_to_jiffies(max(ms, 1u)))) {
+		if (wait_for_completion_timeout(&c->mbox_accepted, tmo)) {
 			acc_us = ktime_us_delta(ktime_get(), t_submit);
-			cause = IRQ_DONE_BIT;	/* accepted: the call succeeds, as DONE did */
-			if (wait_for_completion_timeout(&c->mbox_landed,
-							msecs_to_jiffies(max(ms, 1u))))
-				resp_echo = clarett_resp_wait(c, CMD_EXEC_FLAG | opcode,
-							      t_submit, &land_us);
+			/* accepted: the call succeeds, as DONE did */
+			cause = IRQ_DONE_BIT;
+			if (wait_for_completion_timeout(&c->mbox_landed, tmo))
+				resp_echo = clarett_resp_wait(c, exp_echo,
+							      t_submit,
+							      &land_us);
 			if (resp_echo) {
 				clarett_resp_tail_wait(c);
 				dma_rmb();
-				fcp_status = clarett_get_le32((const u8 *)c->resp_buf +
-							      FCP_RESP_STATUS_OFF);
+				fcp_status = clarett_resp_status(c);
 				clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
 			} else {
 				dev_warn_ratelimited(&c->pci->dev,
@@ -321,17 +375,24 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 			}
 		}
 	} else {
-		/* Polled fallback (no MSI): once DONE shows in 0x100, sweep the remaining cause blocks
-		 * (0x300, 0x200, 0x400, 0x500 — 0x400 holds the command-phase value and is
-		 * read-to-clear), do one confirming full sweep, then wait for the response and ack.
-		 * Sweep only AFTER DONE: sweeping the read-to-clear phase registers continuously
-		 * while the command is processing makes commands time out (-110). */
-		static const u16 sweep[] = { REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0,
-					     REG_NOTIFY_CAUSE, 0x500 };
+		/*
+		 * Polled fallback (no MSI): once DONE shows in 0x100, sweep the
+		 * remaining cause blocks (0x300, 0x200, 0x400, 0x500 — 0x400
+		 * holds the command-phase value and is read-to-clear), do one
+		 * confirming full sweep, then wait for the response and ack.
+		 * Sweep only AFTER DONE: sweeping the read-to-clear phase
+		 * registers continuously while the command is processing makes
+		 * commands time out (-110).
+		 */
+		static const u16 sweep[] = {
+			REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0,
+			REG_NOTIFY_CAUSE, 0x500
+		};
 		int s;
 
 		do {
-			cause = clarett_rl(c, REG_IRQ0_CAUSE);	/* read-to-clear */
+			/* read-to-clear */
+			cause = clarett_rl(c, REG_IRQ0_CAUSE);
 			if (!polls)
 				first_cause = cause;
 			polls++;
@@ -343,31 +404,43 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		if (cause & IRQ_DONE_BIT) {
 			done_us = ktime_us_delta(ktime_get(), t_submit);
 			/*
-			 * Skip the stream period-cause blocks (0x200 TX / 0x300 RX) while the PCM engine is
-			 * streaming: the stream servicer owns them (read-to-clear), and a mailbox read here
-			 * STEALS a pending period event — an audible gap in capture/playback. The mailbox ack only
-			 * needs 0x100 + the response landing + the trailing doorbell ack; the
-			 * stream blocks are irrelevant to it. clarett_stream_cause() flags the two to skip.
+			 * Skip the stream period-cause blocks (0x200 TX / 0x300
+			 * RX) while the PCM engine is streaming: the stream
+			 * servicer owns them (read-to-clear), and a mailbox
+			 * read here STEALS a pending period event — an
+			 * audible gap in capture/playback. The mailbox ack only
+			 * needs 0x100 + the response landing + the trailing
+			 * doorbell ack; the stream blocks are irrelevant to it.
+			 * clarett_stream_cause() flags the two to skip.
 			 */
 			for (s = 1; s < ARRAY_SIZE(sweep); s++)
 				if (!clarett_skip_cause(c, sweep[s]))
-					clarett_rl(c, sweep[s]);	/* rest of the DONE sweep */
+					/* rest of the DONE sweep */
+					clarett_rl(c, sweep[s]);
 			for (s = 0; s < ARRAY_SIZE(sweep); s++)
 				if (!clarett_skip_cause(c, sweep[s]))
-					clarett_rl(c, sweep[s]);	/* confirming full sweep */
+					/* confirming full sweep */
+					clarett_rl(c, sweep[s]);
 			resp_echo = clarett_resp_wait(c, CMD_EXEC_FLAG | opcode,
 						      t_submit, &land_us);
 			if (resp_echo) {
-				/* The header has landed; the rest of a long reply may not have. */
+				/*
+				 * The header has landed; the rest of a long
+				 * reply may not have.
+				 */
 				clarett_resp_tail_wait(c);
-				/* The device reports command-level failures in the FCP status word
-				 * (resp+8), NOT the mailbox error register — a rejected write/commit
-				 * lands a nonzero status here while DONE and the echo both look fine.
-				 * Read it now (response has landed) so callers, incl. the hwdep CMD
-				 * ioctl, see the real result instead of a false success. */
+				/*
+				 * The device reports command-level failures in
+				 * the FCP status word (resp+8), NOT the mailbox
+				 * error register — a rejected write/commit
+				 * lands a nonzero status here while DONE and
+				 * the echo both look fine. Read it now
+				 * (response has landed) so callers, incl. the
+				 * hwdep CMD ioctl, see the real result instead
+				 * of a false success.
+				 */
 				dma_rmb();
-				fcp_status = clarett_get_le32((const u8 *)c->resp_buf +
-							      FCP_RESP_STATUS_OFF);
+				fcp_status = clarett_resp_status(c);
 				clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
 			} else {
 				dev_warn_ratelimited(&c->pci->dev,
@@ -375,45 +448,64 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 					opcode, c->seq);
 			}
 		}
-		/* on timeout: no ack — an incomplete command is never acknowledged */
+		/*
+		 * on timeout: no ack — an incomplete command is never
+		 * acknowledged
+		 */
 	}
 
-	/* No mailbox register is read back: the error channel is resp+8 in the DMA buffer, and a read
-	 * here would race the device's response DMA. */
+	/*
+	 * No mailbox register is read back: the error channel is resp+8 in the
+	 * DMA buffer, and a read here would race the device's response DMA.
+	 */
 
-	/* Per-transaction trace. dev_dbg (not dev_info): the GET_METER heartbeat runs at ~24 Hz, so
-	 * info-level here would flood the log. Enable via dynamic debug when diagnosing the mailbox. */
+	/*
+	 * Per-transaction trace. dev_dbg (not dev_info): the GET_METER
+	 * heartbeat runs at ~24 Hz, so info-level here would flood the log.
+	 * Enable via dynamic debug when diagnosing the mailbox.
+	 */
 	dev_dbg(&c->pci->dev,
 		"FCP op=0x%06x seq=%u %s first_cause=0x%08x polls=%d done=%d phase=0x%x acc=%lldus land=%lldus status=0x%08x\n",
 		opcode, c->seq, by_phase ? "phase" : "done", first_cause, polls,
-		!!(cause & IRQ_DONE_BIT), atomic_read(&c->mbox_phase), acc_us, land_us, fcp_status);
+		!!(cause & IRQ_DONE_BIT), atomic_read(&c->mbox_phase), acc_us,
+		land_us, fcp_status);
 
 	if (resp_trace) {
 		const u8 *r = c->resp_buf;
 
 		if (resp_echo) {
-			u32 size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
+			u32 size = r[FCP_RESP_SIZE_OFF] |
+				   r[FCP_RESP_SIZE_OFF + 1] << 8;
+			u32 rseq = r[FCP_RESP_SEQ_OFF] |
+				   r[FCP_RESP_SEQ_OFF + 1] << 8;
 
 			dev_info(&c->pci->dev,
 				 "FCPr op=0x%06x seq=%u done=%lldus resp=%lldus rseq=%u err=%u size=%u phase=0x%x\n",
-				 opcode, c->seq, done_us, land_us,
-				 r[FCP_RESP_SEQ_OFF] | r[FCP_RESP_SEQ_OFF + 1] << 8,
-				 r[FCP_RESP_STATUS_OFF], size, atomic_read(&c->mbox_phase));
-			/* Payload head for every answered non-meter command; 32 bytes shows counts
-			 * and ids. GET_METER is excluded (24 Hz). */
+				 opcode, c->seq, done_us, land_us, rseq,
+				 r[FCP_RESP_STATUS_OFF], size,
+				 atomic_read(&c->mbox_phase));
+			/*
+			 * Payload head for every answered non-meter command; 32
+			 * bytes shows counts and ids. GET_METER is excluded (24
+			 * Hz).
+			 */
 			if (size && opcode != FCP_GET_METER)
 				dev_info(&c->pci->dev, "FCPr   payload=%*ph\n",
-					 (int)min(size, 32u), r + FCP_RESP_DATA_OFF);
-		}
-		else
+					 (int)min(size, 32u),
+					 r + FCP_RESP_DATA_OFF);
+		} else {
 			dev_info(&c->pci->dev,
 				 "FCPr op=0x%06x seq=%u done=%lldus resp=NONE (ack withheld) phase=0x%x\n",
-				 opcode, c->seq, done_us, atomic_read(&c->mbox_phase));
+				 opcode, c->seq, done_us,
+				 atomic_read(&c->mbox_phase));
+		}
 	}
 
 	/*
-	 * Wedge detection, for probe's report of a device that never became ready. No response at all, or one echoing a sequence number
-	 * that is not ours, both mean the device is still answering an earlier unretired command.
+	 * Wedge detection, for probe's report of a device that never became
+	 * ready. No response at all, or one echoing a sequence number that is
+	 * not ours, both mean the device is still answering an earlier
+	 * unretired command.
 	 */
 	if (!resp_echo) {
 		c->mbox_wedged = true;
@@ -427,14 +519,18 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	}
 
 	/*
-	 * The result. A command with no answer of its own fails: not accepted or not answered in time
-	 * (-ETIMEDOUT), or answered with another command's sequence number (-EIO); handing back the
-	 * response buffer then would give the caller poison or a stale reply as if it were data.
+	 * The result. A command with no answer of its own fails: not accepted
+	 * or not answered in time (-ETIMEDOUT), or answered with another
+	 * command's sequence number (-EIO); handing back the response buffer
+	 * then would give the caller poison or a stale reply as if it were
+	 * data.
 	 *
-	 * NOTE: fcp_status (resp+8) is NOT a clean pass/fail on this device — INIT_1 on an already
-	 * initialised device returns a nonzero status yet the command works. So it does not fail the
-	 * call by itself; it is surfaced in the dev_dbg line above and via resp_trace. The one case it
-	 * does decide is a caller asking for data and getting a nonzero status with none: a refusal.
+	 * NOTE: fcp_status (resp+8) is NOT a clean pass/fail on this device —
+	 * INIT_1 on an already initialised device returns a nonzero status yet
+	 * the command works. So it does not fail the call by itself; it is
+	 * surfaced in the dev_dbg line above and via resp_trace. The one case
+	 * it does decide is a caller asking for data and getting a nonzero
+	 * status with none: a refusal.
 	 */
 	if (!(cause & IRQ_DONE_BIT) || !resp_echo)
 		ret = -ETIMEDOUT;
@@ -444,8 +540,11 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		 !clarett_get_le16((const u8 *)c->resp_buf + FCP_RESP_SIZE_OFF))
 		ret = -EIO;
 
-	/* Copy the response payload out while still holding the lock (resp_buf is stable until the next
-	 * command, which can't start before we unlock). Only on success and only if the caller asked. */
+	/*
+	 * Copy the response payload out while still holding the lock (resp_buf
+	 * is stable until the next command, which can't start before we
+	 * unlock). Only on success and only if the caller asked.
+	 */
 	if (!ret && resp_out && resp_len) {
 		const u8 *r = c->resp_buf;
 		u16 have;
@@ -453,18 +552,22 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		dma_rmb();
 		have = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 		/*
-		 * Honour the response's own size. The device answers some commands with LESS than the
-		 * caller asked for — MUX_READ caps every reply at 28 entries (112 bytes) however large
-		 * a count is requested — and copying the full requested length then hands the caller
-		 * whatever the PREVIOUS command left in resp_buf: stale DMA content presented as device
-		 * data, and via the hwdep a kernel-memory disclosure. Zero-fill the tail so
-		 * a short reply is unmistakably short. size == 0 is left alone: not every command fills
-		 * the field, and a zero-length answer is judged by outcome (see the note above).
+		 * Honour the response's own size. The device answers some
+		 * commands with LESS than the caller asked for — MUX_READ
+		 * caps every reply at 28 entries (112 bytes) however large a
+		 * count is requested — and copying the full requested length
+		 * then hands the caller whatever the PREVIOUS command left in
+		 * resp_buf: stale DMA content presented as device data, and via
+		 * the hwdep a kernel-memory disclosure. Zero-fill the tail so a
+		 * short reply is unmistakably short. size == 0 is left alone:
+		 * not every command fills the field, and a zero-length answer
+		 * is judged by outcome (see the note above).
 		 */
 		if (have && have < resp_len) {
 			memcpy(resp_out, r + FCP_RESP_DATA_OFF, have);
 			memset(resp_out + have, 0, resp_len - have);
-			dev_dbg(&c->pci->dev, "op 0x%06x: short response %u < %u requested\n",
+			dev_dbg(&c->pci->dev,
+				"op 0x%06x: short response %u < %u requested\n",
 				opcode, have, resp_len);
 		} else {
 			memcpy(resp_out, r + FCP_RESP_DATA_OFF, resp_len);
@@ -476,13 +579,16 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 	}
 
 	/*
-	 * Advance the sequence number for a command the device answered as ours. One with no answer —
-	 * accepted but not landed, or not seen accepted at all (it may yet be, late) — is retired by the
-	 * next command (clarett_retire_lost(), which sets the sequence). Except a command not accepted
-	 * straight after a retire found nothing: the device is not answering, so don't make every later
-	 * command wait out a second deadline as well. Otherwise — another command's answer — start over
-	 * at 0: measured on a Clarett asked too early after power-up, re-asking as seq 1 stays refused
-	 * (err=3, stale echoed seq) indefinitely, re-asking as seq 0 is answered.
+	 * Advance the sequence number for a command the device answered as
+	 * ours. One with no answer — accepted but not landed, or not seen
+	 * accepted at all (it may yet be, late) — is retired by the next
+	 * command (clarett_retire_lost(), which sets the sequence). Except a
+	 * command not accepted straight after a retire found nothing: the
+	 * device is not answering, so don't make every later command wait out a
+	 * second deadline as well. Otherwise — another command's answer —
+	 * start over at 0: measured on a Clarett asked too early after
+	 * power-up, re-asking as seq 1 stays refused (err=3, stale echoed seq)
+	 * indefinitely, re-asking as seq 0 is answered.
 	 */
 	if (resp_echo && !c->mbox_wedged) {
 		c->seq++;
@@ -494,16 +600,23 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len,
 		c->seq = 0;
 	}
 
-	atomic_set(&c->cmd_inflight, 0);	/* completion window closed; idle-gap events may resume */
+	/* completion window closed; idle-gap events may resume */
+	atomic_set(&c->cmd_inflight, 0);
 
 	mutex_unlock(&c->mbox_lock);
 	return ret;
 }
 
-/* Read-to-clear the cause blocks between probe's readiness attempts, so each starts from a clean slate. */
+/*
+ * Read-to-clear the cause blocks between probe's readiness attempts, so each
+ * starts from a clean slate.
+ */
 void clarett_mbox_clear_causes(struct clarett *c)
 {
-	static const u16 causes[] = { REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0, REG_NOTIFY_CAUSE, 0x500 };
+	static const u16 causes[] = {
+		REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0,
+		REG_NOTIFY_CAUSE, 0x500
+	};
 	int i;
 
 	mutex_lock(&c->mbox_lock);
@@ -518,18 +631,26 @@ int clarett_fcp(struct clarett *c, u32 opcode, const u8 *data, u16 len)
 	return __clarett_fcp(c, opcode, data, len, NULL, 0, NULL, NULL);
 }
 
-/* hwdep FCP_IOCTL_CMD: run one command and return `resp_len` bytes of its response payload. */
+/*
+ * hwdep FCP_IOCTL_CMD: run one command and return `resp_len` bytes of its
+ * response payload.
+ */
 int clarett_fcp_cmd(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
 		    u8 *resp, u16 resp_len)
 {
-	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len, NULL, NULL);
+	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len,
+			     NULL, NULL);
 }
 
-/* As clarett_fcp_cmd(), also returning the response's size field and FCP status (on success only). */
+/*
+ * As clarett_fcp_cmd(), also returning the response's size field and FCP status
+ * (on success only).
+ */
 int clarett_fcp_read(struct clarett *c, u32 opcode, const u8 *req, u16 req_len,
 		     u8 *resp, u16 resp_len, u16 *size, u32 *status)
 {
-	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len, size, status);
+	return __clarett_fcp(c, opcode, req, req_len, resp, resp_len,
+			     size, status);
 }
 
 /* SET_DATA: write `len` bytes into the config space at `offset`. */
@@ -545,7 +666,10 @@ int clarett_set_data(struct clarett *c, u32 offset, u32 len, const u8 *val)
 	return clarett_fcp(c, FCP_SET_DATA, buf, 8 + len);
 }
 
-/* DATA_CMD: commit a preceding SET_DATA (activate == the control's command number). */
+/*
+ * DATA_CMD: commit a preceding SET_DATA (activate == the control's command
+ * number).
+ */
 int clarett_data_cmd(struct clarett *c, u32 activate)
 {
 	u8 buf[4];
@@ -555,14 +679,16 @@ int clarett_data_cmd(struct clarett *c, u32 activate)
 }
 
 /*
- * Schedule the debounced NVRAM commit (a single DATA_CMD{FCP_ACTIVATE_PERSIST}) so a config change
- * survives a power cycle — the device owns its state (upstream scarlett2 policy). mod_delayed_work
- * coalesces a burst (e.g. a slider drag) into one save CLARETT_SAVE_DELAY_MS after the LAST change.
- * Gated on ctl_ready: the probe-time monitor-enable write runs before the card is up and must NOT
- * commit flash on every load. Called both from the in-kernel write path below and from
- * the hwdep relay when fcp-server commits a config change (clarett_hwdep_cmd) — the device
- * auto-persists only some config (routing) and not the rest (output gains, S/PDIF source), so
- * without this the latter revert to the flash default on a power cycle.
+ * Schedule the debounced NVRAM commit (a single DATA_CMD{FCP_ACTIVATE_PERSIST})
+ * so a config change survives a power cycle — the device owns its state
+ * (upstream scarlett2 policy). mod_delayed_work coalesces a burst (e.g. a
+ * slider drag) into one save CLARETT_SAVE_DELAY_MS after the LAST change. Gated
+ * on ctl_ready: the probe-time monitor-enable write runs before the card is up
+ * and must NOT commit flash on every load. Called both from the in-kernel write
+ * path below and from the hwdep relay when fcp-server commits a config change
+ * (clarett_hwdep_cmd) — the device auto-persists only some config (routing)
+ * and not the rest (output gains, S/PDIF source), so without this the latter
+ * revert to the flash default on a power cycle.
  */
 void clarett_schedule_persist(struct clarett *c)
 {
@@ -571,10 +697,14 @@ void clarett_schedule_persist(struct clarett *c)
 				 msecs_to_jiffies(CLARETT_SAVE_DELAY_MS));
 }
 
-/* Convenience: write a single config byte and commit it. The commit (DATA_CMD{activate})
- * applies the change live but RAM-only — it is NOT persisted across a power cycle. Persistence
- * is a separate DATA_CMD{FCP_ACTIVATE_PERSIST} (command 5), scheduled here on a debounce. */
-static int __clarett_write_u8(struct clarett *c, u32 offset, u8 val, u32 activate, bool save)
+/*
+ * Convenience: write a single config byte and commit it. The commit
+ * (DATA_CMD{activate}) applies the change live but RAM-only — it is NOT
+ * persisted across a power cycle. Persistence is a separate
+ * DATA_CMD{FCP_ACTIVATE_PERSIST} (command 5), scheduled here on a debounce.
+ */
+static int __clarett_write_u8(struct clarett *c, u32 offset, u8 val,
+			      u32 activate, bool save)
 {
 	int err;
 
@@ -589,10 +719,14 @@ static int __clarett_write_u8(struct clarett *c, u32 offset, u8 val, u32 activat
 		return err;
 
 	c->shadow[offset] = val;
-	set_bit(offset, c->shadow_known);	/* write-through: the shadow now matches hardware */
+	/* write-through: the shadow now matches hardware */
+	set_bit(offset, c->shadow_known);
 
-	/* Persist to the device's NVRAM on a debounce so the change survives a power cycle (device owns
-	 * the state); nosave writes are mirrors, not user intent, and skip it. See the helper. */
+	/*
+	 * Persist to the device's NVRAM on a debounce so the change survives a
+	 * power cycle (device owns the state); nosave writes are mirrors, not
+	 * user intent, and skip it. See the helper.
+	 */
 	if (save)
 		clarett_schedule_persist(c);
 	return 0;
@@ -604,9 +738,10 @@ int clarett_write_u8(struct clarett *c, u32 offset, u8 val, u32 activate)
 }
 
 /*
- * As clarett_write_u8, but does NOT schedule the NVRAM save. For bytes the driver maintains as a
- * MIRROR of some other state rather than at the user's request — currently the SW gains of outputs
- * under hardware control (clarett_hw_gain_follow), which retrack the front-panel knob and would
+ * As clarett_write_u8, but does NOT schedule the NVRAM save. For bytes the
+ * driver maintains as a MIRROR of some other state rather than at the user's
+ * request — currently the SW gains of outputs under hardware control
+ * (clarett_hw_gain_follow), which retrack the front-panel knob and would
  * otherwise commit the device's flash on every movement of it.
  */
 int clarett_write_u8_nosave(struct clarett *c, u32 offset, u8 val, u32 activate)
@@ -614,10 +749,14 @@ int clarett_write_u8_nosave(struct clarett *c, u32 offset, u8 val, u32 activate)
 	return __clarett_write_u8(c, offset, val, activate, false);
 }
 
-/* Read-modify-write the `mask` bits of a shared config byte to the value in `val`, then commit.
- * Used for the command-3 enable bytes (72/73) that pack one bit per output: the shadow MUST have
- * been seeded from the device first (clarett_seed_shadow) so the other outputs' bits survive. */
-int clarett_write_bits(struct clarett *c, u32 offset, u8 mask, u8 val, u32 activate)
+/*
+ * Read-modify-write the `mask` bits of a shared config byte to the value in
+ * `val`, then commit. Used for the command-3 enable bytes (72/73) that pack one
+ * bit per output: the shadow MUST have been seeded from the device first
+ * (clarett_seed_shadow) so the other outputs' bits survive.
+ */
+int clarett_write_bits(struct clarett *c, u32 offset, u8 mask, u8 val,
+		       u32 activate)
 {
 	u8 updated;
 
