@@ -641,6 +641,11 @@ static void clarett_play_fill(struct clarett *c)
 		WRITE_ONCE(c->tx_silence, false);
 		clarett_zero_tx(c);
 	}
+	/*
+	 * Pairs with the smp_store_release() in clarett_pcm_trigger(): once
+	 * the stream is seen running, the play_base it was anchored at is
+	 * visible too.
+	 */
 	if (!smp_load_acquire(&c->play_running))
 		return;
 
@@ -1215,9 +1220,8 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 	e_commit = clarett_fcp(c, FCP_SYNC_RATE, NULL, 0);
 
 	dev_dbg(&c->pci->dev,
-		 "stream-handshake: SET_CLOCK{%u,%u}=%d 0x6004=%d 0x6002=%d 0x6005=%d\n",
-		 rate, clk_src, e_clk,
-		 e_en1, e_en2, e_commit);
+		"stream-handshake: SET_CLOCK{%u,%u}=%d 0x6004=%d 0x6002=%d 0x6005=%d\n",
+		rate, clk_src, e_clk, e_en1, e_en2, e_commit);
 }
 
 /*
@@ -1519,10 +1523,10 @@ static void clarett_build_rings(struct clarett *c)
 	rx_tbl[CLARETT_STREAM_NDESC - 1] |= cpu_to_le64(CLARETT_DESC_WRAP_RX);
 
 	dev_dbg(&c->pci->dev,
-		 "descriptor rings: %u entries, tx audio=0x%x slot=0x%x, rx audio=0x%x slot=0x%x, RX IRQ every %u desc (%u frames/period)\n",
-		 CLARETT_STREAM_NDESC, tx_frag, tx_slot,
-		 clarett_frag_bytes(c->model->capture_channels), rx_slot,
-		 clarett_irq_descs(c), clarett_irq_period_frames(c));
+		"descriptor rings: %u entries, tx audio=0x%x slot=0x%x, rx audio=0x%x slot=0x%x, RX IRQ every %u desc (%u frames/period)\n",
+		CLARETT_STREAM_NDESC, tx_frag, tx_slot,
+		clarett_frag_bytes(c->model->capture_channels), rx_slot,
+		clarett_irq_descs(c), clarett_irq_period_frames(c));
 }
 
 int clarett_create_pcm(struct clarett *c)
@@ -1569,10 +1573,9 @@ int clarett_create_pcm(struct clarett *c)
 	 * registered and how wide it is; this adds the ring/buffer detail.
 	 */
 	dev_dbg(&c->pci->dev,
-		 "PCM registered (playback %uch / capture %uch, S32_LE @%u, bufs tx=%zu rx=%zu B @%pad)\n",
-		 c->model->playback_channels, c->model->capture_channels,
-		 CLARETT_PCM_RATE,
-		 txbuf, rxbuf, &c->stream_dma);
+		"PCM registered (playback %uch / capture %uch, S32_LE @%u, bufs tx=%zu rx=%zu B @%pad)\n",
+		c->model->playback_channels, c->model->capture_channels,
+		CLARETT_PCM_RATE, txbuf, rxbuf, &c->stream_dma);
 
 	return 0;
 }

@@ -345,6 +345,71 @@ static int clarett_hwdep_validate_map(const s16 *map, int map_size, int slots)
 }
 
 /*
+ * First meter map: allocate the map and level buffers and publish the Level
+ * Meter controls, CLARETT_METER_MAX_CHANNELS channels per part. Caller holds
+ * hwdep_lock.
+ */
+static int clarett_hwdep_meter_create(struct clarett *c, const s16 *tmp,
+				      u16 map_size, u16 meter_slots)
+{
+	int parts = DIV_ROUND_UP(map_size, CLARETT_METER_MAX_CHANNELS);
+	s16 *new_map = devm_kmalloc_array(&c->pci->dev, map_size,
+					  sizeof(s16), GFP_KERNEL);
+	__le32 *levels = devm_kmalloc_array(&c->pci->dev, meter_slots,
+					    sizeof(__le32), GFP_KERNEL);
+	int err = 0;
+
+	if (!new_map || !levels) {
+		devm_kfree(&c->pci->dev, levels);	/* NULL-safe */
+		devm_kfree(&c->pci->dev, new_map);
+		return -ENOMEM;
+	}
+	/* info() reads the geometry, so set it before adding the controls */
+	c->hwdep_meter_channels = map_size;
+	c->hwdep_n_meter_slots = meter_slots;
+	c->hwdep_meter_map = new_map;
+	c->hwdep_meter_levels = levels;
+	memcpy(c->hwdep_meter_map, tmp, map_size * sizeof(s16));
+	while (c->hwdep_meter_parts < parts) {
+		int p = c->hwdep_meter_parts;
+		struct snd_kcontrol *kctl;
+
+		kctl = snd_ctl_new1(&clarett_hwdep_meter_tmpl, c);
+		if (!kctl) {
+			err = -ENOMEM;
+			break;
+		}
+		kctl->id.index = p;
+		kctl->private_value = p;
+		/* frees kctl on failure */
+		err = snd_ctl_add(c->card, kctl);
+		if (err)
+			break;
+		c->hwdep_meter_ctl[p] = kctl;
+		c->hwdep_meter_parts++;
+	}
+	/*
+	 * A later part failing leaves the earlier ones working: they are
+	 * already published and stay correct, so only the channels past them
+	 * go unmetered. Only a failure on part 0 is fatal.
+	 */
+	if (err && c->hwdep_meter_parts) {
+		int made = c->hwdep_meter_parts;
+
+		dev_warn(&c->pci->dev,
+			 "Level Meter part %d not created (%d); channels from %d unmetered\n",
+			 made, err, clarett_hwdep_meter_part_first(made));
+		err = 0;
+	} else if (err) {
+		c->hwdep_meter_map = NULL;
+		c->hwdep_meter_levels = NULL;
+		devm_kfree(&c->pci->dev, levels);
+		devm_kfree(&c->pci->dev, new_map);
+	}
+	return err;
+}
+
+/*
  * FCP_IOCTL_SET_METER_MAP: install the channel->slot map, creating the controls
  * on first call.
  */
@@ -406,67 +471,8 @@ static int clarett_hwdep_set_meter_map(struct clarett *c,
 		goto out_unlock;
 	}
 	if (!c->hwdep_meter_parts) {
-		int parts = DIV_ROUND_UP(map.map_size,
-					 CLARETT_METER_MAX_CHANNELS);
-		s16 *new_map = devm_kmalloc_array(&c->pci->dev, map.map_size,
-						  sizeof(s16), GFP_KERNEL);
-		__le32 *levels = devm_kmalloc_array(&c->pci->dev,
-						    map.meter_slots,
-						    sizeof(__le32), GFP_KERNEL);
-
-		if (!new_map || !levels) {
-			devm_kfree(&c->pci->dev, levels);	/* NULL-safe */
-			devm_kfree(&c->pci->dev, new_map);
-			err = -ENOMEM;
-			goto out_unlock;
-		}
-		/*
-		 * Geometry must be visible before the controls are added
-		 * (info() reads it).
-		 */
-		c->hwdep_meter_channels = map.map_size;
-		c->hwdep_n_meter_slots = map.meter_slots;
-		c->hwdep_meter_map = new_map;
-		c->hwdep_meter_levels = levels;
-		memcpy(c->hwdep_meter_map, tmp, map.map_size * sizeof(s16));
-		while (c->hwdep_meter_parts < parts) {
-			int p = c->hwdep_meter_parts;
-			struct snd_kcontrol *kctl;
-
-			kctl = snd_ctl_new1(&clarett_hwdep_meter_tmpl, c);
-
-			if (!kctl) {
-				err = -ENOMEM;
-				break;
-			}
-			kctl->id.index = p;
-			kctl->private_value = p;
-			/* frees kctl on failure */
-			err = snd_ctl_add(c->card, kctl);
-			if (err)
-				break;
-			c->hwdep_meter_ctl[p] = kctl;
-			c->hwdep_meter_parts++;
-		}
-		/*
-		 * A later part failing leaves the earlier ones working: they
-		 * are already published and stay correct, so only the channels
-		 * past them go unmetered. Only a failure on part 0 is fatal.
-		 */
-		if (err && c->hwdep_meter_parts) {
-			int made = c->hwdep_meter_parts;
-
-			dev_warn(&c->pci->dev,
-				 "Level Meter part %d not created (%d); channels from %d unmetered\n",
-				 made, err,
-				 clarett_hwdep_meter_part_first(made));
-			err = 0;
-		} else if (err) {
-			c->hwdep_meter_map = NULL;
-			c->hwdep_meter_levels = NULL;
-			devm_kfree(&c->pci->dev, levels);
-			devm_kfree(&c->pci->dev, new_map);
-		}
+		err = clarett_hwdep_meter_create(c, tmp, map.map_size,
+						 map.meter_slots);
 		goto out_unlock;
 	} else if (map.map_size != c->hwdep_meter_channels ||
 		   map.meter_slots != c->hwdep_n_meter_slots) {

@@ -672,6 +672,7 @@ struct clarett {
 	 */
 	char serial[CLARETT_SERIAL_LEN];
 	int serial_state;
+	/* one flash read at a time; guards serial and serial_state */
 	struct mutex serial_lock;
 
 	/*
