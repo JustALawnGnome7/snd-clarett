@@ -615,6 +615,48 @@ static u32 clarett_play_guard(u32 abuf)
 	return clamp_t(u32, READ_ONCE(tx_guard), CLARETT_FRAG_FRAMES, abuf / 2);
 }
 
+/*
+ * First fill after START. If the engine has already reached the guard window of
+ * frame 0 — START landed just before a period event and the servicer only got
+ * here after it — frame 0 can no longer be written in time. Push the anchor
+ * on by whole periods (staying on an event boundary) while .pointer still
+ * reports 0, so hw_ptr never steps backwards. Rare, and it costs one period of
+ * start latency instead of the stream's first frames.
+ */
+static void clarett_play_prime(struct clarett *c,
+			       struct snd_pcm_substream *ps, u32 guard)
+{
+	if (c->play_primed)
+		return;
+	c->play_primed = true;
+	while (c->pcm_frames <= c->play_base &&
+	       c->pcm_frames + guard > c->play_base)
+		WRITE_ONCE(c->play_base,
+			   c->play_base + ps->runtime->period_size);
+}
+
+/*
+ * How many frames the app has written past engine frame `from` (its appl_ptr
+ * distance), or 0 if it is behind the engine (underrun).
+ */
+static snd_pcm_uframes_t clarett_play_ahead(struct clarett *c,
+					    struct snd_pcm_substream *ps,
+					    u64 from, u32 abuf)
+{
+	snd_pcm_uframes_t boundary = ps->runtime->boundary;
+	snd_pcm_uframes_t appl = READ_ONCE(ps->runtime->control->appl_ptr);
+	u64 spos;
+	snd_pcm_uframes_t ahead;
+
+	/* this stream's frame at `from` */
+	div64_u64_rem(from - c->play_base, boundary, &spos);
+	ahead = appl >= spos ? appl - spos : appl + boundary - spos;
+	/* the app is behind the engine (underrun): nothing to copy */
+	if (ahead > abuf)
+		ahead = 0;
+	return ahead;
+}
+
 static void clarett_play_fill(struct clarett *c)
 {
 	struct snd_pcm_substream *ps = c->pcm_play_sub;
@@ -656,6 +698,8 @@ static void clarett_play_fill(struct clarett *c)
 	if (ring <= guard)
 		return;
 
+	clarett_play_prime(c, ps, guard);
+
 	/*
 	 * The whole runway, from the guard to just behind the read position —
 	 * but only as far as the app has actually written (appl_ptr); the rest
@@ -665,23 +709,6 @@ static void clarett_play_fill(struct clarett *c)
 	 * buffer later. Right after START the anchor lies ahead of the runway's
 	 * start; begin there, leaving the frames before frame 0 silent.
 	 */
-	/*
-	 * First fill after START. If the engine has already reached the guard
-	 * window of frame 0 — START landed just before a period event and the
-	 * servicer only got here after it — frame 0 can no longer be written
-	 * in time. Push the anchor on by whole periods (staying on an event
-	 * boundary) while .pointer still reports 0, so hw_ptr never steps
-	 * backwards. Rare, and it costs one period of start latency instead of
-	 * the stream's first frames.
-	 */
-	if (!c->play_primed) {
-		c->play_primed = true;
-		while (c->pcm_frames <= c->play_base &&
-		       c->pcm_frames + guard > c->play_base)
-			WRITE_ONCE(c->play_base,
-				   c->play_base + ps->runtime->period_size);
-	}
-
 	from = c->pcm_frames + guard;
 	n = ring - guard;
 	if (c->play_base > from) {
@@ -692,21 +719,7 @@ static void clarett_play_fill(struct clarett *c)
 		from = c->play_base;
 		n -= lead;
 	}
-	{
-		snd_pcm_uframes_t boundary = ps->runtime->boundary;
-		snd_pcm_uframes_t appl =
-			READ_ONCE(ps->runtime->control->appl_ptr);
-		u64 spos;
-		snd_pcm_uframes_t ahead;
-
-		/* this stream's frame at `from` */
-		div64_u64_rem(from - c->play_base, boundary, &spos);
-		ahead = appl >= spos ? appl - spos : appl + boundary - spos;
-		/* the app is behind the engine (underrun): nothing to copy */
-		if (ahead > abuf)
-			ahead = 0;
-		written = min_t(u32, n, ahead);
-	}
+	written = min_t(u32, n, clarett_play_ahead(c, ps, from, abuf));
 	q = from;
 	aq = from - c->play_base;
 	/* hardware ring position */
@@ -732,6 +745,50 @@ void clarett_pcm_tx_refill(struct clarett *c)
 	mutex_lock(&c->pcm_lock);
 	clarett_play_fill(c);
 	mutex_unlock(&c->pcm_lock);
+}
+
+/*
+ * Capture drain: the add_frames the engine just wrote, from the current ring
+ * position (slot-aware) to the matching position in the stream's own ALSA
+ * buffer (offset by where it attached).
+ *
+ * Clamped to the ALSA buffer rather than the ring, and skipped forward to the
+ * newest n frames. The app has lost the rest either way (ALSA will xrun on the
+ * hw_ptr jump), but it must be handed the most recent audio, not the oldest.
+ * Reachable in normal operation: a ~40 ms platform stall advances the engine
+ * ~2000 frames, far past a small buffer.
+ */
+static void clarett_cap_drain(struct clarett *c, struct snd_pcm_substream *cs,
+			      u32 add_frames)
+{
+	u32 frame = (u32)c->model->capture_channels * 4;
+	u32 ring  = clarett_rx_ring_bytes(c) / frame;
+	/* <= ring, and divides it */
+	u32 abuf  = cs->runtime->buffer_size;
+	u32 n     = min(add_frames, abuf);
+	/* lag longer than the buffer: keep the NEWEST n */
+	u32 skip  = add_frames - n;
+	u64 q = c->pcm_frames + skip;
+	u64 aq = c->pcm_frames + skip - c->pcm_base;
+	u32 pos = do_div(q, ring);
+	u32 apos = do_div(aq, abuf);
+
+	clarett_rx_drain(c, cs->runtime->dma_area, apos, pos, n, abuf);
+}
+
+/*
+ * Whether a stream `frames` into its own clock has entered a new period since
+ * *last; records the new period index if so.
+ */
+static bool clarett_period_crossed(u64 frames, snd_pcm_uframes_t period_size,
+				   u64 *last)
+{
+	u64 period = div_u64(frames, period_size);
+
+	if (period == *last)
+		return false;
+	*last = period;
+	return true;
 }
 
 /*
@@ -767,34 +824,8 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 	cs = c->pcm_sub;
 	ps = c->pcm_play_sub;
 
-	/*
-	 * Capture drain: the add_frames the engine just wrote, from the current
-	 * ring position (slot-aware) to the matching position in the stream's
-	 * own ALSA buffer (offset by where it attached).
-	 */
-	if (cs && cs->runtime->dma_area) {
-		u32 frame = (u32)c->model->capture_channels * 4;
-		u32 ring  = clarett_rx_ring_bytes(c) / frame;
-		/* <= ring, and divides it */
-		u32 abuf  = cs->runtime->buffer_size;
-		u32 n     = min(add_frames, abuf);
-		/* lag longer than the buffer: keep the NEWEST n */
-		u32 skip  = add_frames - n;
-		u64 q = c->pcm_frames + skip;
-		u64 aq = c->pcm_frames + skip - c->pcm_base;
-		u32 pos = do_div(q, ring);
-		u32 apos = do_div(aq, abuf);
-
-		/*
-		 * Clamped to the ALSA buffer rather than the ring, and skipped
-		 * forward to the newest n frames. The app has lost the rest
-		 * either way (ALSA will xrun on the hw_ptr jump), but it must
-		 * be handed the most recent audio, not the oldest. Reachable in
-		 * normal operation: a ~40 ms platform stall advances the engine
-		 * ~2000 frames, far past a small buffer.
-		 */
-		clarett_rx_drain(c, cs->runtime->dma_area, apos, pos, n, abuf);
-	}
+	if (cs && cs->runtime->dma_area)
+		clarett_cap_drain(c, cs, add_frames);
 
 	c->pcm_frames += add_frames;
 
@@ -810,24 +841,16 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 	 * *_running gates). Period indices are counted on each direction's own
 	 * clock (pcm_frames - base), matching what .pointer reports.
 	 */
-	if (cs && READ_ONCE(c->pcm_running)) {
-		u64 period = div_u64(c->pcm_frames - c->pcm_base,
-				     cs->runtime->period_size);
-
-		if (period != c->pcm_last_period) {
-			c->pcm_last_period = period;
-			cap_elapsed = true;
-		}
-	}
-	if (ps && READ_ONCE(c->play_running) && c->pcm_frames >= c->play_base) {
-		u64 period = div_u64(c->pcm_frames - c->play_base,
-				     ps->runtime->period_size);
-
-		if (period != c->play_last_period) {
-			c->play_last_period = period;
-			play_elapsed = true;
-		}
-	}
+	if (cs && READ_ONCE(c->pcm_running))
+		cap_elapsed =
+			clarett_period_crossed(c->pcm_frames - c->pcm_base,
+					       cs->runtime->period_size,
+					       &c->pcm_last_period);
+	if (ps && READ_ONCE(c->play_running) && c->pcm_frames >= c->play_base)
+		play_elapsed =
+			clarett_period_crossed(c->pcm_frames - c->play_base,
+					       ps->runtime->period_size,
+					       &c->play_last_period);
 
 	mutex_unlock(&c->pcm_lock);
 
@@ -982,57 +1005,17 @@ static unsigned int clarett_rate_caps(struct clarett *c, unsigned int *rmin,
 	return rates;
 }
 
-static int clarett_pcm_open(struct snd_pcm_substream *ss)
+/*
+ * The hw constraints and rules of an open substream, on top of the limits
+ * clarett_pcm_open() put in runtime->hw. frame is the substream's frame stride
+ * in bytes, buf its buffer ceiling.
+ */
+static int clarett_pcm_constrain(struct snd_pcm_substream *ss, u32 frame,
+				 size_t buf)
 {
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	struct snd_pcm_runtime *runtime = ss->runtime;
-	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
-	u8 chans   = play ? c->model->playback_channels :
-			    c->model->capture_channels;
-	u32 frame  = (u32)chans * 4;
-	/*
-	 * Both directions get the SHORTER ring's ceiling. A Red's playback ring
-	 * is half its capture ring (2048 frames against 4096), so their
-	 * defaults differed (aplay 512/2048, arecord 1024/4096), and when two
-	 * clients configured in the same instant the second's hw_params failed
-	 * the period lock pinned by the first. With one ceiling the defaults
-	 * agree. No change where the rings match.
-	 */
-	u32 tx_frame = (u32)c->model->playback_channels * 4;
-	u32 rx_frame = (u32)c->model->capture_channels * 4;
-	u32 ring_frames = min_t(u32, clarett_tx_ring_bytes(c) / tx_frame,
-				clarett_rx_ring_bytes(c) / rx_frame);
-	size_t buf = (size_t)ring_frames * frame;
-	/*
-	 * Minimum period: the finest cadence (CLARETT_DYN_MIN_FRAMES); the
-	 * marker cadence follows whatever period the app picks
-	 * (clarett_pcm_prepare). The BUFFER is any power-of-two fraction of the
-	 * ring, which is what keeps ALSA frame k and ring frame k wrapping
-	 * together.
-	 */
-	u32 min_period = CLARETT_DYN_MIN_FRAMES * frame;
 	int err;
-
-	runtime->hw = clarett_pcm_hw;
-	if (play)
-		/* .ack must see every appl_ptr move */
-		runtime->hw.info |= SNDRV_PCM_INFO_SYNC_APPLPTR;
-	runtime->hw.rates           =
-		clarett_rate_caps(c, &runtime->hw.rate_min,
-				  &runtime->hw.rate_max);
-	runtime->hw.channels_min     = chans;
-	runtime->hw.channels_max     = chans;
-	/*
-	 * Ceiling: the ring, unless max_buffer lowers it. What an app that pins
-	 * only the period actually receives is bounded lower still, by the
-	 * period rule registered below (CLARETT_MAX_PERIODS).
-	 */
-	buf = (size_t)clarett_buffer_max_frames(buf / frame) * frame;
-
-	runtime->hw.buffer_bytes_max = buf;
-	runtime->hw.period_bytes_min = min_period;
-	runtime->hw.period_bytes_max = buf / 2;	/* periods_min = 2 */
-	runtime->hw.periods_max      = buf / min_period;
 
 	/* Lock both directions to one rate. */
 	err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
@@ -1088,6 +1071,60 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 	return snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
 				   clarett_rule_lock_period, c,
 				   SNDRV_PCM_HW_PARAM_PERIOD_SIZE, -1);
+}
+
+static int clarett_pcm_open(struct snd_pcm_substream *ss)
+{
+	struct clarett *c = snd_pcm_substream_chip(ss);
+	struct snd_pcm_runtime *runtime = ss->runtime;
+	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
+	u8 chans   = play ? c->model->playback_channels :
+			    c->model->capture_channels;
+	u32 frame  = (u32)chans * 4;
+	/*
+	 * Both directions get the SHORTER ring's ceiling. A Red's playback ring
+	 * is half its capture ring (2048 frames against 4096), so their
+	 * defaults differed (aplay 512/2048, arecord 1024/4096), and when two
+	 * clients configured in the same instant the second's hw_params failed
+	 * the period lock pinned by the first. With one ceiling the defaults
+	 * agree. No change where the rings match.
+	 */
+	u32 tx_frame = (u32)c->model->playback_channels * 4;
+	u32 rx_frame = (u32)c->model->capture_channels * 4;
+	u32 ring_frames = min_t(u32, clarett_tx_ring_bytes(c) / tx_frame,
+				clarett_rx_ring_bytes(c) / rx_frame);
+	size_t buf = (size_t)ring_frames * frame;
+	/*
+	 * Minimum period: the finest cadence (CLARETT_DYN_MIN_FRAMES); the
+	 * marker cadence follows whatever period the app picks
+	 * (clarett_pcm_prepare). The BUFFER is any power-of-two fraction of the
+	 * ring, which is what keeps ALSA frame k and ring frame k wrapping
+	 * together.
+	 */
+	u32 min_period = CLARETT_DYN_MIN_FRAMES * frame;
+
+	runtime->hw = clarett_pcm_hw;
+	if (play)
+		/* .ack must see every appl_ptr move */
+		runtime->hw.info |= SNDRV_PCM_INFO_SYNC_APPLPTR;
+	runtime->hw.rates           =
+		clarett_rate_caps(c, &runtime->hw.rate_min,
+				  &runtime->hw.rate_max);
+	runtime->hw.channels_min     = chans;
+	runtime->hw.channels_max     = chans;
+	/*
+	 * Ceiling: the ring, unless max_buffer lowers it. What an app that pins
+	 * only the period actually receives is bounded lower still, by the
+	 * period rule clarett_pcm_constrain() adds (CLARETT_MAX_PERIODS).
+	 */
+	buf = (size_t)clarett_buffer_max_frames(buf / frame) * frame;
+
+	runtime->hw.buffer_bytes_max = buf;
+	runtime->hw.period_bytes_min = min_period;
+	runtime->hw.period_bytes_max = buf / 2;	/* periods_min = 2 */
+	runtime->hw.periods_max      = buf / min_period;
+
+	return clarett_pcm_constrain(ss, frame, buf);
 }
 
 /*
@@ -1225,28 +1262,14 @@ static void clarett_stream_handshake(struct clarett *c, unsigned int rate)
 }
 
 /*
- * Prepare a direction and, if the shared full-duplex engine is not already
- * running (the other direction armed it), arm it. The engine is ONE full-duplex
- * stream (block 0 = TX/playback, block 1 = RX/capture) with a single frame
- * clock; whichever direction prepares first arms it and the other just attaches
- * at the current clock position. Re-preparing an already-armed direction (xrun
- * recovery) does not re-arm — the free-running engine is undisturbed. Process
- * context, so the mailbox handshake is safe here.
- *
- * Either way the direction records its attach point in the shared clock. ALSA
- * resets hw_ptr to 0 on every prepare, so .pointer must report from there;
- * without the base, a stream attaching to an already-running engine (a second
- * direction, or the SAME one recovering from an xrun) would see its first
- * .pointer return the engine's absolute position mod buffer_size — an
- * enormous hw_ptr jump that the core xruns within a tick, re-prepares, and
- * xruns again.
+ * Attach the substream to the shared engine clock, and claim the arm if it is
+ * the first direction in (*arm). Fails if the engine already runs at another
+ * rate.
  */
-static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
+static int clarett_pcm_attach(struct clarett *c, struct snd_pcm_substream *ss,
+			      bool *arm)
 {
-	struct clarett *c = snd_pcm_substream_chip(ss);
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
-	bool arm;
-	dma_addr_t r0, r1;
 	u32 other;
 
 	mutex_lock(&c->pcm_lock);
@@ -1264,8 +1287,8 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 			other);
 		return -EINVAL;
 	}
-	arm = !c->stream_on;
-	if (arm) {
+	*arm = !c->stream_on;
+	if (*arm) {
 		/*
 		 * CLAIM THE ARM UNDER THE LOCK. clarett_engine_arm() runs ~20
 		 * mailbox commands (the stream handshake) before the engine is
@@ -1298,16 +1321,16 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 		WRITE_ONCE(c->pcm_running, false);
 	}
 	mutex_unlock(&c->pcm_lock);
+	return 0;
+}
 
-	/*
-	 * Latch this rate's live capture width so the drain blanks the
-	 * S/MUX-removed tail.
-	 */
-	if (!play)
-		clarett_set_rx_live(c, ss->runtime->rate);
-
-	if (!arm) /* engine already armed: just attached at the current clock */
-		return 0;
+/*
+ * First direction in: size the RX marker cadence to the period, then run the
+ * stream handshake, arm the engine and start its servicer.
+ */
+static void clarett_pcm_arm(struct clarett *c, unsigned int rate)
+{
+	dma_addr_t r0, r1;
 
 	/*
 	 * Match the RX marker cadence to the negotiated (shared) period before
@@ -1342,7 +1365,7 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 	 * Stream-config handshake immediately before arming (handshake ->
 	 * program regs -> arm).
 	 */
-	clarett_stream_handshake(c, ss->runtime->rate);
+	clarett_stream_handshake(c, rate);
 	clarett_engine_arm(c, r0, r1);
 
 	/*
@@ -1353,6 +1376,47 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 	 */
 	WRITE_ONCE(c->stream_run, true);
 	clarett_engine_run(c);
+}
+
+/*
+ * Prepare a direction and, if the shared full-duplex engine is not already
+ * running (the other direction armed it), arm it. The engine is ONE full-duplex
+ * stream (block 0 = TX/playback, block 1 = RX/capture) with a single frame
+ * clock; whichever direction prepares first arms it and the other just attaches
+ * at the current clock position. Re-preparing an already-armed direction (xrun
+ * recovery) does not re-arm — the free-running engine is undisturbed. Process
+ * context, so the mailbox handshake is safe here.
+ *
+ * Either way the direction records its attach point in the shared clock. ALSA
+ * resets hw_ptr to 0 on every prepare, so .pointer must report from there;
+ * without the base, a stream attaching to an already-running engine (a second
+ * direction, or the SAME one recovering from an xrun) would see its first
+ * .pointer return the engine's absolute position mod buffer_size — an
+ * enormous hw_ptr jump that the core xruns within a tick, re-prepares, and
+ * xruns again.
+ */
+static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
+{
+	struct clarett *c = snd_pcm_substream_chip(ss);
+	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
+	bool arm;
+	int err;
+
+	err = clarett_pcm_attach(c, ss, &arm);
+	if (err)
+		return err;
+
+	/*
+	 * Latch this rate's live capture width so the drain blanks the
+	 * S/MUX-removed tail.
+	 */
+	if (!play)
+		clarett_set_rx_live(c, ss->runtime->rate);
+
+	if (!arm) /* engine already armed: just attached at the current clock */
+		return 0;
+
+	clarett_pcm_arm(c, ss->runtime->rate);
 	return 0;
 }
 

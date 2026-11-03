@@ -131,6 +131,38 @@ static u32 clarett_svc_read_causes(struct clarett *c,
 	return c2;
 }
 
+/* The window's timing: the gap since the last event, and the worst step. */
+static void clarett_svc_timing(struct clarett *c, struct clarett_svc_stats *st,
+			       u32 step)
+{
+	ktime_t now = ktime_get();
+	u64 gap = ktime_to_us(ktime_sub(now, st->last_ev));
+
+	st->last_ev = now;
+	if (gap > st->gap_max_us)
+		st->gap_max_us = gap;
+	if (gap > clarett_tick_late_us(c))
+		st->gap_late++;
+	if (step > st->step_max)
+		st->step_max = step;
+}
+
+/* tx_trace: the engine's ring pointers beside the fill clock. */
+static void clarett_svc_tx_trace(struct clarett *c, u32 ctr, u32 step)
+{
+	void __iomem *bar = c->bar0;
+	/* 0x218 engine TX read pos */
+	u32 txptr = readl(bar + STREAM_BLK0 + STREAM_OFF_PTR);
+	/* 0x318 engine RX write pos */
+	u32 rxptr = readl(bar + STREAM_BLK1 + STREAM_OFF_PTR);
+
+	dev_info(&c->pci->dev,
+		 "tx-trace[%d]: ctr=0x%x step=%u frames=%u | TXptr=0x%08x RXptr=0x%08x | fill=pcm_frames=%llu\n",
+		 atomic_read(&c->stream_periods), ctr, step,
+		 step * CLARETT_CTR_FRAMES, txptr, rxptr,
+		 (unsigned long long)c->pcm_frames);
+}
+
 /*
  * One 0x300 period event: advance the frame clock by the counter delta and
  * run the PCM tick. Returns false if the sample was rejected, in which case
@@ -139,10 +171,7 @@ static u32 clarett_svc_read_causes(struct clarett *c,
 static bool clarett_svc_event(struct clarett *c, u32 c2,
 			      struct clarett_svc_stats *st)
 {
-	void __iomem *bar = c->bar0;
 	u32 ctr = c2 & CLARETT_CTR_MASK;
-	ktime_t now;
-	u64 gap;
 	u32 step;
 
 	/*
@@ -192,29 +221,10 @@ static bool clarett_svc_event(struct clarett *c, u32 c2,
 	c->stream_ctr = ctr;
 	st->seen = true;
 
-	now = ktime_get();
-	gap = ktime_to_us(ktime_sub(now, st->last_ev));
-	st->last_ev = now;
-	if (gap > st->gap_max_us)
-		st->gap_max_us = gap;
-	if (gap > clarett_tick_late_us(c))
-		st->gap_late++;
-	if (step > st->step_max)
-		st->step_max = step;
-
+	clarett_svc_timing(c, st, step);
 	if (tx_trace > 0 &&
-	    (atomic_read(&c->stream_periods) % tx_trace) == 0) {
-		/* 0x218 engine TX read pos */
-		u32 txptr = readl(bar + STREAM_BLK0 + STREAM_OFF_PTR);
-		/* 0x318 engine RX write pos */
-		u32 rxptr = readl(bar + STREAM_BLK1 + STREAM_OFF_PTR);
-
-		dev_info(&c->pci->dev,
-			 "tx-trace[%d]: ctr=0x%x step=%u frames=%u | TXptr=0x%08x RXptr=0x%08x | fill=pcm_frames=%llu\n",
-			 atomic_read(&c->stream_periods), ctr, step,
-			 step * CLARETT_CTR_FRAMES, txptr, rxptr,
-			 (unsigned long long)c->pcm_frames);
-	}
+	    (atomic_read(&c->stream_periods) % tx_trace) == 0)
+		clarett_svc_tx_trace(c, ctr, step);
 
 	atomic_inc(&c->stream_periods);
 	/* advance by real captured frames (no-op if idle) */
@@ -268,10 +278,33 @@ static void clarett_svc_window(struct clarett *c, struct clarett_svc_stats *st)
 	st->step_max = 0;
 }
 
+/*
+ * One summary per stream, same default-quiet rule as the window line: at info
+ * only if the run had anything wrong with it, so a clean session leaves the log
+ * untouched from arm to teardown. PTR tells whether the engine walked the
+ * descriptor table at all.
+ */
+static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
+{
+	void __iomem *bar = c->bar0;
+
+	/* fold the final (partial) window in before summarising */
+	clarett_svc_fold(st);
+
+	clarett_svc_log(c, st->run_late || st->bad_reads || st->overruns,
+			"stream-svc: stopped (periods=%d ctr=0x%x wraps=%u ptr0=0x%x ptr1=0x%x; "
+			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u)\n",
+			atomic_read(&c->stream_periods), c->stream_ctr,
+			st->wraps, readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
+			readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
+			st->run_gap_max_us, st->run_read_us_max, st->run_late,
+			st->run_step_max, st->bad_reads, st->bad_or,
+			st->overruns);
+}
+
 static int clarett_stream_service(void *data)
 {
 	struct clarett *c = data;
-	void __iomem *bar = c->bar0;
 	unsigned long next_log = jiffies + msecs_to_jiffies(2000);
 	struct clarett_svc_stats st = { .last_ev = ktime_get() };
 	/*
@@ -361,23 +394,7 @@ static int clarett_stream_service(void *data)
 		}
 		usleep_range(100, 200);
 	}
-	/* fold the final (partial) window in before summarising */
-	clarett_svc_fold(&st);
-
-	/*
-	 * One summary per stream, same default-quiet rule as the window line:
-	 * at info only if the run had anything wrong with it, so a clean
-	 * session leaves the log untouched from arm to teardown. PTR tells
-	 * whether the engine walked the descriptor table at all.
-	 */
-	clarett_svc_log(c, st.run_late || st.bad_reads || st.overruns,
-			"stream-svc: stopped (periods=%d ctr=0x%x wraps=%u ptr0=0x%x ptr1=0x%x; "
-			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u)\n",
-			atomic_read(&c->stream_periods), c->stream_ctr,
-			st.wraps, readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
-			readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
-			st.run_gap_max_us, st.run_read_us_max, st.run_late,
-			st.run_step_max, st.bad_reads, st.bad_or, st.overruns);
+	clarett_svc_summary(c, &st);
 	return 0;
 }
 

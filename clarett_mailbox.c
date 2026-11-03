@@ -521,6 +521,80 @@ static void clarett_mbox_copy_out(struct clarett *c,
 }
 
 /*
+ * Wedge detection, for probe's report of a device that never became ready. No
+ * response at all, or one echoing a sequence number that is not ours, both mean
+ * the device is still answering an earlier unretired command.
+ */
+static void clarett_mbox_check_wedge(struct clarett *c,
+				     const struct clarett_fcp_txn *t)
+{
+	u16 rseq;
+
+	if (!t->resp_echo) {
+		c->mbox_wedged = true;
+		return;
+	}
+	/* read the echoed seq only after the response has landed */
+	dma_rmb();
+	rseq = ((const u8 *)c->resp_buf)[FCP_RESP_SEQ_OFF] |
+	       ((const u8 *)c->resp_buf)[FCP_RESP_SEQ_OFF + 1] << 8;
+	c->mbox_wedged = rseq != c->seq;
+}
+
+/*
+ * The result. A command with no answer of its own fails: not accepted or not
+ * answered in time (-ETIMEDOUT), or answered with another command's sequence
+ * number (-EIO); handing back the response buffer then would give the caller
+ * poison or a stale reply as if it were data.
+ *
+ * NOTE: fcp_status (resp+8) is NOT a clean pass/fail on this device — INIT_1
+ * on an already initialised device returns a nonzero status yet the command
+ * works. So it does not fail the call by itself; it is surfaced in the dev_dbg
+ * trace and via resp_trace. The one case it does decide is a caller asking for
+ * data and getting a nonzero status with none: a refusal.
+ */
+static int clarett_mbox_result(struct clarett *c,
+			       const struct clarett_fcp_txn *t,
+			       const u8 *resp_out, u16 resp_len)
+{
+	if (!(t->cause & IRQ_DONE_BIT) || !t->resp_echo)
+		return -ETIMEDOUT;
+	if (c->mbox_wedged)
+		return -EIO;
+	if (resp_out && resp_len && t->fcp_status &&
+	    !clarett_get_le16((const u8 *)c->resp_buf + FCP_RESP_SIZE_OFF))
+		return -EIO;
+	return 0;
+}
+
+/*
+ * Advance the sequence number for a command the device answered as ours. One
+ * with no answer — accepted but not landed, or not seen accepted at all (it
+ * may yet be, late) — is retired by the next command (clarett_retire_lost(),
+ * which sets the sequence). Except a command not accepted straight after a
+ * retire found nothing: the device is not answering, so don't make every later
+ * command wait out a second deadline as well. Otherwise — another command's
+ * answer — start over at 0: measured on a Clarett asked too early after
+ * power-up, re-asking as seq 1 stays refused (err=3, stale echoed seq)
+ * indefinitely, re-asking as seq 0 is answered.
+ */
+static void clarett_mbox_next_seq(struct clarett *c,
+				  const struct clarett_fcp_txn *t,
+				  bool retire_failed)
+{
+	if (t->resp_echo && !c->mbox_wedged) {
+		c->seq++;
+	} else if (!t->resp_echo &&
+		   ((t->cause & IRQ_DONE_BIT) || !retire_failed)) {
+		c->lost_pending = true;
+		c->lost_echo = CMD_EXEC_FLAG | t->opcode;
+		c->lost_seq = c->seq;
+	} else {
+		c->seq = 0;
+	}
+}
+
+/*
  * Core mailbox transaction. If resp_out/resp_len are given, the response
  * *payload* (the bytes after the 16-byte echoed header) is copied out under
  * mbox_lock on success — race-free, unlike reading c->resp_buf after the call
@@ -540,7 +614,7 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 		.acc_us = -1,
 	};
 	bool by_phase, retire_failed;
-	int ret = 0;
+	int ret;
 
 	if (len > CLARETT_MBOX_DATA_MAX)
 		return -EINVAL;
@@ -578,73 +652,15 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 	 */
 	clarett_mbox_trace(c, &t, by_phase);
 
-	/*
-	 * Wedge detection, for probe's report of a device that never became
-	 * ready. No response at all, or one echoing a sequence number that is
-	 * not ours, both mean the device is still answering an earlier
-	 * unretired command.
-	 */
-	if (!t.resp_echo) {
-		c->mbox_wedged = true;
-	} else {
-		u16 rseq;
-
-		/* read the echoed seq only after the response has landed */
-		dma_rmb();
-		rseq = ((const u8 *)c->resp_buf)[FCP_RESP_SEQ_OFF] |
-		       ((const u8 *)c->resp_buf)[FCP_RESP_SEQ_OFF + 1] << 8;
-		c->mbox_wedged = rseq != c->seq;
-	}
-
-	/*
-	 * The result. A command with no answer of its own fails: not accepted
-	 * or not answered in time (-ETIMEDOUT), or answered with another
-	 * command's sequence number (-EIO); handing back the response buffer
-	 * then would give the caller poison or a stale reply as if it were
-	 * data.
-	 *
-	 * NOTE: fcp_status (resp+8) is NOT a clean pass/fail on this device —
-	 * INIT_1 on an already initialised device returns a nonzero status yet
-	 * the command works. So it does not fail the call by itself; it is
-	 * surfaced in the dev_dbg trace and via resp_trace. The one case it
-	 * does decide is a caller asking for data and getting a nonzero status
-	 * with none: a refusal.
-	 */
-	if (!(t.cause & IRQ_DONE_BIT) || !t.resp_echo)
-		ret = -ETIMEDOUT;
-	else if (c->mbox_wedged)
-		ret = -EIO;
-	else if (resp_out && resp_len && t.fcp_status &&
-		 !clarett_get_le16((const u8 *)c->resp_buf + FCP_RESP_SIZE_OFF))
-		ret = -EIO;
+	clarett_mbox_check_wedge(c, &t);
+	ret = clarett_mbox_result(c, &t, resp_out, resp_len);
 
 	/* only on success, and only if the caller asked */
 	if (!ret && resp_out && resp_len)
 		clarett_mbox_copy_out(c, &t, resp_out, resp_len, size_out,
 				      status_out);
 
-	/*
-	 * Advance the sequence number for a command the device answered as
-	 * ours. One with no answer — accepted but not landed, or not seen
-	 * accepted at all (it may yet be, late) — is retired by the next
-	 * command (clarett_retire_lost(), which sets the sequence). Except a
-	 * command not accepted straight after a retire found nothing: the
-	 * device is not answering, so don't make every later command wait out a
-	 * second deadline as well. Otherwise — another command's answer —
-	 * start over at 0: measured on a Clarett asked too early after
-	 * power-up, re-asking as seq 1 stays refused (err=3, stale echoed seq)
-	 * indefinitely, re-asking as seq 0 is answered.
-	 */
-	if (t.resp_echo && !c->mbox_wedged) {
-		c->seq++;
-	} else if (!t.resp_echo &&
-		   ((t.cause & IRQ_DONE_BIT) || !retire_failed)) {
-		c->lost_pending = true;
-		c->lost_echo = CMD_EXEC_FLAG | opcode;
-		c->lost_seq = c->seq;
-	} else {
-		c->seq = 0;
-	}
+	clarett_mbox_next_seq(c, &t, retire_failed);
 
 	/* completion window closed; idle-gap events may resume */
 	atomic_set(&c->cmd_inflight, 0);

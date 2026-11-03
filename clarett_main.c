@@ -285,6 +285,67 @@ int clarett_enable_monitor_hw_controls(struct clarett *c)
 				  HWEN_MONITOR_DIM_MASK, HWEN_ACTIVATE);
 }
 
+/* vec0: the 0x400 command phase and device events. */
+static void clarett_irq_event(struct clarett *c)
+{
+	bool inflight = atomic_read(&c->cmd_inflight);
+	u32 cause, ev;
+
+	/*
+	 * This handler is the only reader of 0x400 (read-to-clear):
+	 * once per vec0 MSI, in or out of a command. A second reader
+	 * takes bits this one needs — the stream servicer used to
+	 * read and discard it at ~6.6 kHz, eating front-panel events
+	 * mid-stream. The phase bits are recorded for the command in
+	 * flight; the event bits go to the relay either way.
+	 */
+	/*
+	 * 0x100 FIRST when a command is in flight: its DONE bit (bit29)
+	 * reflects "0x400 has bits pending", so reading 0x400 first
+	 * clears what DONE reports and the command times out. The read
+	 * clears DONE; the command itself completes on the phase bits
+	 * below.
+	 */
+	if (inflight)
+		readl(c->bar0 + REG_IRQ0_CAUSE); /* read-to-clear */
+	cause = readl(c->bar0 + REG_NOTIFY_CAUSE);
+	ev = cause & NOTIFY_EVENT_MASK;
+
+	if (inflight) {
+		atomic_or(cause & NOTIFY_PHASE_MASK, &c->mbox_phase);
+		if (cause & NOTIFY_REQ_ACCEPTED)
+			complete(&c->mbox_accepted);
+		if (cause & NOTIFY_RESP_LANDED)
+			complete(&c->mbox_landed);
+	}
+
+	/*
+	 * Init is waiting for the response-address acknowledgement
+	 * (addr_ack_ms).
+	 */
+	if (READ_ONCE(c->addr_ack_wait) &&
+	    (cause & NOTIFY_REQ_ACCEPTED)) {
+		WRITE_ONCE(c->addr_ack_wait, false);
+		complete(&c->addr_acked);
+	}
+
+	/*
+	 * Only the event bits are a notification; the phase bits belong
+	 * to the mailbox (see the REG_NOTIFY_CAUSE note in clarett.h),
+	 * and the in-flight test above keeps this path off 0x400 while
+	 * a command owns it. ctl_ready gates the relay: the handlers
+	 * are hooked BEFORE the controls exist (for MSI-paced
+	 * completion), and a pre-controls event must not notify.
+	 * Streaming or not: vec0 also fires on every audio period, but
+	 * a period raises no event bit, so a stream adds no relays (a
+	 * stream with the knob untouched relays nothing).
+	 */
+	if (ev && READ_ONCE(c->ctl_ready)) {
+		atomic_or(ev, &c->notify_bits);
+		schedule_work(&c->notify_work);
+	}
+}
+
 /*
  * MSI handler. One Linux IRQ per MSI vector, dispatched by vector index
  * (dev_id). The device signals control-plane events on vec0. While a mailbox
@@ -311,61 +372,7 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 		clarett_midi_irq(c);
 
 	if (ic->idx == CLARETT_VEC_EVENT) {
-		bool inflight = atomic_read(&c->cmd_inflight);
-
-		/*
-		 * This handler is the only reader of 0x400 (read-to-clear):
-		 * once per vec0 MSI, in or out of a command. A second reader
-		 * takes bits this one needs — the stream servicer used to
-		 * read and discard it at ~6.6 kHz, eating front-panel events
-		 * mid-stream. The phase bits are recorded for the command in
-		 * flight; the event bits go to the relay either way.
-		 */
-		/*
-		 * 0x100 FIRST when a command is in flight: its DONE bit (bit29)
-		 * reflects "0x400 has bits pending", so reading 0x400 first
-		 * clears what DONE reports and the command times out. The read
-		 * clears DONE; the command itself completes on the phase bits
-		 * below.
-		 */
-		if (inflight)
-			readl(c->bar0 + REG_IRQ0_CAUSE); /* read-to-clear */
-		u32 cause = readl(c->bar0 + REG_NOTIFY_CAUSE);
-		u32 ev = cause & NOTIFY_EVENT_MASK;
-
-		if (inflight) {
-			atomic_or(cause & NOTIFY_PHASE_MASK, &c->mbox_phase);
-			if (cause & NOTIFY_REQ_ACCEPTED)
-				complete(&c->mbox_accepted);
-			if (cause & NOTIFY_RESP_LANDED)
-				complete(&c->mbox_landed);
-		}
-
-		/*
-		 * Init is waiting for the response-address acknowledgement
-		 * (addr_ack_ms).
-		 */
-		if (READ_ONCE(c->addr_ack_wait) &&
-		    (cause & NOTIFY_REQ_ACCEPTED)) {
-			WRITE_ONCE(c->addr_ack_wait, false);
-			complete(&c->addr_acked);
-		}
-
-		/*
-		 * Only the event bits are a notification; the phase bits belong
-		 * to the mailbox (see the REG_NOTIFY_CAUSE note in clarett.h),
-		 * and the in-flight test above keeps this path off 0x400 while
-		 * a command owns it. ctl_ready gates the relay: the handlers
-		 * are hooked BEFORE the controls exist (for MSI-paced
-		 * completion), and a pre-controls event must not notify.
-		 * Streaming or not: vec0 also fires on every audio period, but
-		 * a period raises no event bit, so a stream adds no relays (a
-		 * stream with the knob untouched relays nothing).
-		 */
-		if (ev && READ_ONCE(c->ctl_ready)) {
-			atomic_or(ev, &c->notify_bits);
-			schedule_work(&c->notify_work);
-		}
+		clarett_irq_event(c);
 	/* data-plane period IRQs */
 	} else if (ic->idx == 1 || ic->idx == 2) {
 		/* read-to-clear */
