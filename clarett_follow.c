@@ -10,10 +10,9 @@
 #include "clarett.h"
 
 /*
- * Optional periodic GET_METER. The device does not need a host heartbeat: left
- * with no host traffic at all for minutes, it still answers, and control writes
- * still take physical effect. The Level Meter control reads the meters on
- * demand (cached for CLARETT_METER_CACHE_MS), so an idle card issues no mailbox
+ * Optional periodic GET_METER. The device needs no host heartbeat, and the
+ * Level Meter control reads the meters on demand (cached for
+ * CLARETT_METER_CACHE_MS), so by default an idle card issues no mailbox
  * commands. The worker also hosts the optional monitor_poll backstop.
  */
 int clarett_meter_poll_ms;
@@ -24,13 +23,11 @@ MODULE_PARM_DESC(meter_poll_ms,
 		 "demand).");
 
 /*
- * Debounced flash-persist worker. clarett_write_u8 schedules this
- * CLARETT_SAVE_DELAY_MS after a control change (cancel+reschedule, so a burst
- * coalesces into one save); it issues the single DATA_CMD{PERSIST} that writes
- * the device's live config to its own NVRAM. This is the device-owns- the-state
- * model (the upstream scarlett2 policy): settings survive a power cycle without
- * the host having to re-apply them. Debouncing keeps a slider drag from
- * hammering the flash.
+ * Debounced flash persist. clarett_write_u8() schedules this
+ * CLARETT_SAVE_DELAY_MS after a control change, so a burst (a slider drag)
+ * coalesces into one DATA_CMD{PERSIST}, which writes the device's live config
+ * to its own NVRAM. The device owns the state, as with scarlett2: settings
+ * survive a power cycle without the host re-applying them.
  */
 void clarett_save_work(struct work_struct *work)
 {
@@ -52,10 +49,8 @@ void clarett_notify_work(struct work_struct *work)
 		return;
 
 	/*
-	 * Controls live in userspace (fcp-server), so a device notification is
-	 * simply relayed: it re-reads whatever it owns. The driver keeps no
-	 * control state to refresh, and re-reading the monitor region here
-	 * would only add mailbox traffic competing with fcp-server's own reads.
+	 * The controls live in fcp-server, so a notification is only relayed;
+	 * it re-reads whatever it owns.
 	 */
 	clarett_hwdep_notify(c, ev);
 	if (ev & (NOTIFY_EV_MONITOR | NOTIFY_EV_DIM_MUTE))
@@ -65,23 +60,14 @@ void clarett_notify_work(struct work_struct *work)
 }
 
 /*
- * Monitor-region change poll: read the monitor region at the meter rate and
- * relay only when the bytes actually CHANGE. It predates the event-bit relay,
- * which now carries the knob and Dim/Mute idle and while streaming, and
- * hw_gain_follow, which now runs on those events (clarett_schedule_follow). Off
- * by default: every front-panel control tried on a Clarett and on a Red is
- * followed without it. Kept as a backstop for a change that raises no event; it
- * runs in the meter_poll_ms worker, so it needs that set too. Cost when on is
- * one GET_DATA per tick beside the periodic GET_METER; a steady state with
- * nobody touching the unit relays nothing at all. The Clarett region (24, len
- * 92) covers the monitor mute/dim flags, the master volume pair at 32/33, the
+ * Monitor-region change poll, a backstop for a front-panel change that raises
+ * no device event: read the monitor region every meter_poll_ms tick (so it
+ * needs that set too) and relay, and run hw_gain_follow, only when the bytes
+ * change. Off by default, since the event relay covers every front-panel
+ * control seen on the Clarett and Red units. The Clarett region (24, len 92)
+ * covers the monitor mute/dim flags, the master volume pair at 32/33, the
  * HW-enable bits and the knob; a model can widen it
- * (clarett_model.monitor_cfg_len) to reach its other front-panel controls.
- *
- * The poll runs whether or not audio is streaming, and relays a real change
- * either way: the 0x400 relay is live outside a stream but is not known to fire
- * for every front-panel control, and clarett_hw_gain_follow() hangs off the
- * same change detection and has to track the knob at all times.
+ * (clarett_model.monitor_cfg_len).
  */
 static bool monitor_poll;
 module_param(monitor_poll, bool, 0644);
@@ -96,29 +82,23 @@ MODULE_PARM_DESC(monitor_poll,
  * front-panel knob.
  *
  * The device applies the knob in its own signal path and never writes it back:
- * turning it moves byte 112 only, while the per-output gains
- * (out_gains[].offset) stay wherever software last left them. Two visible
- * consequences, both of which the USB siblings avoid because the in-kernel
- * scarlett2 driver synthesises the link: the GUI's per-output fader does not
- * follow the knob, and toggling an output HW -> SW makes its volume JUMP to
- * whatever stale software value was stored.
+ * turning it moves byte 112 only, and the per-output gains (out_gains[].offset)
+ * stay wherever software left them. So the GUI's fader would not follow the
+ * knob, and switching an output from HW to SW would jump to a stale volume.
+ * (The USB models' scarlett2 driver synthesises the same link.)
  *
- * Fix it at the source rather than in the presentation layer — write the
- * knob's value into the SW gain of each HW-controlled output, so the device's
- * own config says what is actually being heard. Both symptoms then fall out for
- * free and no userspace change is needed: fcp-server re-reads the byte and the
- * fader tracks, and a HW -> SW toggle is silent because the stored value
- * already matches. Writing an output's SW gain while it is under HW control is
- * inaudible by definition (the knob owns the level), so this only takes effect
- * at the moment control returns to software.
+ * Writing the knob's value into each HW-controlled output's SW gain fixes both
+ * with no userspace change: fcp-server re-reads the byte, and the stored value
+ * already matches when control returns to software. The write is inaudible
+ * while the knob owns the level.
  *
- * NOT persisted (clarett_write_u8_nosave): this is a mirror, not user intent,
- * and committing the flash on every movement of the knob would wear the NVRAM.
- * Writes are also change-gated, so a stationary knob costs nothing at all.
+ * Not persisted (clarett_write_u8_nosave): it mirrors the knob rather than
+ * recording user intent, and committing the flash on every knob movement would
+ * wear it. Writes are change-gated, so a stationary knob costs nothing.
  *
- * `cfg` is the monitor region as fetched by clarett_monitor_poll — offset
- * MONITOR_CFG_OFFSET, at least MONITOR_CFG_LEN long, which spans the gains, the
- * HW-enable bits and the knob alike.
+ * `cfg` is the monitor region from clarett_monitor_fetch(): offset
+ * MONITOR_CFG_OFFSET, at least MONITOR_CFG_LEN long, spanning the gains, the
+ * HW-enable bits and the knob.
  */
 static bool hw_gain_follow = true;
 module_param(hw_gain_follow, bool, 0644);
@@ -185,14 +165,13 @@ static void clarett_hw_gain_follow(struct clarett *c, const u8 *cfg)
 
 /*
  * Meter-source follow (8PreX). fcp-server's "Meter Source" enum writes only the
- * selector byte @184, but the physical meter bridge is routed by the per-source
- * channel-index tables @136/146/156. Nothing derives those from 184 on its own
- * — so without this the selector LED moves while the meters keep displaying
- * whichever bank the tables were last set to. On a change we write the selected
- * source's three per-band tables and commit with activate 8, which commits them
- * together with the selector byte fcp-server already staged. No-op on models
- * with no meter-source control or for an unrecognised source value. Called from
- * the hwdep CMD path on a SET_DATA @184.
+ * selector byte @184, but the front-panel meters are routed by the per-source
+ * channel tables @136/146/156, which the device does not derive from it:
+ * without this the selector LED moves while the meters keep showing the old
+ * bank. Write the selected source's three per-band tables and commit with
+ * activate 8, which also commits the selector byte fcp-server staged. No-op on
+ * models with no meter-source control and for an unknown source value. Called
+ * from the hwdep CMD path on a SET_DATA @184.
  */
 void clarett_meter_source_follow(struct clarett *c, u8 source)
 {
@@ -243,23 +222,18 @@ static int clarett_monitor_fetch(struct clarett *c, u8 *buf)
 	clarett_put_le32(req, MONITOR_CFG_OFFSET);
 	clarett_put_le32(req + 4, len);
 
-	/*
-	 * clarett_fcp_cmd (not clarett_get_data) so the payload is copied out
-	 * under mbox_lock — reading c->resp_buf here would race the next
-	 * command.
-	 */
+	/* copies the payload out under mbox_lock, unlike reading resp_buf */
 	err = clarett_fcp_cmd(c, FCP_GET_DATA, req, sizeof(req), buf, len);
 	return err ? err : len;
 }
 
 /*
- * hw_gain_follow on an event, rather than on every monitor_poll tick. Scheduled
- * when a relayed notification carries the monitor or dim/mute bit, once when
- * the card comes up (the stored SW gains are whatever the last session left),
- * and when fcp-server commits a SW/HW switch, which the device does not
- * announce. Delayed by notify_ms and a no-op while already queued, so a knob
- * raising events ~46 times a second costs at most one region read per
- * notify_ms.
+ * hw_gain_follow on an event. Scheduled when a relayed notification carries the
+ * monitor or dim/mute bit, once when the card comes up (the stored SW gains are
+ * whatever the last session left), and when fcp-server commits a SW/HW switch,
+ * which the device does not announce. Delayed by notify_ms and a no-op while
+ * already queued, so a turning knob (dozens of events a second) costs at most
+ * one region read per notify_ms.
  */
 void clarett_follow_work(struct work_struct *work)
 {
@@ -324,19 +298,17 @@ static void clarett_monitor_poll(struct clarett *c)
 
 	if (changed) {
 		/*
-		 * The event relay normally got there first; this catches a
-		 * change that raised no event (the Red's Meter Source is one),
-		 * and a duplicate costs fcp-server one re-read on a real
-		 * change.
+		 * Usually the event relay got there first; a duplicate costs
+		 * fcp-server one re-read. This catches a change that raised no
+		 * event (the Red's Meter Source is one).
 		 */
 		clarett_hwdep_notify(c, NOTIFY_EV_MONITOR | NOTIFY_EV_DIM_MUTE);
 	}
 
 	/*
-	 * Also on the FIRST poll: the stored SW gains of HW-controlled outputs
-	 * are whatever the last session left behind, so without an initial sync
-	 * they stay stale until the knob is next touched — and a HW->SW
-	 * toggle before that would jump, which is the case this exists to fix.
+	 * Also on the FIRST poll: until the knob next moves, the stored SW
+	 * gains are whatever the last session left, and a HW->SW switch would
+	 * jump.
 	 */
 	if (hw_gain_follow)
 		clarett_hw_gain_follow(c, buf);
@@ -353,11 +325,9 @@ void clarett_meter_work(struct work_struct *work)
 		if (n > 0 && c->hwdep_meter_levels) {
 			/*
 			 * The meter control exists (fcp-server set the map):
-			 * make the heartbeat's poll ALSO refresh the shared
-			 * cache and stamp hwdep_meter_polled, so the GUI-facing
-			 * .get serves that cache instead of issuing its own
-			 * GET_METER per read — one meter poll rate, not one
-			 * device command per GUI read.
+			 * fill its cache and stamp hwdep_meter_polled, so the
+			 * control's .get serves the cache instead of sending a
+			 * GET_METER of its own.
 			 */
 			/* {pad:u16=0, num_meters:u16, magic:u32=1} */
 			u8 req[8];
@@ -372,7 +342,7 @@ void clarett_meter_work(struct work_struct *work)
 				c->hwdep_meter_polled = jiffies ? jiffies : 1;
 			mutex_unlock(&c->hwdep_lock);
 		} else {
-			/* No meter control yet — the plain heartbeat. */
+			/* no meter control yet: a bare GET_METER */
 			static const u8 meter_req[8] = {
 				0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00
 			};
@@ -381,9 +351,7 @@ void clarett_meter_work(struct work_struct *work)
 				    sizeof(meter_req));
 		}
 
-		/*
-		 * The optional backstop poll (monitor_poll), streaming or not.
-		 */
+		/* the optional backstop, streaming or not */
 		if (monitor_poll && READ_ONCE(c->ctl_ready))
 			clarett_monitor_poll(c);
 

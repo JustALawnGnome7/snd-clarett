@@ -20,13 +20,11 @@
  * Suspend stops every mailbox user first, flushing a pending settings save
  * while the mailbox still works, then drops the device's DMA registration and
  * bus mastering as unload does. It must NOT save the PCI state itself: the PCI
- * core would then leave the device in D0, and for a device a driver leaves in
- * D0 the core also keeps its parent bridge powered, which here is the bridge in
- * the unit's own Thunderbolt controller, while the chain above it powers down.
- * On a laptop behind a Thunderbolt dock that froze the host on its way into
- * suspend to idle. Left to the core, the device goes to D3hot and keeps its
- * state there (it has No_Soft_Reset), and the re-attach after resume redoes the
- * host side.
+ * core would then leave the device in D0, and with it the parent bridge (in the
+ * unit's own Thunderbolt controller) powered while the chain above powers down,
+ * which freezes a host behind a Thunderbolt dock on entry to suspend to idle.
+ * Left to the core, the device goes to D3hot and keeps its state (it has
+ * No_Soft_Reset), and the re-attach after resume redoes the host side.
  */
 static int clarett_suspend(struct device *dev)
 {
@@ -60,19 +58,17 @@ static int clarett_suspend(struct device *dev)
 }
 
 /*
- * Resume, done from a work item a moment after the host is awake rather than in
- * the resume callback itself: the callback runs while the host is still
- * bringing devices back, and the unit sits behind a Thunderbolt link that is
- * being re-established at the same time. The card stays at D3hot until the work
- * finishes, so fcp-server's ioctls and the PCM opens wait for it.
+ * Resume runs from a work item a moment after the host is awake, not in the
+ * resume callback, which runs while the Thunderbolt link to the unit is still
+ * being re-established. The card stays at D3hot until the work finishes, so
+ * fcp-server's ioctls and the PCM opens wait for it.
  *
  * The work repeats the attach (clarett_hw_init(), which waits for the device to
- * acknowledge the response address) with the mailbox sequence back at 0, as a
- * fresh attach starts, then re-seeds the shadow, restores the monitor enables
- * and the Clock Source, and tells fcp-server to re-read every control, since
- * the front panel may have moved while the host slept. A unit that went away
- * meanwhile (its config space no longer answers) is left for the hotplug
- * removal that follows.
+ * acknowledge the response address) with the mailbox sequence back at 0, then
+ * re-seeds the shadow, restores the monitor enables and the Clock Source, and
+ * tells fcp-server to re-read every control, since the front panel may have
+ * moved during the sleep. A unit that went away meanwhile (its config space no
+ * longer answers) is left for the hotplug removal that follows.
  */
 #define CLARETT_RESUME_DELAY_MS	1000
 

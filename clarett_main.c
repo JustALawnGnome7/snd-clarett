@@ -40,43 +40,26 @@ MODULE_PARM_DESC(enable_pcm,
 		 "Default on. Set 0 for a control-only card.");
 
 /*
- * Host bring-up ("arm") policy at probe: THE DRIVER NEVER ARMS.
- *
- * A device that has been set up once restores its session from flash at
- * power-up: reads, input metering and control writes all work with no host
- * bring-up. Every unit that has been through Focusrite Control is in that
- * state, and a host-side bring-up would reset the user's routing and mixer to
- * the factory default. Probe waits for the flash-persisted session to answer
- * (clarett_detect_model) and detects the model from it, arming nothing.
- *
- * If the device never answers within ready_timeout_ms, probe does NOT fall back
- * to a placeholder, which would pass a not-ready device off as a working card.
- * It fails loudly; power-cycle the unit to retry.
+ * THE DRIVER NEVER ARMS. A device that has been set up once restores its
+ * session from flash at power-up, and a host-side bring-up would reset the
+ * user's routing and mixer to the factory default. Probe waits for that session
+ * to answer and detects the model from it. If it never answers within
+ * ready_timeout_ms, probe fails rather than register a placeholder;
+ * power-cycle the unit to retry.
  */
 
 /*
  * Probe readiness. The device acknowledges the response-buffer address (the
- * 0x414 write in clarett_hw_init) by raising 0x400 bit0, and a mailbox command
- * sent before that acknowledgement is never answered. How long it takes varies
- * by model and is not small: on a cold power-up a Red 8Line acknowledges after
- * ~0.15 ms, a Clarett 4Pre after ~11 ms and an 8Pre or 8PreX after ~12.6-13 ms.
- * A fixed ~11.5 ms from the write to the first command therefore served the
- * 4Pre by half a millisecond and lost the 8Pre's and 8PreX's first command
- * every time. So clarett_hw_init waits for the acknowledgement (up to
- * addr_ack_ms) instead of sleeping a fixed time, and the first command is then
- * answered. No other register shows readiness: every pre-mailbox register reads
- * its final value from the first read after the enable.
+ * 0x414 write in clarett_hw_init) by raising 0x400 bit0, and a command sent
+ * before that is never answered. The time varies by model, from ~0.15 ms (Red
+ * 8Line) to ~13 ms (8Pre, 8PreX) cold, so clarett_hw_init waits for the
+ * acknowledgement (up to addr_ack_ms). No register shows readiness.
  *
  * Fallback, for a device that does not acknowledge in time: a command sent too
- * early completes (DONE raised) but never DMAs a response, and the device keeps
- * refusing anything sent as the next sequence number (err=3, stale echoed seq).
- * Asking again as seq 0 is answered normally, which is why the mailbox starts
- * over at 0 after an unanswered command (clarett_mailbox.c). So probe re-asks
- * at once until it answers or ready_timeout_ms runs out. Each attempt waits
- * ready_resp_ms for its response rather than the mailbox's usual
- * resp_timeout_ms: a response that lands at all lands within a millisecond, and
- * the device answers the next attempt whenever it comes, so no further pause
- * between attempts helps.
+ * early is never answered, and the mailbox then starts over at seq 0, which the
+ * device does answer. So probe re-asks at once until it answers or
+ * ready_timeout_ms runs out, each attempt waiting ready_resp_ms (a response
+ * that lands at all lands within a millisecond).
  */
 
 static unsigned int ready_resp_ms = 20;
@@ -125,16 +108,11 @@ u32 clarett_rl(struct clarett *c, u32 off)
 void clarett_hw_init(struct clarett *c)
 {
 	/*
-	 * Pre-mailbox init, cut to what the device needs: the two 0x510/0x500
-	 * writes every attach makes (device open; their layout is not decoded
-	 * beyond these values), the interrupt-cause enable, then the
-	 * response-buffer address, waiting for the device to acknowledge it.
-	 * The enable goes first because the acknowledgement arrives as an
-	 * interrupt. A normal attach also reads the caps word,
-	 * 0x4/0x8/0x514/0x58c, every cause block and the rest of the
-	 * firmware-info header, with a few milliseconds between groups; none of
-	 * it changes how the device answers. Process context, so sleeping is
-	 * fine.
+	 * Pre-mailbox init: the two 0x510/0x500 writes every attach makes
+	 * (device open; not decoded beyond these values), the interrupt-cause
+	 * enable, then the response-buffer address, waiting for the device to
+	 * acknowledge it. The enable goes first because the acknowledgement
+	 * arrives as an interrupt. Sleeps.
 	 */
 	clarett_wl(c, 0x510, 0x8);
 	clarett_wl(c, REG_MIDI_STATUS, 0x8);
@@ -165,13 +143,11 @@ void clarett_hw_init(struct clarett *c)
 }
 
 /*
- * Read the unit's serial from flash: the App_Env segment begins with one ASCII
- * line, "SERIAL_NO = <digits>", optionally newline-terminated, and is otherwise
- * erased. Found by name, not by index, though it has been segment 4 on every
- * unit read. Read-only (FLASH_INFO, SEGMENT_INFO, FLASH_READ), and only on
- * demand: the first read of the "serial" sysfs attribute, never at probe, so a
- * slow flash cannot stall an attach or disturb fcp-server's start. Leaves
- * c->serial empty on failure.
+ * Read the unit's serial from flash: the App_Env segment (found by name) begins
+ * with one ASCII line, "SERIAL_NO = <digits>", optionally newline-terminated,
+ * and is otherwise erased. Read-only (FLASH_INFO, SEGMENT_INFO, FLASH_READ),
+ * and only on the first read of the "serial" sysfs attribute, never at probe,
+ * so a slow flash cannot stall an attach. Leaves c->serial empty on failure.
  */
 static void clarett_read_serial(struct clarett *c)
 {
@@ -223,13 +199,11 @@ static void clarett_read_serial(struct clarett *c)
 }
 
 /*
- * Seed the whole config shadow from the device. clarett_hw_init() zeroes the
- * shadow; the seed gives the command-3 enable bytes (72/73) their real values,
- * which their packed bits need for a safe read-modify-write. The first GET
- * after programming the DMA address can come back empty (echo word 0), so retry
- * briefly. The mailbox checks the echo; guard on the response size too: a
- * refusing device returns the header with size=0 and no payload, and copying
- * that would seed stale bytes.
+ * Seed the whole config shadow from the device, so the command-3 enable bytes
+ * (72/73) have their real values for a safe read-modify-write of their packed
+ * bits. The first GET after programming the DMA address can come back empty,
+ * so retry briefly; a refusing device returns size=0 and no payload, so check
+ * the size too.
  */
 int clarett_seed_shadow(struct clarett *c)
 {
@@ -292,12 +266,10 @@ static void clarett_irq_event(struct clarett *c)
 	u32 cause, ev;
 
 	/*
-	 * This handler is the only reader of 0x400 (read-to-clear):
-	 * once per vec0 MSI, in or out of a command. A second reader
-	 * takes bits this one needs — the stream servicer used to
-	 * read and discard it at ~6.6 kHz, eating front-panel events
-	 * mid-stream. The phase bits are recorded for the command in
-	 * flight; the event bits go to the relay either way.
+	 * This is the only reader of 0x400 (read-to-clear), once per vec0 MSI,
+	 * in or out of a command: a second reader would take bits this one
+	 * needs. The phase bits are recorded for the command in flight; the
+	 * event bits go to the relay either way.
 	 */
 	/*
 	 * 0x100 FIRST when a command is in flight: its DONE bit (bit29)
@@ -330,15 +302,10 @@ static void clarett_irq_event(struct clarett *c)
 	}
 
 	/*
-	 * Only the event bits are a notification; the phase bits belong
-	 * to the mailbox (see the REG_NOTIFY_CAUSE note in clarett.h),
-	 * and the in-flight test above keeps this path off 0x400 while
-	 * a command owns it. ctl_ready gates the relay: the handlers
-	 * are hooked BEFORE the controls exist (for MSI-paced
-	 * completion), and a pre-controls event must not notify.
-	 * Streaming or not: vec0 also fires on every audio period, but
-	 * a period raises no event bit, so a stream adds no relays (a
-	 * stream with the knob untouched relays nothing).
+	 * Only the event bits are a notification. ctl_ready gates the relay:
+	 * the handlers are hooked before the controls exist, and an event
+	 * then must not notify. An audio period raises no event bit, so a
+	 * stream adds no relays.
 	 */
 	if (ev && READ_ONCE(c->ctl_ready)) {
 		atomic_or(ev, &c->notify_bits);
@@ -347,14 +314,11 @@ static void clarett_irq_event(struct clarett *c)
 }
 
 /*
- * MSI handler. One Linux IRQ per MSI vector, dispatched by vector index
- * (dev_id). The device signals control-plane events on vec0. While a mailbox
- * command is in flight a vec0 MSI is its completion, and the ISR reads the
- * mailbox cause (0x100); otherwise it checks the notification cause (0x400).
- * vec1/vec2 are the stream period vectors; the servicer polls the period
- * blocks, so here they are only read. MSI is edge-triggered, so not clearing a
- * cause register cannot storm. Every vector returns IRQ_HANDLED so the core
- * doesn't disable the MSI as spurious.
+ * MSI handler, one Linux IRQ per vector (dev_id). vec0 carries the mailbox's
+ * command phase and the device events (clarett_irq_event()). vec1/vec2 are the
+ * stream period vectors; the servicer polls the period blocks, so here they are
+ * only read. MSI is edge-triggered, so an uncleared cause cannot storm. Every
+ * vector returns IRQ_HANDLED so the core does not disable it as spurious.
  */
 static irqreturn_t clarett_irq(int irq, void *dev_id)
 {
@@ -362,11 +326,8 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 	struct clarett *c = ic->c;
 
 	/*
-	 * MIDI RX is register PIO (REG_MIDI_DATA); which MSI vector signals it
-	 * is not known, so drain on every vector — that is vector-agnostic
-	 * AND stops an undrained RX FIFO from livelocking whichever line it
-	 * lands on. A no-op until the rawmidi device exists and whenever the
-	 * FIFO is empty.
+	 * Which vector signals MIDI RX is not known, so drain on every one;
+	 * that also keeps an undrained FIFO from livelocking a vector.
 	 */
 	if (READ_ONCE(c->rmidi))
 		clarett_midi_irq(c);
@@ -382,12 +343,9 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 }
 
 /*
- * Allocate MSI vectors. Done early for the config-space side effect:
- * pci_alloc_irq_vectors() programs the device's MSI capability (address/data,
- * MME) and sets the enable bit (plus INTx-disable), so MSI is on BEFORE the
- * first BAR access, as the device sees on a normal attach. Handlers hook later
- * (clarett_setup_irq); unhandled-but-enabled MSI in between is harmless
- * (edge-triggered, and the mailbox falls back to polling).
+ * Allocate MSI vectors. Done early, so MSI is enabled in config space BEFORE
+ * the first BAR access, as the device sees on a normal attach. The handlers
+ * hook later (clarett_setup_irq); an unhandled MSI in between is harmless.
  */
 static void clarett_enable_msi(struct clarett *c)
 {
@@ -395,11 +353,8 @@ static void clarett_enable_msi(struct clarett *c)
 	int nvec;
 
 	/*
-	 * Request up to CLARETT_NUM_VECTORS but accept as few as 1: some
-	 * platforms cannot grant all 4, and failing outright would leave no
-	 * interrupts at all. With fewer vectors the device funnels all causes
-	 * to the lower vector(s); clarett_irq reads the cause regs regardless,
-	 * so notifications still work.
+	 * Accept as few as 1 vector: the device then funnels every cause to
+	 * the lower vectors, and clarett_irq reads the cause registers anyway.
 	 */
 	nvec = pci_alloc_irq_vectors(pci, 1, CLARETT_NUM_VECTORS, PCI_IRQ_MSI);
 	if (nvec < 0) {
@@ -409,10 +364,7 @@ static void clarett_enable_msi(struct clarett *c)
 		return;
 	}
 	c->n_vec = nvec;
-	/*
-	 * Record the achieved count. A short count is a degraded configuration
-	 * worth a warn; the expected 4/4 is debug.
-	 */
+	/* a short count is worth a warn; the expected 4/4 is debug */
 	if (nvec < CLARETT_NUM_VECTORS)
 		dev_warn(&pci->dev,
 			 "MSI: got %d/%d vectors (causes funnel to the allocated ones)\n",
@@ -423,10 +375,9 @@ static void clarett_enable_msi(struct clarett *c)
 }
 
 /*
- * Hook the notification handlers onto the already-allocated vectors.
- * Best-effort: on failure the driver still works (control plane, polled
- * mailbox) but without async notifications — and the vectors stay allocated
- * so the device keeps seeing MSI enabled.
+ * Hook the handlers onto the allocated vectors. Best-effort: on failure the
+ * driver still works (polled mailbox) without notifications, and the vectors
+ * stay allocated so the device keeps seeing MSI enabled.
  */
 static void clarett_setup_irq(struct clarett *c)
 {
@@ -473,11 +424,10 @@ static void clarett_teardown_irq(struct clarett *c)
  * exist: from remove(), before it returns and devres frees them, or from
  * clarett_card_free() on a probe error. Runs once.
  *
- * remove() cannot leave this to the card's last close. A unit removed during
- * system resume (a Thunderbolt chain that did not survive the sleep) is removed
- * while userspace is still frozen, so fcp-server and alsactl cannot close their
- * handles until the resume completes; waiting for them in remove deadlocked the
- * resume (a black screen on wake).
+ * remove() cannot leave this to the card's last close: a unit removed during
+ * system resume (a Thunderbolt chain lost across the sleep) is removed while
+ * userspace is still frozen, so waiting there for fcp-server and alsactl to
+ * close their handles would deadlock the resume.
  *
  * Mailbox commands still run the normal MSI-paced cycle until the IRQs are
  * freed, so a pending settings save is flushed first; on a device that is
@@ -557,18 +507,15 @@ static void clarett_card_free(struct snd_card *card)
 	clarett_midi_stop(c);
 	/*
 	 * Last, because notify_work is what re-arms it: the debounced hwdep
-	 * relay wake. c is freed the moment this returns to snd_card_free, and
-	 * a live timer into freed memory would panic the host on a surprise
-	 * removal (device powered off).
+	 * relay wake, whose timer must not outlive c.
 	 */
 	clarett_hwdep_free(c);
 }
 
 /*
- * /proc/asound/cardN/clarett — the detected model's name and the current
- * sample rate, which fcp-server reads to pick the meter layout for the speed.
- * The machine-readable model key is the card's "Clarett:<slug>" component, not
- * this file. Kept minimal and greppable on purpose.
+ * /proc/asound/cardN/clarett: the model's name and the current sample rate,
+ * which fcp-server reads to pick the meter layout for the speed. The
+ * machine-readable model key is the card's "Clarett:<slug>" component.
  */
 static void clarett_proc_read(struct snd_info_entry *entry,
 			      struct snd_info_buffer *buf)
@@ -587,10 +534,8 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 	c->card = card;
 	c->pci = pci;
 	/*
-	 * Shared PCI id across the line → the match can't pick the model, and
-	 * there is no override. The id_table's entry is a placeholder only:
-	 * clarett_detect_model() replaces it in clarett_identify(), or probe
-	 * fails. Nothing that depends on the model may be sized before that.
+	 * The whole line shares the PCI id, so the id_table's model is a
+	 * placeholder until clarett_identify(). Size nothing from it before.
 	 */
 	c->model = (const struct clarett_model *)ent->driver_data;
 	mutex_init(&c->mbox_lock);
@@ -650,11 +595,8 @@ static int clarett_map_device(struct clarett *c)
 }
 
 /*
- * Establish the session and identify the model. The driver never arms: a
- * device that has been set up once restores its session from flash, so reads,
- * input metering and control writes all work with no host bring-up. Ask that
- * flash-persisted session for the model and leave the device's own routing
- * alone.
+ * Wait for the flash-restored session to answer and identify the model (see
+ * the note on arming above).
  */
 static int clarett_identify(struct clarett *c)
 {
@@ -665,12 +607,9 @@ static int clarett_identify(struct clarett *c)
 	int tries = 0;
 
 	/*
-	 * Ask until the device answers. After an attempt it was not ready for,
-	 * the mailbox starts the sequence over at 0, so the next attempt is the
-	 * same command as seq 0 again (see the note above ready_resp_ms). Quiet
-	 * while retrying; the last attempt is re-run with logging below. The
-	 * budget is kept short: while probe holds the device, a removal of it
-	 * (the user power-cycling a unit that will not answer) waits too.
+	 * Ask until the device answers (see the note above ready_resp_ms),
+	 * quietly; the last attempt is re-run with logging below. The budget is
+	 * short because a removal of the device waits for probe.
 	 */
 	c->resp_deadline_ms = ready_resp_ms;
 	for (;;) {
@@ -692,11 +631,7 @@ static int clarett_identify(struct clarett *c)
 		det = clarett_detect_model(c, &collapsed, false);
 
 	if (collapsed) {
-		/*
-		 * Never became ready. Do NOT register a placeholder, which
-		 * would pass a not-ready device off as a working card. Fail the
-		 * probe loudly so it gets attention.
-		 */
+		/* never became ready: fail, don't register a placeholder */
 		dev_err(&pci->dev,
 			"device did not become ready within %u ms over %d attempts (mailbox %s) — refusing to register; power-cycle the unit to retry.\n",
 			ready_timeout_ms, tries,
@@ -708,12 +643,9 @@ static int clarett_identify(struct clarett *c)
 
 	if (!det) {
 		/*
-		 * The device answered cleanly but with a geometry no
-		 * clarett_model claims. There is no override to fall back on,
-		 * and standing in a wrong model would size the DMA rings,
-		 * fragment strides and routing tables for different
-		 * hardware — so refuse. The warn just above carries the raw
-		 * pair to add to the table.
+		 * A clean answer with a geometry no clarett_model claims:
+		 * refuse rather than size the rings for different hardware. The
+		 * warn above carries the pair to add to the table.
 		 */
 		dev_err(&pci->dev,
 			"unknown Clarett model (stream geometry matches none in the table) — refusing to register. Add a clarett_model entry for the playback/capture pair logged above.\n");
@@ -768,12 +700,9 @@ static int clarett_setup_model(struct clarett *c)
 			 seeded);
 
 	/*
-	 * Make Mute/Dim actually affect Monitor Out 1-2 by setting the
-	 * per-output enable bits: the master flag alone does nothing until an
-	 * output opts in. This is a hardware-side write, so it is needed
-	 * whoever owns the controls — fcp-server drives the same Mute/Dim
-	 * bytes. Needs the seeded shadow for a correct read-modify-write, so
-	 * only attempt it when seeding succeeded.
+	 * Make Mute/Dim affect Monitor Out 1-2 (the per-output enable bits);
+	 * needed whoever drives the Mute/Dim bytes. Only with a seeded shadow,
+	 * for a correct read-modify-write.
 	 */
 	if (!seeded) {
 		err = clarett_enable_monitor_hw_controls(c);
@@ -784,16 +713,11 @@ static int clarett_setup_model(struct clarett *c)
 	}
 
 	/*
-	 * Seed the published sample rate from the device, ONCE. The device
-	 * keeps its rate across driver reloads, so without this
-	 * /proc/asound/cardN/clarett would claim the default until something
-	 * streams. Userspace (fcp-server, picking the per-rate meter layout)
-	 * then reads the rate for free instead of polling the mailbox for it.
-	 *
-	 * The CONFIGURED rate, not the measured one: on an external clock
-	 * source with nothing locked, FCP_SYNC_RATE reports 192000 while the
-	 * device's routing and meter tables still follow the rate it was set
-	 * to.
+	 * Seed the published sample rate from the device, which keeps its rate
+	 * across driver reloads, so /proc/asound/cardN/clarett is right before
+	 * anything streams. The CONFIGURED rate, not the measured one: on an
+	 * external source with nothing locked, FCP_SYNC_RATE reports 192000
+	 * while the routing and meter tables follow the configured rate.
 	 */
 	if (!clarett_fcp_cmd(c, FCP_SYNC_RATE_CFG, NULL, 0, r, sizeof(r)))
 		WRITE_ONCE(c->cur_rate, clarett_get_le32(r));
@@ -833,10 +757,7 @@ static bool clarett_create_interfaces(struct clarett *c)
 	/* sync the stored SW gains of HW outputs to the knob */
 	clarett_schedule_follow(c);
 
-	/*
-	 * PCM. Every model uses the per-direction descriptor path (geometry
-	 * derived from channel counts), so no per-model gate is needed.
-	 */
+	/* PCM */
 	if (enable_pcm) {
 		err = clarett_create_pcm(c);
 		if (err)
@@ -848,11 +769,7 @@ static bool clarett_create_interfaces(struct clarett *c)
 			pcm_ok = true;
 	}
 
-	/*
-	 * DIN MIDI (rawmidi over the 0x58c register UART), on models with MIDI
-	 * jacks (has_midi); no-op otherwise or if enable_midi is off. Non-fatal
-	 * — a failure just leaves the card without MIDI.
-	 */
+	/* DIN MIDI, on models with MIDI jacks (a no-op otherwise) */
 	err = clarett_create_midi(c);
 	if (err)
 		dev_warn(&pci->dev,
@@ -869,12 +786,8 @@ static int clarett_name_card(struct clarett *c)
 
 	strscpy(card->driver, "Clarett", sizeof(card->driver));
 	/*
-	 * Mirror snd-usb-audio's naming: brand-free product name in the
-	 * shortname (== api.alsa.card.name), manufacturer only in the longname.
-	 * The USB Claretts show "Clarett 8Pre USB" on the /proc/asound/cards
-	 * bracket line because snd-usb-audio takes the shortname from the
-	 * device's iProduct string; we have no such descriptor, so we
-	 * synthesise the same shape.
+	 * snd-usb-audio's naming: the brand-free product name as the shortname
+	 * (api.alsa.card.name), the manufacturer only in the longname.
 	 */
 	snprintf(card->shortname, sizeof(card->shortname), "%s",
 		 c->model->name);
@@ -893,13 +806,10 @@ static int clarett_name_card(struct clarett *c)
 }
 
 /*
- * The probe summary — and, on a healthy load, the ONLY thing this driver
- * prints. The detail (register dumps, the DMA response address, the MSI
- * count, per-subsystem lines, the servicer telemetry) sits at dev_dbg. Bring
- * any of it back at runtime with dynamic debug, e.g.
+ * The probe summary: on a healthy load, the ONLY thing this driver prints. The
+ * detail is at dev_dbg; bring it back at runtime with dynamic debug, e.g.
  *   echo 'module snd_clarett +p' >/sys/kernel/debug/dynamic_debug/control
- * for all of it, or match one statement by format string to skip the ~24 Hz
- * mailbox trace.
+ * or match one statement by its format string.
  */
 static void clarett_log_summary(struct clarett *c, int seeded, bool pcm_ok)
 {
@@ -921,12 +831,9 @@ static void clarett_log_summary(struct clarett *c, int seeded, bool pcm_ok)
 		scnprintf(feat, sizeof(feat), "no interfaces registered");
 
 	/*
-	 * No "(auto-detected)" tag: detection is the only way c->model can be
-	 * set, so saying so would be noise. A model named here is one the
-	 * device claimed. The firmware versions come from the seeded shadow,
-	 * so they are left out if the seed failed. The serial is never
-	 * printed: kernel logs get pasted into public bug reports. It is in
-	 * sysfs.
+	 * The firmware versions come from the seeded shadow, so they are left
+	 * out if the seed failed. The serial is never printed (kernel logs get
+	 * pasted into public bug reports); it is in sysfs.
 	 */
 	if (!seeded) {
 		const u8 *s = c->shadow;
@@ -990,10 +897,8 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 		goto err_free;
 
 	/*
-	 * /proc/asound/cardN/clarett: model name and current rate (see
-	 * clarett_proc_read). Best-effort: the entry's lifetime is the card's;
-	 * a failure only costs fcp-server its per-rate meter layout, not
-	 * function, so it is not fatal to probe.
+	 * /proc/asound/cardN/clarett (clarett_proc_read). Not fatal: a failure
+	 * only costs fcp-server its per-rate meter layout.
 	 */
 	if (snd_card_ro_proc_new(card, "clarett", c, clarett_proc_read))
 		dev_warn(&pci->dev,
@@ -1022,19 +927,12 @@ static void clarett_remove(struct pci_dev *pci)
 	struct clarett *c = card->private_data;
 
 	/*
-	 * Stop the stream servicer FIRST, before any of the card teardown.
-	 *
-	 * snd_card_free() frees the PCM devices — and with them each
-	 * substream's runtime and runtime->dma_area — before it calls
-	 * card->private_free (clarett_card_free). A servicer still ticking
-	 * across that window would dereference a freed capture buffer in
-	 * clarett_pcm_tick(). Unloading the module normally hides this because
-	 * userspace has already closed the PCM, but a SURPRISE REMOVAL — the
-	 * unit powered off mid- stream — leaves the engine armed and the
-	 * servicer running straight into the free.
-	 *
-	 * c->pcm_lock does not help: it serialises the tick against our own
-	 * hw_free, not against ALSA tearing the substream down underneath us.
+	 * Stop the stream servicer FIRST. Freeing the card frees the PCM
+	 * devices, and each substream's buffer, before card->private_free
+	 * runs, and a servicer still ticking would write into a freed buffer:
+	 * a unit powered off mid-stream leaves it running. pcm_lock does not
+	 * help, as it serialises the tick only against the driver's own
+	 * hw_free.
 	 */
 	WRITE_ONCE(c->ctl_ready, false); /* no new notify work from the ISR */
 	cancel_delayed_work_sync(&c->resume_work);
@@ -1043,25 +941,18 @@ static void clarett_remove(struct pci_dev *pci)
 	clarett_engine_stop(c);
 
 	/*
-	 * Disconnect first and kick the relay waiters: fcp-server parked in
-	 * read()/poll() on hwdep_notify_wait would never be woken by the
-	 * disconnect alone — the wait re-checks card->shutdown, which
-	 * snd_card_disconnect sets. New file operations now fail.
+	 * Disconnect, then wake fcp-server's read()/poll() on
+	 * hwdep_notify_wait, whose wait re-checks card->shutdown. New file
+	 * operations now fail.
 	 */
 	snd_card_disconnect(card);
 	wake_up_interruptible(&c->hwdep_notify_wait);
 	/*
-	 * Tear the hardware side down now, while the BAR mapping, the buffers
-	 * and the vectors still exist: devres frees them as soon as this
-	 * returns (in REVERSE order, the response buffer before pcim's disable
-	 * clears bus master, hence the quiesce in there).
+	 * Tear the hardware side down while the BAR mapping, the buffers and
+	 * the vectors still exist: devres frees them as soon as this returns.
 	 */
 	clarett_hw_teardown(c);
-	/*
-	 * Do NOT wait for the last handle to close (snd_card_free would): see
-	 * clarett_hw_teardown(). The card and c are freed whenever userspace
-	 * lets go.
-	 */
+	/* do NOT wait for the last close: see clarett_hw_teardown() */
 	snd_card_free_when_closed(card);
 }
 
@@ -1153,12 +1044,9 @@ static struct pci_driver clarett_driver = {
 module_pci_driver(clarett_driver);
 
 /*
- * Defined on the compiler command line by the Makefile, which reads it out of
- * dkms.conf so the version in `modinfo` is the version of the package that
- * shipped the module. The fallback is deliberately not a plausible number: it
- * marks a build that came in through some other path (a bare kbuild
- * invocation), where claiming a real version would send a bug report chasing
- * the wrong tree.
+ * Defined on the compiler command line by the Makefile, from dkms.conf. The
+ * fallback is deliberately not a plausible number: it marks a build that came
+ * in some other way, such as a bare kbuild invocation.
  */
 #ifndef CLARETT_VERSION
 #define CLARETT_VERSION "0.0.0-unknown"

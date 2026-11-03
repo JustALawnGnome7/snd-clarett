@@ -21,19 +21,16 @@ MODULE_PARM_DESC(tx_trace,
 		 "consumes TX faster than the fill. Runtime-writable.");
 
 /*
- * Persistent servicing engine. The data-plane DMA engine is flow-controlled: it
- * raises a period on the 0x300 cause register and waits for the host to ACK by
- * reading it (read-to-clear). Without that the engine does a few descriptors
- * and stalls; serviced, it clocks for the stream's lifetime. This kthread polls
- * the cause block for the whole stream and drives the PCM path
- * (clarett_pcm_tick) from it.
+ * The stream servicer. The data-plane DMA engine is flow-controlled: it raises
+ * a period on the 0x300 cause register and waits for the host to ACK it by
+ * reading it (read-to-clear); unserviced, it stalls after a few descriptors.
+ * This kthread polls the cause block for the whole stream and drives the PCM
+ * path (clarett_pcm_tick) from it.
  */
 /*
- * Log one servicer telemetry line at info if the window was BAD, else at debug.
- * The healthy case is the common case and it repeats every 2 s for as long as a
- * stream is open — which, with enable_pcm on, is "as long as the machine is
- * up" (PipeWire adopts the card and holds a PCM). See the default-quiet
- * rationale at the window log below.
+ * Log a servicer telemetry line at info if it reports something wrong, else at
+ * debug: a desktop holds a PCM open for as long as it is up, so a healthy line
+ * would otherwise repeat every 2 s indefinitely.
  */
 #define clarett_svc_log(c, bad, fmt, ...)				\
 	do {								\
@@ -64,29 +61,22 @@ struct clarett_svc_stats {
 	u32 run_late, run_step_max;
 	bool seen;
 	/*
-	 * Tick-lateness telemetry. The period counters cannot show this: they
-	 * accumulate the HARDWARE ctr delta, so a late servicer catches up on
-	 * the next tick and the totals stay perfectly smooth while the audio
-	 * glitches. What matters is the wall-clock gap between period events
-	 * — nominal is CLARETT_CTR_FRAMES*step/rate, which is NOT a constant:
-	 * the IRQ cadence follows to the negotiated ALSA period, so it spans
-	 * 0.33 ms (cadence 1) to tens of ms, and the rate varies too.
-	 * clarett_tick_late_us() derives the threshold from both — do not
-	 * reintroduce a fixed one. A gap far over nominal means the TX refill
-	 * landed late and the engine read ring content the app had not been
-	 * copied into yet. step_max is the same signal without a clock: the
-	 * counter delta per event is normally one period's worth, so a doubled
-	 * step IS a missed poll. Reset each log window.
+	 * Tick lateness. The period counters cannot show it: they accumulate
+	 * the hardware counter delta, so a late servicer catches up on the next
+	 * tick and the totals stay smooth while the audio glitches. What
+	 * matters is the wall-clock gap between events, against a nominal that
+	 * follows the period and the rate (clarett_tick_late_us(); do not
+	 * reintroduce a fixed threshold). step_max is the same signal without a
+	 * clock: a doubled step is a missed poll. Reset each log window.
 	 */
 	ktime_t last_ev;
 	u64 gap_max_us;
 	u32 gap_late, step_max;
 	/*
-	 * readmax = longest a single MMIO read-block took (us). Tells a stall's
-	 * mechanism: if readmax ~= gapmax, the time is spent INSIDE a readl()
-	 * (the TB link stalling a read completion, or the whole host frozen);
-	 * if readmax stays small while gapmax spikes, the thread was
-	 * descheduled BETWEEN reads.
+	 * readmax = longest a single MMIO read block took (us). If it is close
+	 * to gapmax, the stall was inside a readl() (the link or the whole host
+	 * stalled); if it stays small while gapmax spikes, the thread was
+	 * descheduled between reads.
 	 */
 	u64 read_us_max;
 };
@@ -94,16 +84,11 @@ struct clarett_svc_stats {
 /*
  * Read the cause blocks the servicer owns and return 0x300.
  *
- * Cause-register ownership. When no command is in flight the servicer sweeps
- * all five blocks (0x100, 0x300, 0x200, 0x400, 0x500): 0x100 asserts bit31 per
- * period (read-to-clear) and must be serviced. But 0x100 (mailbox DONE), 0x400
- * (mailbox command phase) and 0x500 (IRQ summary) belong to the MAILBOX while
- * a command is in flight: the servicer runs at ~6.6 kHz, and read-clearing
- * 0x400 mid-command corrupts the command-phase handshake, so the command
- * times out. During a command the servicer therefore reads ONLY the stream
- * period blocks it owns (0x300/0x200); the mailbox sweep reciprocally skips
- * those two while streaming (clarett_mailbox.c). Every mailbox command sets
- * cmd_inflight, so the guard covers them all.
+ * With no command in flight it also reads 0x100, which asserts bit31 every
+ * period (read-to-clear), and 0x500. 0x400 is the vec0 ISR's alone. While a
+ * command is in flight (cmd_inflight), 0x100 and 0x500 belong to the mailbox,
+ * so only the stream blocks 0x300/0x200 are read; the mailbox's polled sweep
+ * skips those two while streaming (clarett_mailbox.c).
  */
 static u32 clarett_svc_read_causes(struct clarett *c,
 				   struct clarett_svc_stats *st)
@@ -174,29 +159,22 @@ static bool clarett_svc_event(struct clarett *c, u32 c2,
 	u32 ctr = c2 & CLARETT_CTR_MASK;
 	u32 step;
 
-	/*
-	 * First events of a session: raw counter values (the frame advance is
-	 * ctr-delta driven). Debug: eight lines per arm is noise on a working
-	 * driver.
-	 */
+	/* the first events of a session: the raw counter values */
 	if (atomic_read(&c->stream_periods) < 8)
 		dev_dbg(&c->pci->dev, "stream-ev[%d]: 0x300=0x%08x\n",
 			atomic_read(&c->stream_periods), c2);
 
 	/*
-	 * Frames captured since the last event = ctr delta *
-	 * CLARETT_CTR_FRAMES, where the delta is the MODULAR difference
-	 * (CLARETT_CTR_MOD). A counter wrap and a late poll are the same
-	 * arithmetic, so this recovers the frames a delayed tick has to make
-	 * up instead of throwing them away — losing them would put pcm_frames
-	 * permanently behind the engine, so the TX guard would no longer cover
-	 * where the engine reads.
+	 * Frames since the last event = the MODULAR counter delta (mod
+	 * CLARETT_CTR_MOD) * CLARETT_CTR_FRAMES. A wrap and a late poll are the
+	 * same arithmetic, so a delayed tick makes up the frames it missed;
+	 * losing them would leave pcm_frames behind the engine, outside the TX
+	 * guard.
 	 *
-	 * Reject only samples carrying bits outside CLARETT_CTR_KNOWN — in
-	 * practice the all-ones reads of a dead link. CLARETT_CTR_OVERRUN
-	 * samples carry a valid counter and are kept (see clarett.h). Dropping
-	 * is safe whatever an unknown bit means: the next accepted sample's
-	 * modular difference recovers the advance across the gap.
+	 * Reject only samples with bits outside CLARETT_CTR_KNOWN (in practice
+	 * a dead link's all-ones reads); CLARETT_CTR_OVERRUN samples carry a
+	 * valid counter and are kept. The next accepted sample's modular delta
+	 * recovers the advance across a dropped one.
 	 */
 	if (c2 & ~CLARETT_CTR_KNOWN) {
 		st->bad_reads++;
@@ -245,14 +223,9 @@ static void clarett_svc_fold(struct clarett_svc_stats *st)
 }
 
 /*
- * Close a 2-second window: log it, fold it into the run, start the next.
- *
- * DEFAULT-QUIET: a stream is open for as long as PipeWire holds the card, so
- * an unconditional line would log every 2 s indefinitely. Print at info only
- * when the window saw something actually wrong — a late tick (how a platform
- * stall presents), a device-side period overrun, or a rejected sample — and
- * leave the healthy case to dynamic debug. To get every window back without
- * also enabling the ~24 Hz mailbox trace, match this statement by its format:
+ * Close a 2-second window: log it, fold it into the run, start the next. The
+ * line is at info only when the window had a late tick, a device-side period
+ * overrun or a rejected sample. Every window, without the mailbox trace:
  *   echo 'format "stream-svc:" +p' |
  *     tee /sys/kernel/debug/dynamic_debug/control
  */
@@ -279,10 +252,8 @@ static void clarett_svc_window(struct clarett *c, struct clarett_svc_stats *st)
 }
 
 /*
- * One summary per stream, same default-quiet rule as the window line: at info
- * only if the run had anything wrong with it, so a clean session leaves the log
- * untouched from arm to teardown. PTR tells whether the engine walked the
- * descriptor table at all.
+ * One summary per stream, at info only if the run had anything wrong with it.
+ * The ring pointers show whether the engine walked the descriptor table at all.
  */
 static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
 {
@@ -326,12 +297,9 @@ static int clarett_stream_service(void *data)
 		}
 
 		/*
-		 * Gate ACKing on stream_run. The engine is armed (and
-		 * prefetches a few descriptors) by clarett_engine_arm, but
-		 * stays paused until stream_run is set — reading 0x300
-		 * (read-to-clear) IS the period ACK that releases it, so
-		 * withholding the read keeps the engine quiescent between
-		 * prepare and START. The probe path sets stream_run at start.
+		 * Gate ACKing on stream_run. An armed engine stays paused
+		 * until 0x300 is read (read-to-clear is the period ACK), so
+		 * not reading it keeps the engine quiescent until stream_run.
 		 */
 		if (!READ_ONCE(c->stream_run)) {
 			usleep_range(300, 600);
@@ -340,33 +308,20 @@ static int clarett_stream_service(void *data)
 
 		c2 = clarett_svc_read_causes(c, &st);
 		/*
-		 * An all-ones read is a FAILED PCIe transaction, never data.
-		 * bit31 is set in ~0, so it would otherwise present as a period
-		 * event carrying a garbage counter, and the frame advance
-		 * derived from it would wreck pcm_frames.
-		 *
-		 * Two cases. The device really left the bus (cable pulled, unit
-		 * switched off) — stop. Or the link is TRANSIENTLY
-		 * unreachable while the device is still attached (windows of
-		 * tens of ms in which every MMIO read returns ~0 have been seen
-		 * on some hosts). Drop the sample and let the next good read's
-		 * modular difference recover the whole advance.
+		 * An all-ones read is a FAILED PCIe transaction, never data
+		 * (it would look like a period event with a garbage counter).
+		 * Either the device left the bus, or the link is transiently
+		 * unreachable (tens of ms of all-ones reads happen on some
+		 * hosts): drop the sample and let the next good read's
+		 * modular delta recover the advance.
 		 */
 		if (c2 == 0xffffffff) {
 			if (pci_dev_is_disconnected(c->pci)) {
 				/*
-				 * The device left the bus. Do NOT return from
-				 * the threadfn here: this kthread is the target
-				 * of kthread_stop() in clarett_engine_stop(),
-				 * and a kthread that exits on its own BEFORE
-				 * kthread_stop() runs makes kthread_stop()
-				 * dereference the already-reaped task — a
-				 * use-after-free that oopses in kthread_stop()
-				 * from the pciehp remove thread. Park instead
-				 * (the `gone` check at the loop top idles
-				 * without touching the dead device) and let
-				 * kthread_stop() set kthread_should_stop() to
-				 * end the loop and reap us cleanly.
+				 * The device left the bus. Do NOT return: a
+				 * kthread that exits before kthread_stop() runs
+				 * makes kthread_stop() (from the remove path)
+				 * use the reaped task. Park until stopped.
 				 */
 				gone = true;
 				continue;
@@ -383,10 +338,7 @@ static int clarett_stream_service(void *data)
 			usleep_range(100, 200);
 			continue;
 		}
-		/*
-		 * Between period events: copy playback audio the app wrote
-		 * since the tick (.ack).
-		 */
+		/* between events: copy playback the app wrote since */
 		clarett_pcm_tx_refill(c);
 		if (time_after(jiffies, next_log)) {
 			clarett_svc_window(c, &st);
@@ -411,13 +363,11 @@ static void clarett_engine_program(struct clarett *c, dma_addr_t r0,
 	void __iomem *bar = c->bar0;
 
 	/*
-	 * The register-only arm sequence: ack the cause block (0x100=0xf),
-	 * 0x108, the global enable (0x20c=1) BEFORE the geometry/base writes,
-	 * per-block geometry and bases, 0x10c, then 0x110=7. DMA only starts on
-	 * the 0x110=7 arm, which stays last, so there is no null-base fault;
-	 * 0x300 then starts ticking. No FCP commands here: the mailbox side
-	 * (SET_CLOCK, sync queries) is clarett_stream_handshake(), run from PCM
-	 * prepare before this. A null base arg skips that block.
+	 * Ack the cause block (0x100=0xf), 0x108, the global enable (0x20c=1)
+	 * BEFORE the geometry and base writes, per-block geometry and bases,
+	 * 0x10c, then 0x110=7. DMA starts only on the 0x110=7 arm, which stays
+	 * last, so there is no null-base fault. The mailbox side (SET_CLOCK,
+	 * the sync queries) is clarett_stream_handshake(), run before this.
 	 */
 	/* 0x100 = 0xf: ack cause block */
 	writel(0xf, bar + REG_IRQ0_CAUSE);
@@ -473,11 +423,7 @@ void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1)
 
 	clarett_engine_program(c, r0, r1);
 
-	/*
-	 * Post-arm state: whether the bases latched and where the per-block
-	 * pointers start. Debug, not info: this path runs every time an app
-	 * opens the card.
-	 */
+	/* post-arm: whether the bases latched, where the pointers start */
 	dev_dbg(&c->pci->dev,
 		"engine armed: blk0 chans=%u size=0x%x base=%08x:%08x ctrl=%08x ptr=%08x | blk1 chans=%u size=0x%x base=%08x:%08x ctrl=%08x ptr=%08x (model chans tx=%u rx=%u)\n",
 		readl(bar + STREAM_BLK0 + STREAM_OFF_CHANS),
@@ -502,12 +448,10 @@ void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1)
 void clarett_engine_run(struct clarett *c)
 {
 	/*
-	 * Never start a second servicer. The pointer is the ONLY handle
+	 * Never start a second servicer: the pointer is the ONLY handle
 	 * kthread_stop() has, so overwriting it orphans a SCHED_FIFO thread
-	 * that polls the BAR forever and faults on module text after rmmod.
-	 * clarett_pcm_prepare() claims the arm under pcm_lock so this cannot be
-	 * reached, but a silent thread leak is far too expensive to leave
-	 * guarded by one caller's discipline.
+	 * that faults on module text after rmmod. The arm claim in
+	 * clarett_pcm_attach() should make this unreachable.
 	 */
 	if (WARN_ON_ONCE(c->stream_svc))
 		return;
@@ -523,13 +467,9 @@ void clarett_engine_run(struct clarett *c)
 		return;
 	}
 	/*
-	 * Real-time priority for the servicer: it ACKs 0x300 and refills the TX
-	 * ring every period, and if userspace preempts it the TX fill falls
-	 * behind and the engine replays stale audio — audible skips despite
-	 * no XRUN. It sleeps ~150 us between polls (work is microseconds), so
-	 * it yields constantly and cannot starve the system; SCHED_FIFO just
-	 * guarantees it runs promptly when a period is due. Low RT priority so
-	 * it sits above normal tasks but below any other real-time thread.
+	 * Low real-time priority: if userspace preempts the servicer, the TX
+	 * fill falls behind and the engine plays stale audio with no XRUN. It
+	 * sleeps ~150 us between polls, so it cannot starve the system.
 	 */
 	sched_set_fifo_low(c->stream_svc);
 }
@@ -543,22 +483,15 @@ void clarett_engine_stop(struct clarett *c)
 	struct task_struct *svc;
 
 	/*
-	 * CLAIM THE TEARDOWN UNDER pcm_lock. Both directions can close
-	 * simultaneously, and clarett_pcm_detach() makes its "last one out"
-	 * test AFTER dropping pcm_lock, so two callers can both observe both
-	 * substreams NULL and both arrive here. If both read the same
-	 * stream_svc and both called kthread_stop(), the second would stop a
-	 * task that has already exited and been reaped, blocking forever — an
-	 * unkillable closing process, and a module that cannot be unloaded.
+	 * CLAIM THE TEARDOWN UNDER pcm_lock. Both directions can close at once,
+	 * and clarett_pcm_detach() tests "last one out" after dropping the
+	 * lock, so two callers can arrive here. A second kthread_stop() on the
+	 * same, already reaped task blocks forever. Taking stream_on and the
+	 * handle together under the lock lets exactly one caller proceed (the
+	 * mirror of the arm claim in clarett_pcm_attach()).
 	 *
-	 * Taking stream_on and the servicer handle together under the lock
-	 * makes exactly one caller proceed; the loser returns at the stream_on
-	 * test. This is the teardown mirror of the arm claim in
-	 * clarett_pcm_prepare().
-	 *
-	 * kthread_stop() MUST run outside pcm_lock: the servicer calls
-	 * clarett_pcm_tick(), which takes pcm_lock, so stopping it while
-	 * holding the lock trades this hang for a deadlock.
+	 * kthread_stop() MUST run outside pcm_lock: the servicer takes it in
+	 * clarett_pcm_tick(), so stopping it under the lock would deadlock.
 	 */
 	mutex_lock(&c->pcm_lock);
 	if (!c->stream_on) {
@@ -587,15 +520,11 @@ void clarett_engine_stop(struct clarett *c)
 }
 
 /*
- * Deregister the response-buffer owner and stop the device mastering the bus.
- * REG_DMA_ADDR_LO/HI are a standing registration — the armed device keeps the
- * host address and DMAs responses into it asynchronously, and nothing in the
- * protocol expires it. Left in place across an unload it is a dangling DMA
- * target (freed memory) for the rest of the power cycle. Bus master goes off
- * first so the device cannot issue a write to a half-zeroed (torn) address;
- * the zeroed registration is what the next same-power-cycle session inherits.
- * Call only after all mailbox traffic has stopped — a command issued after
- * this can never have its response land (the gated cycle times out).
+ * Deregister the response buffer and stop the device mastering the bus.
+ * REG_DMA_ADDR_LO/HI are a standing registration that nothing expires, so left
+ * in place across an unload they point the device at freed memory. Bus master
+ * goes off first, so the device cannot write through a half-zeroed address.
+ * Call only after all mailbox traffic has stopped.
  */
 void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0)
 {

@@ -4,20 +4,12 @@
  * seam for Geoffrey Bennett's user-space `fcp-server`.
  *
  * Presents the same hwdep ABI as the mainline USB FCP driver (sound/usb/fcp.c),
- * so the unmodified fcp-server can drive this Thunderbolt device: the kernel is
- * a thin transport (relay FCP commands to the mailbox, expose the level meter)
- * and userspace implements the mixer/routing/metering. The FCP wire packet is
- * our mailbox packet exactly (opcode/size/seq/error/pad/data) and the FCP
- * opcodes are our opcodes, so FCP_IOCTL_CMD maps straight onto
- * clarett_fcp_cmd().
- *
- * This is the driver's only control surface. The device is still armed
- * in-kernel at probe (the device self-arms from flash); this just hands the
- * mailbox to userspace.
- *
- * STATUS: complete ABI — PVERSION + CMD + INIT + SET_METER_MAP/LABELS + the
- * notification read/poll relay. fcp-server can drive this device end-to-end
- * (bench-testing pending).
+ * so fcp-server can drive this Thunderbolt device: the kernel is a thin
+ * transport (relay FCP commands to the mailbox, expose the level meter) and
+ * userspace implements the mixer, routing and metering. The FCP wire packet is
+ * the mailbox packet exactly, so FCP_IOCTL_CMD maps straight onto
+ * clarett_fcp_cmd(). This is the driver's only control surface: PVERSION, CMD,
+ * INIT, SET_METER_MAP/LABELS and the notification read/poll relay.
  */
 #include <linux/module.h>
 #include <linux/uaccess.h>
@@ -83,12 +75,9 @@ static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 		goto out;
 
 	/*
-	 * Meter-source follow: fcp-server's Meter Source enum writes only the
-	 * selector byte @184, but the front-panel meter bridge is routed by the
-	 * per-source tables @136/146/156. When we see that write go by, write
-	 * the selected source's tables so the meters actually switch banks. The
-	 * SET_DATA payload is {u32 offset, u32 len, value...}; a selector write
-	 * is offset 184, len 1.
+	 * Meter-source follow (clarett_meter_source_follow()) on a write of
+	 * the selector byte: SET_DATA {u32 offset, u32 len, value...} with
+	 * offset 184, len 1.
 	 */
 	if (cmd.opcode == FCP_SET_DATA && cmd.req_size >= 9 &&
 	    clarett_get_le32(data) == METER_SOURCE_OFFSET &&
@@ -96,15 +85,11 @@ static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 		clarett_meter_source_follow(c, ((const u8 *)data)[8]);
 
 	/*
-	 * Persist fcp-server's config changes to flash. A control change
-	 * arrives as SET_DATA (stage the bytes) + DATA_CMD{activate} (commit
-	 * live). The device auto-persists only some of its config (routing
-	 * survives a power cycle) and not the rest (output gains, S/PDIF input
-	 * source revert to the flash default), and this relay does not
-	 * otherwise flush flash — so schedule the driver's debounced NVRAM
-	 * save on the commit, mirroring the in-kernel write path. The DATA_CMD
-	 * is that commit step; skip the persist opcode itself so a relayed save
-	 * can't reschedule endlessly.
+	 * Persist fcp-server's config changes to flash: a change arrives as
+	 * SET_DATA + DATA_CMD{activate}, and the device persists only some
+	 * config by itself, so schedule the debounced save on the commit
+	 * (clarett_schedule_persist()). Not on the persist command itself, so
+	 * a relayed save can't reschedule endlessly.
 	 */
 	if (cmd.opcode == FCP_DATA_CMD && cmd.req_size >= 4 &&
 	    clarett_get_le32(data) != FCP_ACTIVATE_PERSIST)
@@ -134,17 +119,13 @@ out:
  * The USB reference (fcp.c fcp_init) does: a STEP0 USB class request -> INIT_1
  * -> INIT_2, and resets seq to 0. Two adaptations for this Thunderbolt device:
  *
- *  - STEP0 has no mailbox equivalent. On USB it is a vendor class request
- *    (FCP_USB_REQ_STEP0), not an FCP opcode; the device-info it returns
- *    (serial, firmware ids) the driver reads at probe instead (the serial from
- *    flash, the versions from the appspace). We return step0 zeroed; fcp-server
- *    only inspects step2, so this is honest, not a fabricated layout.
+ *  - STEP0 has no mailbox equivalent: on USB it is a vendor class request, not
+ *    an FCP opcode. step0 is returned zeroed; fcp-server only inspects step2.
  *
- *  - We do NOT reset c->seq. fcp.c can zero it because fcp-server is the
- *    device's only mailbox user; here the in-kernel GET_METER heartbeat shares
- *    c->seq, so a reset would race it. The device only echoes seq (it does not
- *    require a 0 start), and fcp-server never inspects seq, so continuing the
- *    monotonic counter is correct and race-free.
+ *  - c->seq is NOT reset. fcp.c can zero it because fcp-server is the USB
+ *    device's only mailbox user; here the driver's own commands share c->seq.
+ *    The device does not require a 0 start, and fcp-server never inspects
+ *    seq.
  *
  * INIT_1/INIT_2 are safe to issue on a device whose session is already running
  * (fcp.c's fcp_reinit does the same); INIT_1 may report a nonzero FCP status
@@ -202,16 +183,14 @@ out:
 /*
  * fcp-server owns metering on this path: it reads the device's raw meter count,
  * chooses a channel->slot map, and installs both here. The "Level Meter"
- * control is created on the first SET_METER_MAP; its .get polls GET_METER (the
- * same {pad,num_meters,magic=1} request the in-kernel heartbeat uses) and
- * projects the raw levels through the map. SET_METER_LABELS attaches an
- * FCP_CHANNEL_LABELS TLV naming each channel. Mirrors sound/usb/fcp.c's meter
- * control.
+ * control is created on the first SET_METER_MAP; its .get reads GET_METER
+ * ({pad, num_meters, magic=1}) and projects the raw levels through the map.
+ * SET_METER_LABELS attaches an FCP_CHANNEL_LABELS TLV naming each channel.
+ * Mirrors sound/usb/fcp.c's meter control.
  *
- * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT. The reply is 48 u32 words,
- * one per slot, and each word carries the same 16-bit level (0..4095) in both
- * halves — e.g. 0x020a020a = 522. Read only the low half: the whole word is
- * ~8000x full scale. num_meters is assumed to count slots 1:1.
+ * A LEVEL IS 16-BIT, REPLICATED INTO A 32-BIT SLOT: one u32 word per slot,
+ * with the same 16-bit level (0..4095) in both halves (0x020a020a = 522). Read
+ * only the low half.
  *
  * MORE THAN 128 CHANNELS. An INTEGER control holds at most
  * CLARETT_METER_MAX_CHANNELS values, and a Red has more metered destinations
@@ -261,13 +240,9 @@ static int clarett_hwdep_meter_get(struct snd_kcontrol *kctl,
 		return -ENODEV;
 	}
 	/*
-	 * Rate-limit the device poll: the mixer GUI reads this control at 30-60
-	 * Hz, and a GET_METER per read floods the mailbox and disrupts
-	 * streaming (audible skips + fcp-server command timeouts — control
-	 * and stream contend on this Thunderbolt device). Poll at most every
-	 * CLARETT_METER_CACHE_MS and serve the cached hwdep_meter_levels
-	 * between polls; the meter stays live at ~30 Hz with a fraction of the
-	 * traffic.
+	 * Read the device at most every CLARETT_METER_CACHE_MS and serve the
+	 * cached hwdep_meter_levels between reads, however often a GUI polls
+	 * the control.
 	 */
 	if (!c->hwdep_meter_polled ||
 	    time_after(jiffies, c->hwdep_meter_polled +
@@ -425,12 +400,10 @@ static int clarett_hwdep_set_meter_map(struct clarett *c,
 		return -EFAULT;
 
 	/*
-	 * Geometry is frozen once the controls exist (fcp.c does the same: an
-	 * ALSA control's channel count cannot change live). A map that changed
-	 * size — e.g. after editing fcp-server-data — is rejected until the
-	 * controls are recreated, which means a driver reload. Say so: the bare
-	 * EINVAL surfaces in fcp-server only as "Cannot set meter map: Invalid
-	 * argument".
+	 * Geometry is frozen once the controls exist (as in fcp.c: a control's
+	 * channel count cannot change live), so a map of another size needs a
+	 * driver reload. Say so: fcp-server shows only "Cannot set meter map:
+	 * Invalid argument".
 	 */
 	if (c->hwdep_meter_parts &&
 	    (map.map_size != c->hwdep_meter_channels ||
@@ -477,12 +450,10 @@ static int clarett_hwdep_set_meter_map(struct clarett *c,
 	} else if (map.map_size != c->hwdep_meter_channels ||
 		   map.meter_slots != c->hwdep_n_meter_slots) {
 		/*
-		 * Re-mapping an existing control is supported (fcp-server
-		 * re-pushes when the device changes speed band, because the
-		 * meter slot array compacts under ADAT S/MUX), but only with
-		 * the SAME geometry: the map and level buffers were sized on
-		 * the first call, and the control's channel count is already
-		 * published. A larger map here would overrun both.
+		 * A re-map (fcp-server re-pushes on a speed-band change, since
+		 * the slot array compacts under S/MUX) must keep the SAME
+		 * geometry: the buffers and the published channel count were
+		 * sized on the first call.
 		 */
 		err = -EINVAL;
 		goto out_unlock;
@@ -656,31 +627,19 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 /*** Notification relay ***/
 
 /*
- * Relay a device notification to a waiting fcp-server (called from
- * clarett_notify_work on the hwdep path). fcp-server's read() returns a u32
- * bitmask and re-reads every control whose devmap "notify-client" mask
- * intersects it.
- *
- * The USB FCP device delivers that bitmask in its interrupt message; this
- * Thunderbolt device carries it in the event bits of the 0x400 cause register
- * (ev, phase bits already removed), so it is relayed as is on a model whose
- * device map is written against it (clarett_model.notify_word, every model the
- * driver knows). A model without it gets an all-categories wildcard (~0), so
- * fcp-server does a correct, if broad, re-read of all notifiable controls.
+ * Relay a device notification to a waiting fcp-server. Its read() returns a u32
+ * bitmask, and it re-reads every control whose devmap "notify-client" mask
+ * intersects it. The USB device delivers that bitmask in its interrupt message;
+ * this one carries it in the event bits of 0x400 (ev, phase bits removed), so a
+ * model whose maps are written against them (clarett_model.notify_word) gets
+ * them as is, and any other an all-categories wildcard (~0).
  */
 /*
- * Minimum gap between notification wakes. Writable at runtime:
- *   echo 0 > /sys/module/snd_clarett/parameters/notify_ms  # no limiting
- * Each wake costs userspace a re-read of every control it marks notifiable —
- * ~17 mailbox round trips on a 2Pre (the routing and mixer controls are not
- * notifiable, so they cost nothing), so 20 Hz would be roughly 160 round trips
- * a second.
- *
- * Turning a Clarett's monitor knob raises its event bit ~46 times a second; 50
- * ms collapses that to one re-read per 50 ms, which tracks the knob smoothly.
- * An idle Clarett raises no event bits at all. (The steady ~8-13 Hz
- * "notification" seen before the event bits were separated out was the mailbox
- * phase bits of the driver's own commands, relayed by mistake.)
+ * Minimum gap between notification wakes (0 = no limiting; writable at
+ * runtime). Each wake costs fcp-server a re-read of every notifiable control
+ * the event matches. A turning monitor knob raises its event dozens of times a
+ * second; 50 ms collapses that to one re-read per 50 ms, which still tracks the
+ * knob smoothly.
  */
 static uint notify_ms = 50;
 module_param(notify_ms, uint, 0644);
@@ -715,17 +674,12 @@ static void clarett_hwdep_notify_wake(struct work_struct *work)
 void clarett_hwdep_notify(struct clarett *c, u32 ev)
 {
 	/*
-	 * A moving front-panel control raises events far faster than anyone can
-	 * see (~46/s for the monitor knob), and every wake makes fcp-server
-	 * re-read each control the word matches. Coalesce: set the event now,
-	 * and wake at most once per notify_ms.
+	 * Coalesce: record the event now, wake at most once per notify_ms.
 	 *
 	 * schedule_delayed_work(), NOT mod_delayed_work(): it is a no-op while
-	 * the work is already queued, so the wake lands notify_ms after the
-	 * FIRST notification of a burst. mod_delayed_work() pushes the deadline
-	 * out on every arrival, which is a debounce — and against a source
-	 * that never goes idle it never fires at all, so userspace would see
-	 * one notification and nothing afterwards.
+	 * the work is queued, so the wake lands notify_ms after the FIRST
+	 * event of a burst. mod_delayed_work() would push the deadline out on
+	 * every event, and against a knob that keeps turning never fire.
 	 */
 	if (!c->hwdep_ready)
 		return;
@@ -743,13 +697,10 @@ void clarett_hwdep_notify(struct clarett *c, u32 ev)
 
 /*
  * Stop the relay. MUST run before c is freed: the debounced wake holds a timer
- * pointing at c, and because the device notifies at ~30 Hz idle one is
- * essentially always armed — a surprise removal (the device powered off on
- * its Thunderbolt link) that frees c with the timer live fires
- * wake_up_interruptible() into freed memory. Call after the last thing that can
- * re-arm the dwork (clarett_notify_work), and note the flag also covers
- * probe-error teardowns that never reached clarett_hwdep_init(), where the
- * delayed_work is still all zeroes.
+ * pointing at c, and freeing c with it armed would fire
+ * wake_up_interruptible() into freed memory. Call after the last thing that
+ * can re-arm it (clarett_notify_work). The flag also covers probe-error
+ * teardowns that never reached clarett_hwdep_init().
  */
 void clarett_hwdep_free(struct clarett *c)
 {
@@ -770,9 +721,8 @@ static long clarett_hwdep_read(struct snd_hwdep *hw, char __user *buf,
 		return -EINVAL;
 
 	/*
-	 * card->shutdown terminates the wait on removal: snd_card_free() blocks
-	 * until the last handle closes, so a reader parked here forever would
-	 * hang the PCI remove thread.
+	 * card->shutdown ends the wait on removal (clarett_remove() wakes the
+	 * queue after the disconnect), so a reader never stays parked here.
 	 */
 	err = wait_event_interruptible(c->hwdep_notify_wait,
 				       atomic_read(&c->hwdep_notify_event) ||

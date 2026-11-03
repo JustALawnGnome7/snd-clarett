@@ -48,7 +48,7 @@ static const struct clarett_meter_source clarett_8prex_meter_sources[] = {
  * Selectable clock sources for the "Clock Source" control, Internal first.
  * Values are the SET_CLOCK enums (clarett.h): Internal 24, S/PDIF 3, ADAT 0,
  * shared by the whole line. The 8PreX adds its second ADAT port (1) and its
- * wordclock input (2), both verified.
+ * wordclock input (2).
  */
 static const struct clarett_clock_src clarett_clock_srcs[] = {
 	{ "Internal", CLARETT_CLOCK_INTERNAL },
@@ -80,25 +80,13 @@ static const struct clarett_model clarett_8prex = {
 	.n_clock_srcs = ARRAY_SIZE(clarett_8prex_clock_srcs),
 	.rx_live_high = 16,   /* + ch16-19 gone at quad */
 	.rx_loopback_at = 10, /* after analogue 1-8 + S/PDIF 1-2 */
-	/*
-	 * double + quad speed verified for capture (correct pitch at 96k
-	 * and 192k, full width); playback verified at single speed.
-	 */
 	.max_rate = 192000,
 };
 
 /*
- * Clarett 2Pre (Thunderbolt). Shares the 8PreX's config offsets and commands;
- * the first 4 of the 8PreX output gains; 2 combo-jack preamps with the
- * Line/Inst encoding (Line=1, Inst=2 — Mic is auto-detected by the jack, not
- * a software mode). Streams 4 playback / 14 record, which is also how it is
- * detected (clarett_detect_model). Asymmetric TX 4ch / RX 14ch: periods 0x40 /
- * 0xe0, descriptor fragments 0x100 / 0x380 (clarett_frag_bytes).
- */
-/*
- * Names mirror scarlett2's Clarett 2Pre USB line_out_descrs (Monitor L/R,
- * Headphones L/R); the "Line NN" number is 1-based output index, matching
- * scarlett2's "Line %02d (%s)".
+ * Clarett 2Pre (Thunderbolt): 4 playback / 14 record, the first 4 of the 8PreX
+ * output gains. The names mirror scarlett2's Clarett 2Pre USB line_out_descrs,
+ * in its "Line %02d (%s)" format.
  */
 static const struct clarett_out_gain clarett_2pre_gains[] = {
 	{ "Line 01 (Monitor L)", 32 }, { "Line 02 (Monitor R)", 33 },
@@ -124,29 +112,12 @@ const struct clarett_model clarett_2pre = {
 	.rx_live_high = 8,
 	/* after analogue 1-2 + S/PDIF 1-2 */
 	.rx_loopback_at = 4,
-	/*
-	 * double + quad speed verified (correct pitch at 96k and 192k,
-	 * full width).
-	 */
 	.max_rate = 192000,
 };
 
 /*
- * Clarett 4Pre (Thunderbolt). Detected by its (8,20) geometry
- * (clarett_detect_model).
- *
- *   channel counts 8 playback / 20 record (18 record + 2 loopback).
- *   inputs: only Analogue 1-2 have a mode (Line=1/Inst=2; Mic is
- *           auto-detected by the combo XLR/TRS jack, not a software option),
- *           at mode@166/167 cmd 6; Analogue 1-4 each have Air at
- *           air@174..177 cmd 7; Analogue 5-8 have no preamp controls.
- *   output gains (cmd 1, 8-bit): Monitor 1-2 @ 32/33, Line 3-4 @ 36/37,
- *           Headphone 2 L/R @ 40/41. S/PDIF outputs carry no gain. Six gains
- *           total (no 44/45 pair on this model).
- */
-/*
- * Names mirror scarlett2's Clarett 4Pre USB line_out_descrs (Monitor L/R,
- * Headphones 1 L/R, Headphones 2 L/R).
+ * Clarett 4Pre (Thunderbolt): 8 playback / 20 record (18 record + 2 loopback),
+ * six output gains (no 44/45 pair). Names as scarlett2's Clarett 4Pre USB.
  */
 static const struct clarett_out_gain clarett_4pre_gains[] = {
 	{ "Line 01 (Monitor L)", 32 }, { "Line 02 (Monitor R)", 33 },
@@ -168,35 +139,14 @@ static const struct clarett_model clarett_4pre = {
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
 	.rx_live_high = 14,	/* + ADAT 3-4 -> ch14-15 gone at quad */
 	.rx_loopback_at = 10,	/* after analogue 1-8 + S/PDIF 1-2 */
-	/*
-	 * double + quad speed verified for capture (correct pitch at 96k
-	 * and 192k, full width); playback verified at single speed.
-	 */
 	.max_rate = 192000,
 };
 
 /*
- * Clarett 8Pre (Thunderbolt) — a DISTINCT model from the 8PreX (do not
- * confuse).
- *
- * Differences from the 8PreX — these are physical: the 8Pre uses combo
- * XLR/TRS jacks (the jack auto-detects Mic when an XLR is inserted), whereas
- * the 8PreX has SEPARATE XLR + 1/4" ports per input (so its mode must be
- * software-selected). Hence:
- *   - inputs: all 8 carry Air @ 174..181 (cmd 7), but only Analogue 1-2 have a
- *     mode (Line=1/Inst=2 for the 1/4" path; Mic is jack-auto, not a software
- *     option) @ 166/167 (cmd 6); Analogue 3-8 are air-only. (The 8PreX, with
- *     discrete ports, exposes software Mic/Line[/Inst] on all 8.)
- *   - streams: 20 playback / 20 record (the 8PreX is 28/28 — the 8Pre has a
- *     single ADAT bank).
- *   - outputs: same 10-gain offsets as the 8PreX (Monitor @ 32/33, then
- *     36..49), but named to mirror scarlett2's Clarett 8Pre USB line_out_descrs
- *     (Monitor L/R, Line 03-06 unlabelled, Headphones 1/2), so it gets its own
- *     gain table rather than reusing the 8PreX's.
- */
-/*
- * scarlett2 Clarett 8Pre USB line_out_descrs: Monitor L/R, four unlabelled line
- * outs, Headphones 1/2.
+ * Clarett 8Pre (Thunderbolt), a different model from the 8PreX: one ADAT bank,
+ * so 20 playback / 20 record against the 8PreX's 28/28. The 8PreX's ten gain
+ * offsets, named as scarlett2's Clarett 8Pre USB (Monitor L/R, four unlabelled
+ * line outs, Headphones 1/2).
  */
 static const struct clarett_out_gain clarett_8pre_gains[] = {
 	{ "Line 01 (Monitor L)", 32 }, { "Line 02 (Monitor R)", 33 },
@@ -220,33 +170,18 @@ static const struct clarett_model clarett_8pre = {
 	.n_clock_srcs = ARRAY_SIZE(clarett_clock_srcs),
 	.rx_live_high = 14,      /* + ADAT 3-4 -> ch14-15 gone at quad */
 	.rx_loopback_at = 10,    /* after analogue 1-8 + S/PDIF 1-2 */
-	/*
-	 * double + quad speed verified for capture (correct pitch at 96k
-	 * and 192k, full width).
-	 */
 	.max_rate = 192000,
 };
 
 /*
- * Focusrite Red 8Line — the first non-Clarett model, and one whose entry is
- * deliberately CONTROL-PLANE EMPTY. It shares PCI id 1cb5:0002 with every
- * Clarett, so the id_table already matches it; this entry gives
- * clarett_detect_model() its geometry: playback=64, capture=60 (58 record + 2
- * loopback).
- *
- * WHAT IS DELIBERATELY LEFT NULL/ZERO, AND WHY. The Red's control plane is NOT
- * a wider Clarett:
- *  - out_gains: the Red's output gains are 16-bit values on a 2-byte stride
- *    (gain @24, 26, 28, ..., bits="16", min-gain -112.0 dB), where every
- *    Clarett uses a 7-bit 1 dB/step attenuation byte. clarett_hw_gain_follow()
- *    writes a BYTE at out_gains[].offset, so populating this table from the
- *    Red's offsets would write half a gain field. NULL correctly disables that
- *    mirror outright.
- *  - meter_sources: the Red's front-panel meter bridge is not mapped.
- *  - has_midi: the Red range has no MIDI jacks, so no rawmidi device is created
- *    for it.
- * The control plane therefore reaches userspace only through the FCP hwdep,
- * where fcp-server's red-8line map pair describes it.
+ * Focusrite Red 8Line: playback=64, capture=60 (58 record + 2 loopback). Left
+ * empty on purpose:
+ *  - out_gains: the Red's output gains are 16-bit values on a 2-byte stride,
+ *    and clarett_hw_gain_follow() writes a byte, so it would write half a gain
+ *    field;
+ *  - meter_sources: the Red's front-panel meter bridge is not mapped;
+ *  - has_midi: the Red range has no MIDI.
+ * Its controls are fcp-server's, through the FCP hwdep.
  */
 /*
  * The same values on every Red model (the Pre models' descriptors list them in
@@ -270,45 +205,33 @@ static const struct clarett_model red_8line = {
 	.capture_channels = 60,			/* 58 record + 2 loopback */
 	.playback_channels = 64,		/* Playback 1-64 */
 	/*
-	 * S/MUX: a channel gone at one speed stays gone at every higher speed,
-	 * as on the Clarett models. The Red differs in KIND, though: rather
-	 * than simply losing channels it RE-PINS survivors (a slot carrying
-	 * ADAT 5 at single speed carries ADAT 9 at double and Dante 1 at quad),
-	 * and only the tail actually goes away. Both dead sets are still
-	 * contiguous tails, which is what these two counts require. They match
-	 * the vendor's own per-rate routing tables, which route exactly 52 and
-	 * 32 capture slots at double and quad speed.
+	 * S/MUX: unlike the Claretts, the Red RE-PINS surviving channels (a
+	 * slot carrying ADAT 5 at single speed carries ADAT 9 at double and
+	 * Dante 1 at quad), but the channels that go are still a contiguous
+	 * tail, which is what these two counts require.
 	 */
 	.rx_live_mid = 52,  /* ADAT 1-4 + 9-12, all 32 Dante: 8 slots fewer */
 	.rx_live_high = 32, /* ADAT 1-2 + 9-10, Dante 1-16 */
 	/*
-	 * Double and quad speed verified: correct capture pitch at 96k and
-	 * 192k, and a digital-loopback ramp through a playback channel that
-	 * survives each speed arrives sample-exact. Playback drops its tail too
-	 * (Playback 63-64 at double speed, 37-64 at quad); the device just
-	 * ignores those channels, so nothing needs blanking on that side.
+	 * Playback drops its tail too (63-64 at double speed, 37-64 at quad);
+	 * the device ignores those channels, so nothing needs blanking.
 	 */
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
 	.tb_gen = 3,	/* JHL6540 Alpine Ridge; the Red 4Pre is its TB2 twin */
 	/*
-	 * The three front-panel knob groups (monitor, headphones 1, headphones
-	 * 2) keep their gains at 112/116/120 and their mute/dim at 124/126/128,
-	 * and the front panel's Meter Source selector is at 268, so the watched
-	 * region runs to 268 — the Clarett default stops at 115 and would
-	 * miss every one of them but the monitor gain.
+	 * The three knob groups keep their gains at 112/116/120 and mute/dim at
+	 * 124/126/128, and the Meter Source selector is at 268, so the watched
+	 * region runs to 268 (the Clarett default stops at 115).
 	 */
 	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 };
 
 /*
- * Focusrite Red 16Line — NOT YET SEEN ON HARDWARE; everything here comes from
- * its device descriptor. It is the Red 8Line plus eight line inputs and eight
- * line outputs, and otherwise the same device: the same clock sources,
- * front-panel knob groups and config layout, and every field the 8Line leaves
- * empty is empty here for the same reasons. Geometry playback=64, capture=64
- * (62 record + 2 loopback).
+ * Focusrite Red 16Line, NOT YET SEEN ON HARDWARE: taken from its device
+ * descriptor. The Red 8Line plus eight line inputs and outputs, otherwise the
+ * same. Geometry playback=64, capture=64 (62 record + 2 loopback).
  */
 static const struct clarett_model red_16line = {
 	.name = "Red 16Line",
@@ -339,14 +262,11 @@ static const struct clarett_model red_16line = {
 };
 
 /*
- * Focusrite Red 4Pre and Red 8Pre — NOT YET SEEN ON HARDWARE; everything here
- * comes from their device descriptors. Each is its Line model's twin: the same
- * stream geometry, S/MUX tails, clock sources, knob groups and config layout,
- * with preamps on more of its inputs (a control-plane difference the fcp-server
- * maps carry, not the driver). They share their twin's STREAM_INFO pair, so
- * they are told apart by the unit's own Thunderbolt controller: the Pre models
- * are Thunderbolt 2 units, the Line models Thunderbolt 3
- * (clarett_unit_tb_gen()).
+ * Focusrite Red 4Pre and Red 8Pre, NOT YET SEEN ON HARDWARE: taken from their
+ * device descriptors. Each is its Line model's twin (the same stream geometry,
+ * S/MUX tails, clock sources and config layout; the extra preamps are
+ * fcp-server's), told apart by the unit's own Thunderbolt controller: the Pre
+ * models are Thunderbolt 2 units, the Line models Thunderbolt 3.
  */
 static const struct clarett_model red_4pre = {
 	.name = "Red 4Pre",
@@ -381,25 +301,16 @@ static const struct clarett_model red_8pre = {
 };
 
 /*
- * Model selection: THE DEVICE DECIDES, always. There is deliberately no
- * override.
+ * Model selection: the device decides, and there is deliberately no override.
+ * The whole line shares PCI id 1cb5:0002 and an identical pre-mailbox register
+ * surface, and the Thunderbolt DROM's model name is not visible on every host.
+ * But STREAM_INFO{band 0} answers {u16 playback_ch, u16 capture_ch}, unique per
+ * model (bar the Red twins).
  *
- * The whole line shares PCI id 1cb5:0002 and presents a byte-identical
- * PRE-MAILBOX surface (MMIO regs, config space, the fw-info header, even the
- * dummy serial), and the Thunderbolt DROM's model name is not reliably visible
- * either (whether a Thunderbolt 2 unit is enumerated as a kernel-managed
- * Thunderbolt device depends on the host firmware). But the device reports its
- * own stream geometry: STREAM_INFO{band 0} answers {u16 playback_ch, u16
- * capture_ch}, unique per model.
- *
- * Everything downstream is sized from c->model: channel counts, DMA ring and
- * descriptor geometry, fragment strides, routing and mixer tables, meter
- * layout, the fcp-server map slug. A wrong model is therefore not a cosmetic
- * mislabel, it is a card that streams the wrong width into wrongly strided
- * rings — which is why a mismatch REFUSES TO REGISTER rather than fall back
- * to a plausible guess, and why no guess is available as a module parameter
- * either. If a genuinely new model appears, the probe error prints the raw
- * geometry pair to add to the table below.
+ * Everything downstream is sized from c->model, so a wrong model would stream
+ * the wrong width into wrongly strided rings. An unknown geometry therefore
+ * refuses to register, and the probe error prints the pair to add to the
+ * table.
  */
 
 /*
@@ -407,17 +318,15 @@ static const struct clarett_model red_8pre = {
  * pre-Thunderbolt 3 part), or 0 if it cannot be told.
  *
  * The endpoint's immediate upstream bridge is always the unit's own Thunderbolt
- * controller — on any host, through a dock, and with the unit daisy-chained
- * behind another one, since a dock, adapter or other unit sits further up the
- * chain. Every Clarett carries a single-port DSL2210 Port Ridge; the Red 8Line
- * a two-port JHL6540 Alpine Ridge, whose second downstream port is its
- * daisy-chain port. The Red 4Pre and 8Pre are Thunderbolt 2 units, the 8Line
- * and 16Line Thunderbolt 3, so this tells apart the two pairs of Red models
- * that report the same stream geometry.
+ * controller, whatever sits further up the chain (a dock, an adapter, another
+ * unit). Every Clarett carries a DSL2210 Port Ridge and the Red 8Line a JHL6540
+ * Alpine Ridge. The Red 4Pre and 8Pre are Thunderbolt 2 units, the 8Line and
+ * 16Line Thunderbolt 3, so this tells apart the Red models that report the same
+ * stream geometry.
  *
- * 0 covers no upstream bridge at all (the device passed through to a virtual
- * machine) and any controller not listed; clarett_detect_model() then falls
- * back to the first matching model.
+ * 0 covers no upstream bridge (the device passed through to a virtual machine)
+ * and any controller not listed; clarett_detect_model() then takes the first
+ * matching model.
  */
 static int clarett_unit_tb_gen(struct pci_dev *pdev)
 {
@@ -484,17 +393,11 @@ static int clarett_stream_info(struct clarett *c, u8 band, u16 *playback,
 }
 
 /*
- * Ask the device who it is: STREAM_INFO{band 0} returns {u16 playback_ch, u16
- * capture_ch}, a pair unique per model (bar the Red twins below). Returns NULL
- * if the query fails or the pair matches no known model.
- *
- * A NULL return is fatal to probe either way — there is no fallback model —
- * but *collapsed distinguishes WHY, because the two need opposite things from
- * the user: true = the GET path is dead (transport error, or a status=3/size=0
- * refusal), which usually means "not ready yet, retry"; false = a VALID reply
- * whose geometry is not in the table, i.e. genuinely unknown hardware, which
- * needs a new clarett_model entry. The non-quiet warn on each path prints the
- * raw pair for exactly that.
+ * Ask the device who it is (STREAM_INFO{band 0}). Returns NULL if the query
+ * fails or the pair matches no known model; either is fatal to probe, and
+ * *collapsed says which: true = the read failed or was refused (usually "not
+ * ready yet, retry"), false = a valid reply with an unknown geometry (new
+ * hardware, which needs a clarett_model entry).
  */
 const struct clarett_model *
 clarett_detect_model(struct clarett *c, bool *collapsed, bool quiet)
@@ -506,13 +409,7 @@ clarett_detect_model(struct clarett *c, bool *collapsed, bool quiet)
 	u16 pb, cap;
 	int i;
 
-	/*
-	 * Every failure logs the raw response (when not quiet), so a first
-	 * attach of a new model pins the cause (transport vs. status vs.
-	 * unmatched) in one line and surfaces the actual pair to add to the
-	 * table. Either failure of the read is a collapse: the GET did not
-	 * complete at all, or it was refused (status=3/size=0).
-	 */
+	/* when not quiet, every failure logs the raw response */
 	*collapsed = clarett_stream_info(c, 0, &pb, &cap, quiet) != 0;
 	if (*collapsed)
 		return NULL;

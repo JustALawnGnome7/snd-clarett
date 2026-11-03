@@ -2,18 +2,17 @@
 /*
  * Focusrite Clarett/Red (Thunderbolt) ALSA driver — DIN MIDI (ALSA rawmidi).
  *
- * The MIDI transport is register PIO through a single memory-mapped MIDI UART
- * at BAR0 REG_MIDI_DATA (0x58c) — NOT the FCP mailbox, NOT the audio DMA
- * ring. Both directions move the same packed word, (count << 24) | (b2 << 16) |
+ * The MIDI transport is register PIO through one memory-mapped UART at BAR0
+ * REG_MIDI_DATA (0x58c), not the FCP mailbox or the audio DMA. Both directions
+ * move the same packed word, (count << 24) | (b2 << 16) |
  * (b1 << 8) | b0, where count = the number of valid MIDI bytes 1..3 packed
  * low->high in wire order. `count` is a plain BYTE COUNT (the SysEx F7
  * terminator is a lone count=1 word), NOT a USB-MIDI CIN, and words are chunked
  * by raw byte grouping, independent of message boundaries.
  *
- *   TX  write a word to REG_MIDI_DATA. The TX path just hands the device
- *       whatever bytes ALSA has queued, three at a time. Every write is
- *       gated on MIDI_TX_READY in REG_MIDI_STATUS: the FIFO is nine words
- *       deep and discards a word written while it is full.
+ *   TX  write a word to REG_MIDI_DATA, up to three queued bytes at a time.
+ *       Every write is gated on MIDI_TX_READY in REG_MIDI_STATUS: the FIFO is
+ *       nine words deep and discards a word written while it is full.
  *
  *   RX  read a word from REG_MIDI_DATA; count 0 means the RX FIFO is
  *       empty. The device decides how many bytes a word carries: the 2Pre
@@ -23,16 +22,10 @@
  *       its low byte, the driver drains REG_MIDI_DATA to empty, then writes
  *       MIDI_IRQ_ACK_VAL to REG_MIDI_ACK to clear the interrupt.
  *
- * This is the simplest possible transport — no DMA, no descriptor rings, no
- * mailbox round-trips — and it is independent of the FCP control session, so
- * MIDI works regardless of control-plane state. Every Clarett Thunderbolt model
- * has DIN MIDI (the 2Pre included); the Red range has none, so the rawmidi is
- * created only where clarett_model.has_midi is set.
- *
- * Open questions, none affecting correctness: which MSI vector carries the MIDI
- * RX interrupt (the ISR drains on ANY vector); and whether the RX interrupt
- * needs an explicit enable at input-open (assumed covered by the
- * REG_IRQ0_ENABLE write at probe).
+ * It is independent of the FCP control session. Every Clarett Thunderbolt model
+ * has DIN MIDI; the Red range has none, so the rawmidi is created only where
+ * clarett_model.has_midi is set. Which MSI vector carries the RX interrupt is
+ * not known, so the ISR drains on every vector.
  */
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -50,48 +43,29 @@ MODULE_PARM_DESC(enable_midi,
 		 "BAR0 0x58c). Default on.");
 
 /*
- * TX flow control. The FIFO holds nine packed words and drains at the DIN wire
- * rate — 3125 bytes/s, so ~960 us per 3-byte word — while a work item can
- * fill it in microseconds. The poll interval is a fraction of a word time; the
- * timeout is many word times, so it expires only if the UART has stopped
- * draining altogether rather than merely being full.
+ * TX flow control. The FIFO drains at the DIN wire rate, 3125 bytes/s or ~960
+ * us per 3-byte word. The poll interval is a fraction of a word time; the
+ * timeout is many, so it expires only if the UART has stopped draining.
  */
 #define CLARETT_MIDI_TX_POLL_US     200
 #define CLARETT_MIDI_TX_TIMEOUT_US  100000
 
 /*
- * Runaway bound on the RX drain loop. The device FIFO holds 139 bytes (measured
- * by stalling the drain until it overflowed and counting what came back); this
- * sits well above that, so a full FIFO always empties in a single pass.
+ * Runaway bound on the RX drain loop, above the FIFO's measured 139 bytes, so a
+ * full FIFO always empties in one pass.
  */
 #define CLARETT_MIDI_RX_GUARD       256
 
 /*
- * Drain the RX FIFO, called from the ISR (clarett_irq) on any vector — MIDI
- * RX is register PIO and which MSI vector signals it is unconfirmed, so
- * draining unconditionally is both correct and prevents a stuck MIDI interrupt
- * from livelocking whichever vector it lands on. Bytes are pushed to the input
- * substream only while it is open and triggered, but the FIFO is ALWAYS drained
- * and acked, open or not — the ack is what re-arms the interrupt. Runs in
- * hard IRQ context; snd_rawmidi_receive() is designed for that.
- *
- * A word whose count exceeds MIDI_WORD_BYTES is not data. That includes a
- * failed PCIe read (0xffffffff, count 0xff) — treating it as data would spin
- * forever emitting 0xff — so bail on it (device gone / transiently
- * unreachable).
- *
- * The FIFO must be emptied in ONE pass: a non-empty FIFO does not raise a fresh
- * interrupt, so anything left behind strands until an unrelated interrupt
- * happens to re-enter this handler. Likewise a pass that reads data but skips
- * the ack leaves the interrupt unarmed, so every word with a nonzero count
- * counts as data. CLARETT_MIDI_RX_GUARD is a runaway bound in bytes for a stuck
- * count, not a per-interrupt work budget, and it sits above the measured FIFO
- * depth so a legitimate backlog never hits it.
- */
-/*
  * Drain the RX FIFO, handing the bytes to ss, or discarding them when ss is
  * NULL, and acknowledge the RX interrupt if anything was read. Caller holds
  * midi_rx_lock.
+ *
+ * The FIFO must be emptied in ONE pass: a non-empty FIFO raises no fresh
+ * interrupt, and a pass that reads data but skips the ack leaves the interrupt
+ * unarmed. A word whose count exceeds MIDI_WORD_BYTES is not data; that
+ * includes a failed PCIe read (0xffffffff), which would otherwise spin emitting
+ * 0xff.
  */
 static void clarett_midi_drain(struct clarett *c,
 			       struct snd_rawmidi_substream *ss)
@@ -122,15 +96,19 @@ static void clarett_midi_drain(struct clarett *c,
 		clarett_wl(c, REG_MIDI_ACK, MIDI_IRQ_ACK_VAL);
 }
 
+/*
+ * From the ISR, on every vector. The FIFO is drained and acked whether or not
+ * the input is open, since the ack is what re-arms the interrupt; the bytes go
+ * to the substream only while it is open and triggered.
+ */
 void clarett_midi_irq(struct clarett *c)
 {
 	struct snd_rawmidi_substream *ss;
 
 	/*
 	 * Serialise: this runs for every MSI vector, and while streaming the
-	 * period vectors fire on other CPUs concurrently with vec0 — two
-	 * drainers of the one FIFO would interleave and reorder the bytes
-	 * (corrupting multi-byte messages). Also taken by
+	 * period vectors fire on other CPUs concurrently with vec0. Two
+	 * drainers of the one FIFO would reorder the bytes. Also taken by
 	 * clarett_midi_resume(), with IRQs off.
 	 */
 	spin_lock(&c->midi_rx_lock);
@@ -160,15 +138,10 @@ static int clarett_midi_tx_wait(struct clarett *c)
 
 /*
  * Drain the rawmidi output buffer into the TX register, up to 3 bytes per
- * write. Runs in process context (scheduled from the output trigger) so it can
- * pull an arbitrarily long stream without spinning in atomic context.
- * snd_rawmidi_transmit() takes up to `count` RAW bytes irrespective of MIDI
- * message boundaries — exactly the device's 3-byte grouping — and combines
- * peek+ack, so each call consumes what it returns.
- *
- * MIDI_TX_READY is checked BEFORE taking bytes from ALSA, so a device that has
- * stopped draining leaves the stream queued for the next kick instead of
- * consuming bytes it cannot transmit.
+ * write, in process context (scheduled from the output trigger).
+ * snd_rawmidi_transmit() takes raw bytes regardless of message boundaries,
+ * which is the device's grouping, and consumes what it returns. MIDI_TX_READY
+ * is checked BEFORE taking bytes, so a stalled device leaves the stream queued.
  */
 static void clarett_midi_tx_work(struct work_struct *w)
 {
@@ -256,9 +229,7 @@ static int clarett_midi_in_close(struct snd_rawmidi_substream *ss)
 
 /*
  * Atomic context: gate whether the ISR pushes received bytes to this substream.
- * The RX interrupt itself is assumed already enabled by the bring-up
- * (REG_IRQ0_ENABLE); if RX never fires on hardware, an explicit device enable
- * write likely belongs here.
+ * The RX interrupt is enabled at attach (REG_IRQ0_ENABLE).
  */
 static void clarett_midi_in_trigger(struct snd_rawmidi_substream *ss, int up)
 {
@@ -321,10 +292,7 @@ int clarett_create_midi(struct clarett *c)
 	/* set LAST: the ISR uses this as the "MIDI live" gate */
 	WRITE_ONCE(c->rmidi, rmidi);
 
-	/*
-	 * Debug: the probe summary in clarett_probe() already reports that MIDI
-	 * came up.
-	 */
+	/* debug: the probe summary already reports MIDI */
 	dev_dbg(&c->pci->dev,
 		"MIDI registered (%s, 1 in + 1 out, register UART @0x%03x)\n",
 		name, REG_MIDI_DATA);
@@ -350,13 +318,11 @@ void clarett_midi_stop(struct clarett *c)
  * suspend only parks the TX drain (bytes still queued in the rawmidi buffer
  * stay there), and resume restarts it.
  *
- * RX is muted across the sleep (midi_rx_discard). After a sleep the unit's RX
- * FIFO reports old buffer contents as new: measured on an 8PreX with a cable
- * from MIDI Out to In, a stream crossing s2idle got ~220 stale bytes injected
- * in one burst within 2 ms of the wake, then carried on in order with nothing
- * lost. So the ISR discards until the re-attach is done, and resume drains
- * whatever is left before delivery starts again. Bytes sent to the unit while
- * the host was asleep are lost either way.
+ * RX is muted across the sleep (midi_rx_discard): after a sleep the unit's RX
+ * FIFO delivers a burst of stale bytes (old buffer contents) at the wake. The
+ * ISR discards until the re-attach is done, and resume drains what is left
+ * before delivery starts again. Bytes sent to the unit during the sleep are
+ * lost either way.
  */
 void clarett_midi_suspend(struct clarett *c)
 {

@@ -3,11 +3,8 @@
  * Focusrite Clarett/Red (Thunderbolt) ALSA driver — FCP mailbox transport.
  *
  * One transaction: fill the request mailbox (cmd/size+seq/error/pad/data), ring
- * the doorbell, wait for the DONE bit in the IRQ-0 cause register and for the
- * response DMA to land, then acknowledge. Mailbox completion is polled by
- * design: MSI is used for async notifications and stream period events, but
- * polling the DONE bit keeps the mailbox from racing the read-to-clear cause
- * register against the ISR.
+ * the doorbell, wait until the device has accepted the command and its response
+ * DMA has landed, then acknowledge.
  */
 #include <linux/io.h>
 #include <linux/jiffies.h>
@@ -40,24 +37,20 @@
 
 /*
  * Why the trailing ack waits for the response. The doorbell ack (0x408=2) means
- * "response consumed, buffer free", not "completion observed": the device DMAs
- * its response asynchronously AFTER raising DONE, and acking before it lands
- * makes the device refuse the whole session (err=3 on every later command). So
- * each command zeroes the response header before submit (a repeated opcode must
- * not match a stale echo), waits after DONE for THIS command's echoed opcode in
- * resp_buf, and only then acks. A response that never arrives is never acked.
+ * "response consumed, buffer free": the device DMAs its response AFTER it
+ * reports completion, and an ack before it lands makes the device refuse the
+ * whole session (err=3 on every later command). So each command zeroes the
+ * response header before submit (a repeated opcode must not match a stale
+ * echo), waits for THIS command's echoed opcode in resp_buf, and only then
+ * acks. A response that never arrives is never acked.
  *
- * The header is not the whole response. A long reply lands in pieces, header
- * first, and one copied out the moment the echo matched could still hold the
- * previous command's bytes past the first piece (a 245-byte GET_DATA read back
- * intermittently zeroed from about 130 bytes in). So the payload area is
- * poisoned before submit too, and after the echo the wait continues until the
- * last bytes the header's size field promises are no longer poison
+ * A long reply lands in pieces, header first, so the payload area is poisoned
+ * before submit too, and after the echo the wait continues until the last
+ * bytes the header's size promises are no longer poison
  * (clarett_resp_tail_wait).
  *
- * resp_trace: one log line per command — DONE latency, response-landing
- * latency, echoed seq, FCP status word (resp+8), size. (GET_METER adds ~24
- * lines/s; meter_poll_ms=0 for a readable log.)
+ * resp_trace logs one line per command: the latencies, the echoed seq, the FCP
+ * status word (resp+8) and the size.
  */
 static bool resp_trace;
 module_param(resp_trace, bool, 0444);
@@ -67,16 +60,9 @@ MODULE_PARM_DESC(resp_trace,
 		 "size. Use with meter_poll_ms=0. Default 0.");
 
 /*
- * Deadline for a command's response DMA to land, split out from
- * CLARETT_MBOX_TIMEOUT_MS (which still governs the DONE wait) because only this
- * half is in question. A command can complete normally — DONE raised, status
- * clean — and still have its response DMA arrive late; the ack is then
- * withheld, and the device is left holding an unretired command that it answers
- * instead of every later one.
- *
- * Runtime-writable because a reload re-runs the pre-mailbox init and clears the
- * device's mailbox state, which would hide a slow response; set it, then
- * power-cycle the unit so probe re-runs.
+ * Deadline for a command's response DMA to land, separate from
+ * CLARETT_MBOX_TIMEOUT_MS (the DONE wait). A response that misses it is retired
+ * by the next command (clarett_retire_lost()).
  */
 static uint resp_timeout_ms = CLARETT_MBOX_TIMEOUT_MS;
 module_param(resp_timeout_ms, uint, 0644);
@@ -172,7 +158,7 @@ static u32 clarett_resp_wait(struct clarett *c, u32 exp_echo, ktime_t t_submit,
  * Posted writes from the device land in order, so once the last payload bytes
  * the header announces are no longer poison, everything before them has landed
  * too. Real data can equal the poison, so the wait is bounded; on expiry the
- * bytes are taken as they are (the old behaviour) and counted.
+ * bytes are taken as they are.
  */
 #define CLARETT_RESP_POISON	0xa5
 #define CLARETT_RESP_TAIL_US	2000
@@ -187,9 +173,7 @@ static void clarett_resp_tail_wait(struct clarett *c)
 	dma_rmb();
 	size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 	if (!size)
-		/*
-		 * not every command fills the size field: nothing to wait for
-		 */
+		/* not every command fills the size field */
 		return;
 	end = min_t(size_t, FCP_RESP_DATA_OFF + size, c->resp_size);
 	from = max_t(size_t, end >= 4 ? end - 4 : 0, FCP_RESP_DATA_OFF);
@@ -212,16 +196,13 @@ static void clarett_resp_tail_wait(struct clarett *c)
 
 /*
  * Retire a command whose response missed its deadline, before the next command
- * is sent. Measured on a Clarett 8Pre and a Red 8Line by withholding one
- * GET_DATA's ack: the response did land (it was late, not lost), and until it
- * is acknowledged the device refuses every later command (err=3, no payload)
- * whatever sequence number it carries. Acking it once it has landed restores
- * the session completely, with the sequence continuing from the lost command.
- * So: wait up to that command's own deadline for the response, ack it and carry
- * on; if it never lands (a device asked too early after power-up answers
- * nothing at all), start the sequence over at 0, which is what recovers that
- * case. Returns true if it waited and nothing landed. Called with mbox_lock
- * held, before the response buffer is reset for the next command.
+ * is sent. A "lost" response is a late one, and until it is acknowledged the
+ * device refuses every later command (err=3, no payload) whatever sequence
+ * number it carries; acking it once it lands restores the session, with the
+ * sequence continuing from the lost command. So: wait up to that command's own
+ * deadline, ack and carry on; if it never lands (a device asked too early
+ * after power-up answers nothing), start the sequence over at 0. Returns true
+ * if it waited and nothing landed. Caller holds mbox_lock.
  */
 static bool clarett_retire_lost(struct clarett *c)
 {
@@ -278,15 +259,9 @@ static void clarett_mbox_submit(struct clarett *c, struct clarett_fcp_txn *t,
 {
 	int i;
 
-	/*
-	 * zero the response header so clarett_resp_wait can't match a stale
-	 * echo of a repeated opcode
-	 */
+	/* zero the header: a repeated opcode must not match a stale echo */
 	memset(c->resp_buf, 0, FCP_RESP_DATA_OFF);
-	/*
-	 * and poison the payload, so clarett_resp_tail_wait can tell when the
-	 * tail has landed
-	 */
+	/* and poison the payload, for clarett_resp_tail_wait */
 	memset((u8 *)c->resp_buf + FCP_RESP_DATA_OFF, CLARETT_RESP_POISON,
 	       c->resp_size - FCP_RESP_DATA_OFF);
 	/* both in memory before the doorbell lets the device overwrite them */
@@ -311,11 +286,9 @@ static void clarett_mbox_submit(struct clarett *c, struct clarett_fcp_txn *t,
 	}
 
 	/*
-	 * Mark the command in flight BEFORE submitting: vec0 fires on the
-	 * command's phase bits, and the ISR must record them for this command
-	 * rather than relay them (clarett_irq / the 0x400 note in clarett.h).
-	 * Held until just before mutex_unlock so it still covers an MSI
-	 * delivered late.
+	 * Mark the command in flight BEFORE submitting, so the ISR records its
+	 * phase bits rather than relaying them. Held until just before
+	 * mutex_unlock, to cover an MSI delivered late.
 	 */
 	reinit_completion(&c->mbox_accepted);
 	reinit_completion(&c->mbox_landed);
@@ -364,12 +337,10 @@ static void clarett_mbox_wait_phase(struct clarett *c,
 
 /*
  * Polled fallback (no MSI): once DONE shows in 0x100, sweep the remaining
- * cause blocks (0x300, 0x200, 0x400, 0x500 — 0x400 holds the command-phase
- * value and is read-to-clear), do one confirming full sweep, then wait for
- * the response and ack. Sweep only AFTER DONE: sweeping the read-to-clear
- * phase registers continuously while the command is processing makes
- * commands time out (-110). On timeout: no ack — an incomplete command is
- * never acknowledged.
+ * cause blocks (0x400 holds the command phase and is read-to-clear), do one
+ * confirming full sweep, then wait for the response and ack. Sweep only AFTER
+ * DONE: sweeping the phase register while the command is processing makes it
+ * time out. An incomplete command is never acknowledged.
  */
 static void clarett_mbox_wait_polled(struct clarett *c,
 				     struct clarett_fcp_txn *t)
@@ -397,13 +368,8 @@ static void clarett_mbox_wait_polled(struct clarett *c,
 		return;
 	t->done_us = ktime_us_delta(ktime_get(), t->t_submit);
 	/*
-	 * Skip the stream period-cause blocks (0x200 TX / 0x300 RX) while the
-	 * PCM engine is streaming: the stream servicer owns them
-	 * (read-to-clear), and a mailbox read here STEALS a pending period
-	 * event — an audible gap in capture/playback. The mailbox ack only
-	 * needs 0x100 + the response landing + the trailing doorbell ack; the
-	 * stream blocks are irrelevant to it. clarett_stream_cause() flags the
-	 * two to skip.
+	 * The sweeps skip the stream blocks while streaming: a read here would
+	 * steal a period event from the servicer (clarett_stream_cause()).
 	 */
 	for (s = 1; s < ARRAY_SIZE(sweep); s++)
 		if (!clarett_skip_cause(c, sweep[s]))
@@ -419,12 +385,9 @@ static void clarett_mbox_wait_polled(struct clarett *c,
 		/* the header has landed; a long reply's tail may not have */
 		clarett_resp_tail_wait(c);
 		/*
-		 * The device reports command-level failures in the FCP status
-		 * word (resp+8), NOT the mailbox error register — a rejected
-		 * write/commit lands a nonzero status here while DONE and the
-		 * echo both look fine. Read it now (response has landed) so
-		 * callers, incl. the hwdep CMD ioctl, see the real result
-		 * instead of a false success.
+		 * Command-level failures are in the FCP status word (resp+8),
+		 * not the mailbox error register: a rejected write lands a
+		 * nonzero status while DONE and the echo look fine.
 		 */
 		dma_rmb();
 		t->fcp_status = clarett_resp_status(c);
@@ -437,9 +400,8 @@ static void clarett_mbox_wait_polled(struct clarett *c,
 }
 
 /*
- * Per-transaction trace. dev_dbg (not dev_info): the GET_METER heartbeat runs
- * at ~24 Hz, so info-level here would flood the log. Enable via dynamic debug
- * when diagnosing the mailbox. resp_trace adds the response telemetry.
+ * Per-transaction trace, at dev_dbg since the meters are read up to 20 times a
+ * second. resp_trace adds the response telemetry.
  */
 static void clarett_mbox_trace(struct clarett *c,
 			       const struct clarett_fcp_txn *t, bool by_phase)
@@ -464,10 +426,7 @@ static void clarett_mbox_trace(struct clarett *c,
 			 t->opcode, c->seq, t->done_us, t->land_us, rseq,
 			 r[FCP_RESP_STATUS_OFF], size,
 			 atomic_read(&c->mbox_phase));
-		/*
-		 * Payload head for every answered non-meter command; 32 bytes
-		 * shows counts and ids. GET_METER is excluded (24 Hz).
-		 */
+		/* the payload head of every answered non-meter command */
 		if (size && t->opcode != FCP_GET_METER)
 			dev_info(&c->pci->dev, "FCPr   payload=%*ph\n",
 				 (int)min(size, 32u), r + FCP_RESP_DATA_OFF);
@@ -741,16 +700,13 @@ int clarett_data_cmd(struct clarett *c, u32 activate)
 }
 
 /*
- * Schedule the debounced NVRAM commit (a single DATA_CMD{FCP_ACTIVATE_PERSIST})
- * so a config change survives a power cycle — the device owns its state
- * (upstream scarlett2 policy). mod_delayed_work coalesces a burst (e.g. a
- * slider drag) into one save CLARETT_SAVE_DELAY_MS after the LAST change. Gated
- * on ctl_ready: the probe-time monitor-enable write runs before the card is up
- * and must NOT commit flash on every load. Called both from the in-kernel write
- * path below and from the hwdep relay when fcp-server commits a config change
- * (clarett_hwdep_cmd) — the device auto-persists only some config (routing)
- * and not the rest (output gains, S/PDIF source), so without this the latter
- * revert to the flash default on a power cycle.
+ * Schedule the debounced NVRAM commit (DATA_CMD{FCP_ACTIVATE_PERSIST}) so a
+ * config change survives a power cycle: a burst (a slider drag) becomes one
+ * save CLARETT_SAVE_DELAY_MS after the LAST change. Gated on ctl_ready, so the
+ * probe-time monitor-enable write does not commit flash on every load. Called
+ * from the in-kernel write path and from the hwdep relay when fcp-server
+ * commits a change (clarett_hwdep_cmd): the device persists some config by
+ * itself (routing) but not the rest (output gains, S/PDIF source).
  */
 void clarett_schedule_persist(struct clarett *c)
 {
@@ -760,10 +716,9 @@ void clarett_schedule_persist(struct clarett *c)
 }
 
 /*
- * Convenience: write a single config byte and commit it. The commit
- * (DATA_CMD{activate}) applies the change live but RAM-only — it is NOT
- * persisted across a power cycle. Persistence is a separate
- * DATA_CMD{FCP_ACTIVATE_PERSIST} (command 5), scheduled here on a debounce.
+ * Write one config byte and commit it. DATA_CMD{activate} applies the change
+ * live but not across a power cycle; persisting is a separate debounced
+ * DATA_CMD{FCP_ACTIVATE_PERSIST}.
  */
 static int __clarett_write_u8(struct clarett *c, u32 offset, u8 val,
 			      u32 activate, bool save)
@@ -784,11 +739,7 @@ static int __clarett_write_u8(struct clarett *c, u32 offset, u8 val,
 	/* write-through: the shadow now matches hardware */
 	set_bit(offset, c->shadow_known);
 
-	/*
-	 * Persist to the device's NVRAM on a debounce so the change survives a
-	 * power cycle (device owns the state); nosave writes are mirrors, not
-	 * user intent, and skip it. See the helper.
-	 */
+	/* nosave writes are mirrors, not user intent, and skip the persist */
 	if (save)
 		clarett_schedule_persist(c);
 	return 0;
@@ -800,11 +751,10 @@ int clarett_write_u8(struct clarett *c, u32 offset, u8 val, u32 activate)
 }
 
 /*
- * As clarett_write_u8, but does NOT schedule the NVRAM save. For bytes the
- * driver maintains as a MIRROR of some other state rather than at the user's
- * request — currently the SW gains of outputs under hardware control
- * (clarett_hw_gain_follow), which retrack the front-panel knob and would
- * otherwise commit the device's flash on every movement of it.
+ * As clarett_write_u8, but without the NVRAM save: for bytes the driver keeps
+ * as a mirror of other state (the knob-following SW gains,
+ * clarett_hw_gain_follow), which would otherwise commit flash on every knob
+ * movement.
  */
 int clarett_write_u8_nosave(struct clarett *c, u32 offset, u8 val, u32 activate)
 {
