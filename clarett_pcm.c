@@ -7,7 +7,7 @@
  * contiguous coherent buffer (c->stream_buf): block 0 (0x200 = TX/playback)
  * then block 1 (0x300 = RX/capture). It raises a period on the 0x300 cause
  * register and waits for the host to ACK by reading it;
- * clarett_stream_service() (clarett_main.c) is that ACK loop and the shared
+ * clarett_stream_service() (clarett_engine.c) is that ACK loop and the shared
  * frame clock for both directions. Each 0x300 event carries the frames the
  * engine advanced (ctr delta * CLARETT_CTR_FRAMES); clarett_pcm_tick() then
  * drains the RX ring into the capture ALSA buffer (behind the write pointer)

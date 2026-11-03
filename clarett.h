@@ -1323,13 +1323,6 @@ int clarett_write_u8_nosave(struct clarett *c, u32 offset, u8 val,
  * the definition.
  */
 void clarett_schedule_persist(struct clarett *c);
-/*
- * Write the selected meter source's per-band channel tables (@136/146/156) and
- * commit; see the definition. Called from the hwdep CMD path when fcp-server
- * writes the selector byte @184.
- */
-void clarett_meter_source_follow(struct clarett *c, u8 source);
-void clarett_schedule_follow(struct clarett *c);
 unsigned int clarett_hwdep_notify_ms(void);
 
 /* BAR0 access wrappers. */
@@ -1339,10 +1332,43 @@ u32 clarett_rl(struct clarett *c, u32 off);
 int clarett_write_bits(struct clarett *c, u32 offset, u8 mask, u8 val,
 		       u32 activate);
 
-/* main.c — data-plane engine (shared with pcm.c) */
+/* main.c — the attach sequence, repeated on resume */
+void clarett_hw_init(struct clarett *c);
+int clarett_seed_shadow(struct clarett *c);
+int clarett_enable_monitor_hw_controls(struct clarett *c);
+
+/* models.c */
+/* the id_table's placeholder until clarett_detect_model() answers */
+extern const struct clarett_model clarett_2pre;
+const struct clarett_model *
+clarett_detect_model(struct clarett *c, bool *collapsed, bool quiet);
+void clarett_log_twin(struct clarett *c);
+void clarett_read_rx_live(struct clarett *c);
+
+/* engine.c — data-plane engine (shared with pcm.c) */
 void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1);
 void clarett_engine_run(struct clarett *c);
 void clarett_engine_stop(struct clarett *c);
+void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0);
+
+/* follow.c */
+/* the meter_poll_ms module parameter */
+extern int clarett_meter_poll_ms;
+void clarett_save_work(struct work_struct *work);
+void clarett_notify_work(struct work_struct *work);
+void clarett_follow_work(struct work_struct *work);
+void clarett_meter_work(struct work_struct *work);
+/*
+ * Write the selected meter source's per-band channel tables (@136/146/156) and
+ * commit; see the definition. Called from the hwdep CMD path when fcp-server
+ * writes the selector byte @184.
+ */
+void clarett_meter_source_follow(struct clarett *c, u8 source);
+void clarett_schedule_follow(struct clarett *c);
+
+/* pm.c */
+extern const struct dev_pm_ops clarett_pm;
+void clarett_resume_work(struct work_struct *work);
 
 /* pcm.c */
 int clarett_create_pcm(struct clarett *c);

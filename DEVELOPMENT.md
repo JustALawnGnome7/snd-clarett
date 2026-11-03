@@ -16,7 +16,11 @@ MIDI, the sample clock (the `Clock Source` control), and model detection.
 
 | File | Role |
 |---|---|
-| `clarett_main.c` | PCI probe, model table and detection, IRQs, notification relay, monitor poll |
+| `clarett_main.c` | PCI probe and removal, the attach sequence, IRQs, the serial sysfs file |
+| `clarett_models.c` | The per-model table and model detection |
+| `clarett_engine.c` | The data-plane engine (arm/run/stop) and the stream servicer |
+| `clarett_follow.c` | Deferred workers: settings persist, notification relay, front-panel follow, meter poll |
+| `clarett_pm.c` | System sleep (suspend/resume) |
 | `clarett_mailbox.c` | FCP command transport over BAR0 |
 | `clarett_hwdep.c` | The FCP hwdep ABI consumed by `fcp-server` |
 | `clarett_pcm.c` | Capture/playback PCM on the descriptor-ring engine, `Clock Source` |
@@ -343,7 +347,7 @@ echo 'module snd_clarett +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 echo 'format "stream-svc:" +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 
 # or scope it by file / function
-echo 'file clarett_main.c +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+echo 'file clarett_engine.c +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 echo 'func clarett_stream_service +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 ```
 

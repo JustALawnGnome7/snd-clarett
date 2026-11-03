@@ -13,7 +13,8 @@
 # Named once, for both halves of this file: the kbuild half turns it into the object
 # list, the packaging half into the tarball/DKMS payload. Adding a source file here is
 # the only edit either needs.
-CLARETT_SRCS := clarett_main.c clarett_mailbox.c clarett_pcm.c clarett_hwdep.c clarett_midi.c
+CLARETT_SRCS := clarett_main.c clarett_models.c clarett_engine.c clarett_follow.c \
+		clarett_pm.c clarett_mailbox.c clarett_pcm.c clarett_hwdep.c clarett_midi.c
 CLARETT_HDRS := clarett.h clarett_fcp_uapi.h
 
 # Kbuild includes this file with `obj` set (along with src, M and KERNELRELEASE); a direct

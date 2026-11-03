@@ -496,14 +496,14 @@ static void clarett_mbox_copy_out(struct clarett *c,
 	have = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 	/*
 	 * Honour the response's own size. The device answers some commands
-	 * with LESS than the caller asked for — MUX_READ caps every reply at 28
-	 * entries (112 bytes) however large a count is requested — and copying
-	 * the full requested length then hands the caller whatever the PREVIOUS
-	 * command left in resp_buf: stale DMA content presented as device data,
-	 * and via the hwdep a kernel-memory disclosure. Zero-fill the tail so a
-	 * short reply is unmistakably short. size == 0 is left alone: not every
-	 * command fills the field, and a zero-length answer is judged by
-	 * outcome (see the note in __clarett_fcp()).
+	 * with LESS than the caller asked for — MUX_READ caps every reply at
+	 * 28 entries (112 bytes) however large a count is requested — and
+	 * copying the full requested length then hands the caller whatever
+	 * the PREVIOUS command left in resp_buf: stale DMA content presented
+	 * as device data, and via the hwdep a kernel-memory disclosure.
+	 * Zero-fill the tail so a short reply is unmistakably short. size == 0
+	 * is left alone: not every command fills the field, and a zero-length
+	 * answer is judged by outcome (see the note in __clarett_fcp()).
 	 */
 	if (have && have < resp_len) {
 		memcpy(resp_out, r + FCP_RESP_DATA_OFF, have);
