@@ -241,9 +241,9 @@ without it, so the driver does not send it. Credit: Geoffrey D. Bennett establis
   numbers it last (PCM 19-20 on a 4Pre or 8Pre). The capture copy moves the pair to the end of
   each frame (`clarett_model.rx_loopback_at`), so ALSA capture channel n is the router's PCM n at
   every rate. The Red range's maps name capture channels in stream order and need no reordering.
-- **Clock source** is the `Clock Source` ALSA control, backed by the per-card `clock_source[]`
-  parameter. It is sent with the sample rate in `SET_CLOCK` at every arm, and a change to the
-  control is sent at once at the current rate, streaming or not. `Sync Status` (from `fcp-server`)
+- **Clock source** is the `Clock Source` ALSA control, one per card; alsactl's saved state keeps it
+  across reloads and re-attaches. It is sent with the sample rate in `SET_CLOCK` at every arm, and
+  a change to the control is sent at once at the current rate, streaming or not. `Sync Status` (from `fcp-server`)
   shows the lock.
 - **There is no default route**: playback is silent until a PCM source is wired to an output in the
   router.
@@ -370,8 +370,6 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
   entries follow attach order, and a unit refused by `enable` does not keep its entry.
 - `enable_pcm` (default on) — register the PCM devices; `0` for a control-only card.
 - `enable_midi` (default on) — register the DIN MIDI rawmidi.
-- `clock_source` (per card, runtime-writable) — the sample clock source; the same value as the
-  `Clock Source` control.
 - `max_buffer` — optional hard ceiling on the ALSA buffer, in frames (`0`, the default, leaves it to
   the per-period rule).
 - `notify_ms` (default 50) — rate limit for the notification relay.

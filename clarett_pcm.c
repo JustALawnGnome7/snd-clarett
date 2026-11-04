@@ -58,54 +58,21 @@ static void clarett_build_rings(struct clarett *c);
 #define CLARETT_DYN_MIN_FRAMES	CLARETT_FRAG_FRAMES
 
 /*
- * Clock source sent with SET_CLOCK at each stream arm and whenever the "Clock
- * Source" control changes; this is the value behind that control. The enums
- * are in clarett.h. Default Internal.
- *
- * PER-CARD, indexed by ALSA card number, because a two-card ADAT rig needs one
- * card on Internal and the other on ADAT. A sysfs write takes effect at the
- * next stream arm, a control write immediately. On an external source the PCM
- * rate must match the external clock's.
- */
-static int clock_source[SNDRV_CARDS] = {
-	[0 ... SNDRV_CARDS - 1] = CLARETT_CLOCK_INTERNAL
-};
-
-/* NULL count, so the sysfs read shows the whole array, not just what was set */
-module_param_array(clock_source, int, NULL, 0644);
-MODULE_PARM_DESC(clock_source,
-		 "Per-card SET_CLOCK source, indexed by ALSA card number: "
-		 "24=Internal (default), 0=ADAT, 3=S/PDIF (8PreX also has "
-		 "1=ADAT 2, 2=Wordclock). PCM rate must match the external "
-		 "clock when not Internal.");
-
-/*
- * The clock source in force for this card; falls back to Internal for a card
- * number past the array.
+ * The clock source sent with SET_CLOCK at each stream arm and whenever the
+ * "Clock Source" control changes (the enums are in clarett.h). On an external
+ * source the PCM rate must match the external clock's.
  */
 static int clarett_clock_source(struct clarett *c)
 {
-	int n = c->card->number;
-
-	return (n >= 0 && n < SNDRV_CARDS) ? clock_source[n] :
-					       CLARETT_CLOCK_INTERNAL;
-}
-
-static void clarett_set_clock_source(struct clarett *c, int value)
-{
-	int n = c->card->number;
-
-	if (n >= 0 && n < SNDRV_CARDS)
-		clock_source[n] = value;
+	return READ_ONCE(c->clock_src);
 }
 
 /*
  * "Clock Source", the one control this driver owns. The clock source is not a
  * config byte: it exists only in the SET_CLOCK payload {u32 rate, u32 source},
  * and only this driver knows the rate. alsa-scarlett-gui renders any element
- * named "Clock Source" as a drop-down. Backed by clock_source[], so the control
- * and the parameter are one value; a sysfs write bypasses the control's change
- * notification.
+ * named "Clock Source" as a drop-down. Its value is per card, kept across
+ * reloads and re-attaches by alsactl's saved state.
  */
 static int clarett_clock_src_info(struct snd_kcontrol *kctl,
 				  struct snd_ctl_elem_info *uinfo)
@@ -139,16 +106,13 @@ static int clarett_clock_src_get(struct snd_kcontrol *kctl,
 	int cur = clarett_clock_source(c);
 	u8 i;
 
-	/* a value set through sysfs may not be listed: report entry 0 */
 	for (i = 0; i < m->n_clock_srcs; i++) {
 		if (m->clock_srcs[i].value == cur) {
 			ucontrol->value.enumerated.item[0] = i;
 			return 0;
 		}
 	}
-	dev_dbg(&c->pci->dev,
-		"clock source %d not in this model's list; reporting %s\n",
-		cur, m->clock_srcs[0].name);
+	/* only listed values are stored, so this is not reached */
 	ucontrol->value.enumerated.item[0] = 0;
 	return 0;
 }
@@ -169,7 +133,7 @@ static int clarett_clock_src_put(struct snd_kcontrol *kctl,
 	if (value == clarett_clock_source(c))
 		return 0;
 
-	clarett_set_clock_source(c, value);
+	WRITE_ONCE(c->clock_src, value);
 
 	/*
 	 * Apply it at once, streaming or not, at the rate the device runs

@@ -758,6 +758,12 @@ struct clarett {
 	 */
 	u32 cur_rate;
 	/*
+	 * the "Clock Source" control's value, the source SET_CLOCK carries
+	 * (CLARETT_CLOCK_*); Internal at probe, until alsactl restores the
+	 * saved state
+	 */
+	int clock_src;
+	/*
 	 * capture channels the device writes at single/double/quad
 	 * speed: STREAM_INFO's answer, read at probe, or the model
 	 * table's where the device gave none (clarett_read_rx_live)

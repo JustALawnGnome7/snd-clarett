@@ -554,6 +554,7 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 {
 	c->card = card;
 	c->pci = pci;
+	c->clock_src = CLARETT_CLOCK_INTERNAL;
 	/*
 	 * The whole line shares the PCI id, so the id_table's model is a
 	 * placeholder until clarett_identify(). Size nothing from it before.
