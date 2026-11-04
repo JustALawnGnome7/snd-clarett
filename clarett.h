@@ -585,6 +585,8 @@ struct clarett_irqctx {
 struct clarett {
 	struct pci_dev *pci;
 	struct snd_card *card;
+	/* this card's index[]/id[]/enable[] entry (clarett_get_slot()) */
+	int card_slot;
 	void __iomem *bar0;
 	/* selected at probe; see struct clarett_model */
 	const struct clarett_model *model;

@@ -32,6 +32,46 @@
 #define PCI_VENDOR_FOCUSRITE   0x1cb5
 #define PCI_DEVICE_CLARETT     0x0002
 
+static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
+static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
+static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
+module_param_array(index, int, NULL, 0444);
+MODULE_PARM_DESC(index, "Index value for the Clarett/Red sound card.");
+module_param_array(id, charp, NULL, 0444);
+MODULE_PARM_DESC(id, "ID string for the Clarett/Red sound card.");
+module_param_array(enable, bool, NULL, 0444);
+MODULE_PARM_DESC(enable, "Enable the Clarett/Red sound card.");
+
+/*
+ * Which index[]/id[]/enable[] entry a card uses: the lowest one no live card
+ * holds. The usual count of probes would run out, since a Thunderbolt unit can
+ * attach and detach many times per boot. An entry is released only when its
+ * card is freed (clarett_card_free()), so a unit re-attached while its old card
+ * is still open takes the next entry. A unit refused by enable[] does not keep
+ * its entry.
+ */
+static DEFINE_MUTEX(clarett_slot_lock);
+static DECLARE_BITMAP(clarett_slots, SNDRV_CARDS);
+
+static int clarett_get_slot(void)
+{
+	int slot;
+
+	mutex_lock(&clarett_slot_lock);
+	slot = find_first_zero_bit(clarett_slots, SNDRV_CARDS);
+	if (slot < SNDRV_CARDS)
+		__set_bit(slot, clarett_slots);
+	mutex_unlock(&clarett_slot_lock);
+	return slot < SNDRV_CARDS ? slot : -ENODEV;
+}
+
+static void clarett_put_slot(int slot)
+{
+	mutex_lock(&clarett_slot_lock);
+	__clear_bit(slot, clarett_slots);
+	mutex_unlock(&clarett_slot_lock);
+}
+
 static bool enable_pcm = true;
 module_param(enable_pcm, bool, 0444);
 MODULE_PARM_DESC(enable_pcm,
@@ -490,6 +530,7 @@ static void clarett_card_free(struct snd_card *card)
 	 */
 	clarett_hwdep_free(c);
 	clarett_hwdep_free_meters(c);
+	clarett_put_slot(c->card_slot);
 }
 
 /*
@@ -839,14 +880,25 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	struct clarett *c;
 	bool pcm_ok;
 	void __iomem *bar0;
-	int err, seeded;
+	int err, seeded, slot;
 
-	err = snd_card_new(&pci->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
-			   THIS_MODULE, sizeof(*c), &card);
-	if (err < 0)
+	slot = clarett_get_slot();
+	if (slot < 0)
+		return slot;
+	if (!enable[slot]) {
+		clarett_put_slot(slot);
+		return -ENOENT;
+	}
+	err = snd_card_new(&pci->dev, index[slot], id[slot], THIS_MODULE,
+			   sizeof(*c), &card);
+	if (err < 0) {
+		clarett_put_slot(slot);
 		return err;
+	}
 
 	c = card->private_data;
+	/* released by clarett_card_free(), from here on the only free path */
+	c->card_slot = slot;
 	clarett_init_state(c, card, pci, ent);
 
 	err = clarett_map_device(c);

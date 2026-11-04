@@ -364,6 +364,10 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 
 `modinfo snd-clarett` lists all of them. The ones that matter operationally:
 
+- `index`, `id`, `enable` — the standard ALSA per-card arrays: pin a card's number, set its ID
+  string, or leave a unit unregistered (`enable=0`). A card takes the lowest entry no other live
+  Clarett/Red card holds, so a unit power-cycled on its own keeps its entry. With several units,
+  entries follow attach order, and a unit refused by `enable` does not keep its entry.
 - `enable_pcm` (default on) — register the PCM devices; `0` for a control-only card.
 - `enable_midi` (default on) — register the DIN MIDI rawmidi.
 - `clock_source` (per card, runtime-writable) — the sample clock source; the same value as the
