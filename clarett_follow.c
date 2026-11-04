@@ -1,26 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Focusrite Clarett/Red (Thunderbolt) ALSA driver — the deferred workers: the
- * settings persist, the notification relay, front-panel follow and the
- * optional meter poll.
+ * settings persist, the notification relay and front-panel follow.
  */
 #include <linux/pci.h>
 #include <linux/workqueue.h>
-#include <linux/string.h>
 #include "clarett.h"
-
-/*
- * Optional periodic GET_METER. The device needs no host heartbeat, and the
- * Level Meter control reads the meters on demand (cached for
- * CLARETT_METER_CACHE_MS), so by default an idle card issues no mailbox
- * commands. The worker also hosts the optional monitor_poll backstop.
- */
-static int meter_poll_ms;
-module_param(meter_poll_ms, int, 0444);
-MODULE_PARM_DESC(meter_poll_ms,
-		 "Period (ms) of an optional periodic GET_METER, which also "
-		 "drives monitor_poll (default 0: none; the meters are read on "
-		 "demand).");
 
 /*
  * Debounced flash persist. clarett_write_u8() schedules this
@@ -60,24 +45,6 @@ void clarett_notify_work(struct work_struct *work)
 }
 
 /*
- * Monitor-region change poll, a backstop for a front-panel change that raises
- * no device event: read the monitor region every meter_poll_ms tick (so it
- * needs that set too) and relay, and run hw_gain_follow, only when the bytes
- * change. Off by default, since the event relay covers every front-panel
- * control seen on the Clarett and Red units. The Clarett region (24, len 92)
- * covers the monitor mute/dim flags, the master volume pair at 32/33, the
- * HW-enable bits and the knob; a model can widen it
- * (clarett_model.monitor_cfg_len).
- */
-static bool monitor_poll;
-module_param(monitor_poll, bool, 0644);
-MODULE_PARM_DESC(monitor_poll,
-		 "Poll the monitor config region and act when it changes: "
-		 "relay a notification and drive hw_gain_follow. A backstop "
-		 "for changes that raise no device event; runs in the "
-		 "meter_poll_ms worker, so needs that set too (default off).");
-
-/*
  * Keep the SW gain of every output under HARDWARE control equal to the
  * front-panel knob.
  *
@@ -96,9 +63,9 @@ MODULE_PARM_DESC(monitor_poll,
  * recording user intent, and committing the flash on every knob movement would
  * wear it. Writes are change-gated, so a stationary knob costs nothing.
  *
- * `cfg` is the monitor region from clarett_monitor_fetch(): offset
- * MONITOR_CFG_OFFSET, at least MONITOR_CFG_LEN long, spanning the gains, the
- * HW-enable bits and the knob.
+ * `cfg` is the monitor region from clarett_monitor_fetch(): MONITOR_CFG_LEN
+ * bytes from MONITOR_CFG_OFFSET, spanning the gains, the HW-enable bits and the
+ * knob.
  */
 static bool hw_gain_follow = true;
 module_param(hw_gain_follow, bool, 0644);
@@ -206,25 +173,17 @@ void clarett_meter_source_follow(struct clarett *c, u8 source)
 			ms->name, source);
 }
 
-/*
- * Fetch the monitor config region into buf (MONITOR_CFG_MAX_LEN). Returns its
- * length, or <0.
- */
+/* Fetch the monitor config region into buf (MONITOR_CFG_LEN bytes). */
 static int clarett_monitor_fetch(struct clarett *c, u8 *buf)
 {
-	u32 len = c->model->monitor_cfg_len ? : MONITOR_CFG_LEN;
 	u8 req[8];		/* GET_DATA {u32 offset, u32 len} */
-	int err;
-
-	if (WARN_ON_ONCE(len > MONITOR_CFG_MAX_LEN))
-		len = MONITOR_CFG_MAX_LEN;
 
 	clarett_put_le32(req, MONITOR_CFG_OFFSET);
-	clarett_put_le32(req + 4, len);
+	clarett_put_le32(req + 4, MONITOR_CFG_LEN);
 
 	/* copies the payload out under mbox_lock, unlike reading resp_buf */
-	err = clarett_fcp_cmd(c, FCP_GET_DATA, req, sizeof(req), buf, len);
-	return err ? err : len;
+	return clarett_fcp_cmd(c, FCP_GET_DATA, req, sizeof(req), buf,
+			       MONITOR_CFG_LEN);
 }
 
 /*
@@ -239,9 +198,9 @@ void clarett_follow_work(struct work_struct *work)
 {
 	struct clarett *c = container_of(work, struct clarett,
 					 follow_work.work);
-	u8 buf[MONITOR_CFG_MAX_LEN];
+	u8 buf[MONITOR_CFG_LEN];
 
-	if (hw_gain_follow && clarett_monitor_fetch(c, buf) > 0)
+	if (hw_gain_follow && !clarett_monitor_fetch(c, buf))
 		clarett_hw_gain_follow(c, buf);
 }
 
@@ -256,111 +215,4 @@ void clarett_schedule_follow(struct clarett *c)
 
 	if (hw_gain_follow && c->model->n_out_gains && READ_ONCE(c->ctl_ready))
 		schedule_delayed_work(&c->follow_work, delay);
-}
-
-static void clarett_monitor_poll(struct clarett *c)
-{
-	u8 buf[MONITOR_CFG_MAX_LEN];
-	bool changed, first;
-	int len;
-
-	len = clarett_monitor_fetch(c, buf);
-	if (len < 0) {
-		dev_dbg(&c->pci->dev, "monitor poll: GET_DATA failed: %d\n",
-			len);
-		return;
-	}
-
-	first = !c->mon_snap_valid;
-	changed = !first && memcmp(c->mon_snap, buf, len);
-	if (changed) {
-		/* Which bytes moved: "@off old->new", first few only. */
-		char why[96];
-		int n = 0, shown = 0;
-		u32 i;
-
-		why[0] = 0;
-		for (i = 0; i < len && shown < 6; i++)
-			if (c->mon_snap[i] != buf[i]) {
-				n += scnprintf(why + n, sizeof(why) - n,
-					       " @%u %02x->%02x",
-					       MONITOR_CFG_OFFSET + i,
-					       c->mon_snap[i], buf[i]);
-				shown++;
-			}
-		dev_dbg(&c->pci->dev, "monitor poll: region changed:%s\n", why);
-	}
-	memcpy(c->mon_snap, buf, len);
-	c->mon_snap_valid = true;
-
-	if (!first && !changed)
-		return;
-
-	if (changed) {
-		/*
-		 * Usually the event relay got there first; a duplicate costs
-		 * fcp-server one re-read. This catches a change that raised no
-		 * event (the Red's Meter Source is one).
-		 */
-		clarett_hwdep_notify(c, NOTIFY_EV_MONITOR | NOTIFY_EV_DIM_MUTE);
-	}
-
-	/*
-	 * Also on the FIRST poll: until the knob next moves, the stored SW
-	 * gains are whatever the last session left, and a HW->SW switch would
-	 * jump.
-	 */
-	if (hw_gain_follow)
-		clarett_hw_gain_follow(c, buf);
-}
-
-/* Start the optional periodic GET_METER, if meter_poll_ms asks for one. */
-void clarett_meter_poll_start(struct clarett *c)
-{
-	if (meter_poll_ms > 0)
-		schedule_delayed_work(&c->meter_work,
-				      msecs_to_jiffies(meter_poll_ms));
-}
-
-void clarett_meter_work(struct work_struct *work)
-{
-	struct clarett *c = container_of(work, struct clarett, meter_work.work);
-	int n = c->hwdep_n_meter_slots;
-
-	if (meter_poll_ms > 0) {
-		if (n > 0 && c->hwdep_meter_levels) {
-			/*
-			 * The meter control exists (fcp-server set the map):
-			 * fill its cache and stamp hwdep_meter_polled, so the
-			 * control's .get serves the cache instead of sending a
-			 * GET_METER of its own.
-			 */
-			/* {pad:u16=0, num_meters:u16, magic:u32=1} */
-			u8 req[8];
-
-			clarett_put_le16(req, 0);
-			clarett_put_le16(req + 2, n);
-			clarett_put_le32(req + 4, 1);
-			mutex_lock(&c->hwdep_lock);
-			if (!clarett_fcp_cmd(c, FCP_GET_METER, req, sizeof(req),
-					     (u8 *)c->hwdep_meter_levels,
-					     n * sizeof(__le32)))
-				c->hwdep_meter_polled = jiffies ? jiffies : 1;
-			mutex_unlock(&c->hwdep_lock);
-		} else {
-			/* no meter control yet: a bare GET_METER */
-			static const u8 meter_req[8] = {
-				0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00
-			};
-
-			clarett_fcp(c, FCP_GET_METER, meter_req,
-				    sizeof(meter_req));
-		}
-
-		/* the optional backstop, streaming or not */
-		if (monitor_poll && READ_ONCE(c->ctl_ready))
-			clarett_monitor_poll(c);
-
-		clarett_meter_poll_start(c);
-	}
 }

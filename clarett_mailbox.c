@@ -49,15 +49,9 @@
  * bytes the header's size promises are no longer poison
  * (clarett_resp_tail_wait).
  *
- * resp_trace logs one line per command: the latencies, the echoed seq, the FCP
- * status word (resp+8) and the size.
+ * The "FCPr" debug lines give each command's latencies, echoed seq, FCP
+ * status word (resp+8) and size.
  */
-static bool resp_trace;
-module_param(resp_trace, bool, 0444);
-MODULE_PARM_DESC(resp_trace,
-		 "Log per-command response telemetry: DONE and "
-		 "response-landing latencies, echo, FCP status (resp+8), "
-		 "size. Use with meter_poll_ms=0. Default 0.");
 
 /*
  * The response deadline for one command: probe's override while it asks for
@@ -387,7 +381,8 @@ static void clarett_mbox_wait_polled(struct clarett *c,
 
 /*
  * Per-transaction trace, at dev_dbg since the meters are read up to 20 times a
- * second. resp_trace adds the response telemetry.
+ * second. The "FCPr" lines add the response telemetry; match them on their own
+ * with dynamic debug's format "FCPr".
  */
 static void clarett_mbox_trace(struct clarett *c,
 			       const struct clarett_fcp_txn *t, bool by_phase)
@@ -401,26 +396,24 @@ static void clarett_mbox_trace(struct clarett *c,
 		atomic_read(&c->mbox_phase), t->acc_us, t->land_us,
 		t->fcp_status);
 
-	if (!resp_trace)
-		return;
 	if (t->resp_echo) {
 		u32 size = r[FCP_RESP_SIZE_OFF] | r[FCP_RESP_SIZE_OFF + 1] << 8;
 		u32 rseq = r[FCP_RESP_SEQ_OFF] | r[FCP_RESP_SEQ_OFF + 1] << 8;
 
-		dev_info(&c->pci->dev,
-			 "FCPr op=0x%06x seq=%u done=%lldus resp=%lldus rseq=%u err=%u size=%u phase=0x%x\n",
-			 t->opcode, c->seq, t->done_us, t->land_us, rseq,
-			 r[FCP_RESP_STATUS_OFF], size,
-			 atomic_read(&c->mbox_phase));
+		dev_dbg(&c->pci->dev,
+			"FCPr op=0x%06x seq=%u done=%lldus resp=%lldus rseq=%u err=%u size=%u phase=0x%x\n",
+			t->opcode, c->seq, t->done_us, t->land_us, rseq,
+			r[FCP_RESP_STATUS_OFF], size,
+			atomic_read(&c->mbox_phase));
 		/* the payload head of every answered non-meter command */
 		if (size && t->opcode != FCP_GET_METER)
-			dev_info(&c->pci->dev, "FCPr   payload=%*ph\n",
-				 (int)min(size, 32u), r + FCP_RESP_DATA_OFF);
+			dev_dbg(&c->pci->dev, "FCPr   payload=%*ph\n",
+				(int)min(size, 32u), r + FCP_RESP_DATA_OFF);
 	} else {
-		dev_info(&c->pci->dev,
-			 "FCPr op=0x%06x seq=%u done=%lldus resp=NONE (ack withheld) phase=0x%x\n",
-			 t->opcode, c->seq, t->done_us,
-			 atomic_read(&c->mbox_phase));
+		dev_dbg(&c->pci->dev,
+			"FCPr op=0x%06x seq=%u done=%lldus resp=NONE (ack withheld) phase=0x%x\n",
+			t->opcode, c->seq, t->done_us,
+			atomic_read(&c->mbox_phase));
 	}
 }
 
@@ -495,7 +488,7 @@ static void clarett_mbox_check_wedge(struct clarett *c,
  * NOTE: fcp_status (resp+8) is NOT a clean pass/fail on this device — INIT_1
  * on an already initialised device returns a nonzero status yet the command
  * works. So it does not fail the call by itself; it is surfaced in the dev_dbg
- * trace and via resp_trace. The one case it does decide is a caller asking for
+ * trace. The one case it does decide is a caller asking for
  * data and getting a nonzero status with none: a refusal.
  */
 static int clarett_mbox_result(struct clarett *c,

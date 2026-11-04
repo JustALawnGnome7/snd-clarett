@@ -220,12 +220,6 @@ static const struct clarett_model red_8line = {
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
 	.tb_gen = 3,	/* JHL6540 Alpine Ridge; the Red 4Pre is its TB2 twin */
-	/*
-	 * The three knob groups keep their gains at 112/116/120 and mute/dim at
-	 * 124/126/128, and the Meter Source selector is at 268, so the watched
-	 * region runs to 268 (the Clarett default stops at 115).
-	 */
-	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 };
 
 /*
@@ -255,8 +249,6 @@ static const struct clarett_model red_16line = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	/* the 8Line's knob groups and Meter Source */
-	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 	/* its TB2 twin is the Red 8Pre */
 	.tb_gen = 3,
 };
@@ -280,7 +272,6 @@ static const struct clarett_model red_4pre = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 	.tb_gen = 2,
 };
 
@@ -296,7 +287,6 @@ static const struct clarett_model red_8pre = {
 	.max_rate = 192000,
 	.clock_srcs = red_clock_srcs,
 	.n_clock_srcs = ARRAY_SIZE(red_clock_srcs),
-	.monitor_cfg_len = 269 - MONITOR_CFG_OFFSET,
 	.tb_gen = 2,
 };
 
@@ -360,7 +350,7 @@ static int clarett_unit_tb_gen(struct pci_dev *pdev)
  * STREAM_INFO{band}: the device's stream geometry at one speed band. Returns 0
  * with the pair filled in, -EIO if the device refused the read (status != 0, or
  * a reply too short to hold the pair), or the transport error. The reply is
- * copied out under mbox_lock, so a command from the meter worker cannot
+ * copied out under mbox_lock, so another command (a meter read, say) cannot
  * overwrite it mid-parse. When not quiet, every failure logs the raw response.
  */
 static int clarett_stream_info(struct clarett *c, u8 band, u16 *playback,

@@ -187,10 +187,8 @@ struct snd_rawmidi_substream;
 
 /* Monitoring config region re-read on a notification. */
 #define MONITOR_CFG_OFFSET       24
-/* default: 24..115, the Clarett's gains, HW bits and knob */
+/* 24..115: the Clarett's gains, HW bits and knob */
 #define MONITOR_CFG_LEN          92
-/* largest per-model region (clarett_model.monitor_cfg_len) */
-#define MONITOR_CFG_MAX_LEN      245
 /* the front-panel knob's level; read-only reflection */
 #define MONITOR_VOLUME_OFFSET    112
 
@@ -262,8 +260,7 @@ struct snd_rawmidi_substream;
 
 /*
  * GET_METER (0x001001): read the level meters, payload {u16 0, u16 count, u32
- * 1}. Read on demand by the Level Meter control; meter_poll_ms optionally
- * issues it periodically too (clarett_meter_work()).
+ * 1}. Read on demand by the Level Meter control.
  */
 #define FCP_GET_METER            0x001001
 
@@ -483,12 +480,6 @@ struct clarett_model {
 	/* selectable clock sources, Internal first */
 	const struct clarett_clock_src *clock_srcs;
 	u8 n_clock_srcs;
-	/*
-	 * Bytes from MONITOR_CFG_OFFSET that clarett_monitor_poll watches for
-	 * front-panel changes. Must cover every config byte a front-panel
-	 * control can move. 0 = MONITOR_CFG_LEN; at most MONITOR_CFG_MAX_LEN.
-	 */
-	u8 monitor_cfg_len;
 };
 
 /*
@@ -636,13 +627,6 @@ struct clarett {
 	/* debounced DATA_CMD{PERSIST}; see CLARETT_SAVE_DELAY_MS */
 	struct delayed_work save_work;
 	atomic_t notify_bits;
-	/*
-	 * Last-seen monitor config region, for the change-detecting backstop
-	 * poll (clarett_monitor_poll). Touched only from the meter worker, so
-	 * no lock of its own.
-	 */
-	u8 mon_snap[MONITOR_CFG_MAX_LEN];
-	bool mon_snap_valid;
 	/* by the vec0 ISR on 0x400 bit0 (request accepted), in flight */
 	struct completion mbox_accepted;
 	/* ...on 0x400 bit1 (response landed), in flight */
@@ -684,11 +668,6 @@ struct clarett {
 	 */
 	atomic_t cmd_inflight;
 
-	/*
-	 * Periodic GET_METER heartbeat. See FCP_GET_METER /
-	 * clarett_meter_work().
-	 */
-	struct delayed_work meter_work;
 	/* hw_gain_follow, run on an event (clarett_schedule_follow) */
 	struct delayed_work follow_work;
 	/* system resume: re-attach after the host is awake */
@@ -713,7 +692,7 @@ struct clarett {
 	 */
 	wait_queue_head_t hwdep_notify_wait;
 	atomic_t hwdep_notify_event;
-	/* coalesces relay wakes (0x400 heartbeat ~13.4 Hz) */
+	/* coalesces relay wakes, at most one per notify_ms */
 	struct delayed_work hwdep_notify_dwork;
 	/* dwork INIT'd: gates cancel (probe-error paths never got here) */
 	bool hwdep_ready;
@@ -1256,11 +1235,9 @@ void clarett_engine_stop(struct clarett *c);
 void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0);
 
 /* follow.c */
-void clarett_meter_poll_start(struct clarett *c);
 void clarett_save_work(struct work_struct *work);
 void clarett_notify_work(struct work_struct *work);
 void clarett_follow_work(struct work_struct *work);
-void clarett_meter_work(struct work_struct *work);
 /*
  * Write the selected meter source's per-band channel tables (@136/146/156) and
  * commit; see the definition. Called from the hwdep CMD path when fcp-server

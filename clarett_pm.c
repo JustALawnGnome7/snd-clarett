@@ -44,7 +44,6 @@ static int clarett_suspend(struct device *dev)
 	snd_power_sync_ref(card);
 
 	WRITE_ONCE(c->ctl_ready, false); /* no new notify work from the ISR */
-	cancel_delayed_work_sync(&c->meter_work);
 	cancel_delayed_work_sync(&c->follow_work);
 	cancel_work_sync(&c->notify_work);
 	if (cancel_delayed_work_sync(&c->save_work))
@@ -89,7 +88,6 @@ void clarett_resume_work(struct work_struct *work)
 	c->seq = 0;
 	c->lost_pending = false;
 	c->mbox_wedged = false;
-	c->mon_snap_valid = false;
 	clarett_hw_init(c);
 
 	err = clarett_seed_shadow(c);
@@ -105,7 +103,6 @@ void clarett_resume_work(struct work_struct *work)
 	}
 	clarett_pcm_resume(c);
 
-	clarett_meter_poll_start(c);
 	WRITE_ONCE(c->ctl_ready, true);
 	clarett_schedule_follow(c);
 	clarett_hwdep_notify(c, ~0u);

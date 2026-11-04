@@ -233,10 +233,7 @@ int clarett_seed_shadow(struct clarett *c)
 	clarett_put_le32(req, 0);
 	clarett_put_le32(req + 4, CLARETT_CONFIG_SIZE);
 	for (attempt = 0; attempt < 3; attempt++) {
-		/*
-		 * copied out under mbox_lock: the meter worker may already be
-		 * issuing commands
-		 */
+		/* copied out under mbox_lock: other commands may be running */
 		err = clarett_fcp_read(c, FCP_GET_DATA, req, sizeof(req), buf,
 				       sizeof(buf), &size, NULL);
 		if (err)
@@ -459,7 +456,6 @@ static void clarett_hw_teardown(struct clarett *c)
 	/* stop the ISR queueing new notify work */
 	WRITE_ONCE(c->ctl_ready, false);
 	cancel_delayed_work_sync(&c->resume_work);
-	cancel_delayed_work_sync(&c->meter_work);
 	cancel_delayed_work_sync(&c->follow_work);
 	if (cancel_delayed_work_sync(&c->save_work))
 		clarett_data_cmd(c, FCP_ACTIVATE_PERSIST);
@@ -518,7 +514,6 @@ static void clarett_card_free(struct snd_card *card)
 	 */
 	WRITE_ONCE(c->ctl_ready, false);
 	cancel_delayed_work_sync(&c->resume_work);
-	cancel_delayed_work_sync(&c->meter_work);
 	/* nothing to flush to: the device is gone */
 	cancel_delayed_work_sync(&c->save_work);
 	cancel_work_sync(&c->notify_work);
@@ -570,7 +565,6 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 	init_completion(&c->addr_acked);
 	INIT_WORK(&c->notify_work, clarett_notify_work);
 	INIT_DELAYED_WORK(&c->save_work, clarett_save_work);
-	INIT_DELAYED_WORK(&c->meter_work, clarett_meter_work);
 	INIT_DELAYED_WORK(&c->follow_work, clarett_follow_work);
 	INIT_DELAYED_WORK(&c->resume_work, clarett_resume_work);
 	atomic_set(&c->notify_bits, 0);
@@ -703,12 +697,6 @@ static int clarett_setup_model(struct clarett *c)
 	c->rx_slot = roundup_pow_of_two(c->rx_slot);
 	c->tx_slot = clarett_tx_frag_bytes(c->model->playback_channels);
 	c->tx_slot = roundup_pow_of_two(c->tx_slot);
-
-	/*
-	 * Start the optional periodic GET_METER now (meter_poll_ms), so it is
-	 * already running when the monitor-enable writes below go out.
-	 */
-	clarett_meter_poll_start(c);
 
 	/*
 	 * Seed the shadow from the device so the enable-byte RMW below is safe.
@@ -968,7 +956,6 @@ static void clarett_remove(struct pci_dev *pci)
 	 */
 	WRITE_ONCE(c->ctl_ready, false); /* no new notify work from the ISR */
 	cancel_delayed_work_sync(&c->resume_work);
-	cancel_delayed_work_sync(&c->meter_work);
 	cancel_delayed_work_sync(&c->follow_work);
 	clarett_engine_stop(c);
 
@@ -1001,7 +988,6 @@ static void clarett_shutdown(struct pci_dev *pci)
 		return;
 	c = card->private_data;
 	cancel_delayed_work_sync(&c->resume_work);
-	cancel_delayed_work_sync(&c->meter_work);
 	cancel_delayed_work_sync(&c->follow_work);
 	clarett_hwdep_free(c); /* no-op unless the hwdep path armed the relay */
 	/*
