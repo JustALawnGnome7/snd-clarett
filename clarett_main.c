@@ -510,6 +510,7 @@ static void clarett_card_free(struct snd_card *card)
 	 * relay wake, whose timer must not outlive c.
 	 */
 	clarett_hwdep_free(c);
+	clarett_hwdep_free_meters(c);
 }
 
 /*

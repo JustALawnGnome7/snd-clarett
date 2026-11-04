@@ -328,15 +328,13 @@ static int clarett_hwdep_meter_create(struct clarett *c, const s16 *tmp,
 				      u16 map_size, u16 meter_slots)
 {
 	int parts = DIV_ROUND_UP(map_size, CLARETT_METER_MAX_CHANNELS);
-	s16 *new_map = devm_kmalloc_array(&c->pci->dev, map_size,
-					  sizeof(s16), GFP_KERNEL);
-	__le32 *levels = devm_kmalloc_array(&c->pci->dev, meter_slots,
-					    sizeof(__le32), GFP_KERNEL);
+	s16 *new_map = kmalloc_array(map_size, sizeof(s16), GFP_KERNEL);
+	__le32 *levels = kmalloc_array(meter_slots, sizeof(__le32), GFP_KERNEL);
 	int err = 0;
 
 	if (!new_map || !levels) {
-		devm_kfree(&c->pci->dev, levels);	/* NULL-safe */
-		devm_kfree(&c->pci->dev, new_map);
+		kfree(levels);
+		kfree(new_map);
 		return -ENOMEM;
 	}
 	/* info() reads the geometry, so set it before adding the controls */
@@ -378,8 +376,8 @@ static int clarett_hwdep_meter_create(struct clarett *c, const s16 *tmp,
 	} else if (err) {
 		c->hwdep_meter_map = NULL;
 		c->hwdep_meter_levels = NULL;
-		devm_kfree(&c->pci->dev, levels);
-		devm_kfree(&c->pci->dev, new_map);
+		kfree(levels);
+		kfree(new_map);
 	}
 	return err;
 }
@@ -479,7 +477,7 @@ static void clarett_hwdep_meter_clear_labels(struct clarett *c, int p)
 	kctl->vd[0].access &= ~(SNDRV_CTL_ELEM_ACCESS_TLV_READ |
 				SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK);
 	snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
-	devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv[p]);
+	kfree(c->hwdep_meter_labels_tlv[p]);
 	c->hwdep_meter_labels_tlv[p] = NULL;
 	c->hwdep_meter_labels_tlv_size[p] = 0;
 }
@@ -495,7 +493,7 @@ static int clarett_hwdep_meter_set_labels(struct clarett *c, int p,
 	unsigned int data_size = ALIGN(len, sizeof(unsigned int));
 	/* type + length + payload */
 	unsigned int tlv_size = sizeof(unsigned int) * 2 + data_size;
-	unsigned int *tlv = devm_kzalloc(&c->pci->dev, tlv_size, GFP_KERNEL);
+	unsigned int *tlv = kzalloc(tlv_size, GFP_KERNEL);
 
 	if (!tlv)
 		return -ENOMEM;
@@ -509,7 +507,7 @@ static int clarett_hwdep_meter_set_labels(struct clarett *c, int p,
 				      SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK;
 		snd_ctl_notify(c->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
 	} else {
-		devm_kfree(&c->pci->dev, c->hwdep_meter_labels_tlv[p]);
+		kfree(c->hwdep_meter_labels_tlv[p]);
 	}
 	c->hwdep_meter_labels_tlv[p] = tlv;
 	c->hwdep_meter_labels_tlv_size[p] = tlv_size;
@@ -702,6 +700,26 @@ void clarett_hwdep_notify(struct clarett *c, u32 ev)
  * can re-arm it (clarett_notify_work). The flag also covers probe-error
  * teardowns that never reached clarett_hwdep_init().
  */
+/*
+ * Free the Level Meter buffers. They are plain allocations, not devres, because
+ * the card can outlive remove() (snd_card_free_when_closed()), so they are
+ * freed with the card: from clarett_card_free(), once the controls that read
+ * them are gone. NULL-safe, so a probe error path may call it too.
+ */
+void clarett_hwdep_free_meters(struct clarett *c)
+{
+	int p;
+
+	for (p = 0; p < CLARETT_METER_PARTS; p++) {
+		kfree(c->hwdep_meter_labels_tlv[p]);
+		c->hwdep_meter_labels_tlv[p] = NULL;
+	}
+	kfree(c->hwdep_meter_levels);
+	c->hwdep_meter_levels = NULL;
+	kfree(c->hwdep_meter_map);
+	c->hwdep_meter_map = NULL;
+}
+
 void clarett_hwdep_free(struct clarett *c)
 {
 	if (!c->hwdep_ready)

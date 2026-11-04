@@ -693,8 +693,8 @@ struct clarett {
 	 * the device's raw meter array (or -1 = no source) for output channel
 	 * i; hwdep_meter_levels is the GET_METER scratch buffer
 	 * (hwdep_n_meter_slots u32s). hwdep_meter_labels_tlv[p] carries part
-	 * p's channel-name TLV, set by FCP_IOCTL_SET_METER_LABELS. All
-	 * devm-allocated (freed at detach). Mirrors sound/usb/fcp.c.
+	 * p's channel-name TLV, set by FCP_IOCTL_SET_METER_LABELS. Freed with
+	 * the card (clarett_hwdep_free_meters()). Mirrors sound/usb/fcp.c.
 	 */
 	/* serialises the hwdep meter ioctls vs the control callbacks */
 	struct mutex hwdep_lock;
@@ -1200,6 +1200,8 @@ int clarett_hwdep_init(struct clarett *c);
 void clarett_hwdep_notify(struct clarett *c, u32 ev);
 /* stop the relay before c is freed (UAF guard) */
 void clarett_hwdep_free(struct clarett *c);
+/* free the Level Meter buffers, with the card */
+void clarett_hwdep_free_meters(struct clarett *c);
 int clarett_set_data(struct clarett *c, u32 offset, u32 len, const u8 *val);
 int clarett_data_cmd(struct clarett *c, u32 activate);
 int clarett_write_u8(struct clarett *c, u32 offset, u8 val, u32 activate);
