@@ -21,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.2.3
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -84,6 +84,17 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %changelog
+* Wed Nov 04 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.3.0-1
+- Add the standard index, id and enable card parameters
+- The Clock Source setting is kept by alsactl's saved state; the
+  clock_source parameter is removed
+- Remove the remaining tuning and diagnostic parameters: addr_ack_ms,
+  enable_midi, enable_pcm, hw_gain_follow, meter_poll_ms, monitor_poll,
+  notify_ms, ready_resp_ms, ready_timeout_ms, resp_timeout_ms,
+  resp_trace, tx_guard, tx_trace
+- Free the level-meter buffers with the card
+- Split and reorganise the source into per-subsystem files
+
 * Fri Oct 23 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.2.3-1
 - Do not wait for open handles when the device is removed, which froze
   resume when a Thunderbolt chain was lost during system sleep
