@@ -131,7 +131,7 @@ Probe sequence:
    nothing about how the device answers. Credit: Geoffrey D. Bennett established this.
 1. **Wait for the response-address acknowledgement.** The device answers the write of the
    response buffer's address (high word, `0x414`) by raising `0x400` bit 0, and does not answer a
-   mailbox command sent before that. Probe waits for it, up to `addr_ack_ms` (500 ms). The delay
+   mailbox command sent before that. Probe waits for it, up to 500 ms. The delay
    varies by model: ~0.15 ms on a Red 8Line, ~9.5 ms on a Clarett 2Pre, ~11 ms on a 4Pre, ~13 ms
    on an 8Pre or 8PreX (cold; a warm rebind is faster, ~2 ms on a 2Pre or 4Pre),
    so a fixed pause loses the first command on some model. With the wait, every model answers its
@@ -141,15 +141,14 @@ Probe sequence:
    completes — DONE is raised — but no response arrives, and the device then refuses anything sent
    as the next sequence number. Asking again as **sequence number 0** is answered, so after an
    unanswered command the mailbox starts the sequence over at 0, and probe re-asks until the device
-   answers or `ready_timeout_ms` (10 s) runs out. Each attempt waits `ready_resp_ms` (20 ms) for its
-   response instead of the mailbox's usual 100 ms, because a response that lands at all lands within
-   a millisecond.
+   answers or 10 s runs out. Each attempt waits 20 ms for its response instead of the mailbox's usual
+   100 ms, because a response that lands at all lands within a millisecond.
 3. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, PCI config space and the BAR0 serial and firmware-info words (placeholders, the same
    on every unit) — but the session reports the model's stream geometry: `STREAM_INFO{band 0}` (`0x007001`)
    answers `{u16 playback_channels, u16 capture_channels}`, a pair unique per model. Probe then asks
    bands 1 and 2 (double and quad speed) for the capture width S/MUX leaves; see Sample rates below.
-4. **Give up.** A unit that has not answered within `ready_timeout_ms` fails the probe with a
+4. **Give up.** A unit that has not answered within those 10 s fails the probe with a
    message to power-cycle it. The budget is kept short because a removal of the device (the user
    power-cycling it) waits for its probe to finish.
 
@@ -375,16 +374,12 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 - `monitor_poll` (default off) — the change-detecting monitor-region poll (a backstop).
 - `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
 - `meter_poll_ms` (default 0) — an optional periodic `GET_METER`, which also drives `monitor_poll`.
-- `addr_ack_ms` (default 500), `ready_resp_ms` (default 20), `ready_timeout_ms` (default 10000) —
-  all runtime-writable: the bound on the response-address acknowledgement wait, how long each
-  fallback attempt waits for its response, and the budget described above.
-- `resp_timeout_ms` (default 100) — how long one command's response DMA may take to land.
 - `tx_guard` (default 16, one fragment) — frames the playback fill keeps clear of the device's read
   position. A frame written less than this far ahead of the read is not played, so smaller is better
   for a client that keeps little queued; a full-buffer client is unaffected.
 
-The rest are diagnostics: `resp_trace` (per-command response telemetry) and `tx_trace` (DMA pointer
-trace while streaming). Their `MODULE_PARM_DESC` strings say more.
+The rest is a diagnostic: `resp_trace` (per-command response telemetry). Its `MODULE_PARM_DESC`
+string says more.
 
 ## Settings persistence
 

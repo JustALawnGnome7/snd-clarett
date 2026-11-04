@@ -523,6 +523,12 @@ struct clarett_model {
 
 #define CLARETT_MBOX_TIMEOUT_MS  100
 /*
+ * Deadline for a command's response DMA to land, separate from the DONE wait
+ * above. A response that misses it is retired by the next command
+ * (clarett_retire_lost()).
+ */
+#define CLARETT_RESP_TIMEOUT_MS  100
+/*
  * Response deadline for the FLASH category (0x004xxx): a flash read can take
  * far longer than any other command, and has outlasted the normal 100 ms.
  */
@@ -586,7 +592,7 @@ struct clarett {
 	/* serialises FCP transactions */
 	struct mutex mbox_lock;
 	u16 seq;
-	/* response deadline override while probe asks; 0 = resp_timeout_ms */
+	/* response deadline override while probe asks; 0 = none */
 	unsigned int resp_deadline_ms;
 
 	void *resp_buf;			/* coherent GET-response DMA buffer */
@@ -641,7 +647,7 @@ struct clarett {
 	struct completion mbox_landed;
 	/*
 	 * Response-address acknowledgement (0x400 bit0 after the 0x414 write);
-	 * see addr_ack_ms.
+	 * see CLARETT_ADDR_ACK_MS.
 	 */
 	struct completion addr_acked;
 	bool addr_ack_wait;	/* the ISR completes addr_acked on 0x400 bit0 */

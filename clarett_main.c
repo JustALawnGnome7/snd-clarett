@@ -44,7 +44,7 @@ MODULE_PARM_DESC(enable_pcm,
  * session from flash at power-up, and a host-side bring-up would reset the
  * user's routing and mixer to the factory default. Probe waits for that session
  * to answer and detects the model from it. If it never answers within
- * ready_timeout_ms, probe fails rather than register a placeholder;
+ * CLARETT_READY_TIMEOUT_MS, probe fails rather than register a placeholder;
  * power-cycle the unit to retry.
  */
 
@@ -53,39 +53,22 @@ MODULE_PARM_DESC(enable_pcm,
  * 0x414 write in clarett_hw_init) by raising 0x400 bit0, and a command sent
  * before that is never answered. The time varies by model, from ~0.15 ms (Red
  * 8Line) to ~13 ms (8Pre, 8PreX) cold, so clarett_hw_init waits for the
- * acknowledgement (up to addr_ack_ms). No register shows readiness.
+ * acknowledgement (up to CLARETT_ADDR_ACK_MS). No register shows readiness.
  *
  * Fallback, for a device that does not acknowledge in time: a command sent too
  * early is never answered, and the mailbox then starts over at seq 0, which the
  * device does answer. So probe re-asks at once until it answers or
- * ready_timeout_ms runs out, each attempt waiting ready_resp_ms (a response
- * that lands at all lands within a millisecond).
+ * CLARETT_READY_TIMEOUT_MS runs out, each attempt waiting
+ * CLARETT_READY_RESP_MS (a response that lands at all lands within a
+ * millisecond).
  */
 
-static unsigned int ready_resp_ms = 20;
-module_param(ready_resp_ms, uint, 0644);
-MODULE_PARM_DESC(ready_resp_ms,
-		 "How long (ms) each readiness attempt at probe waits for its "
-		 "response before asking again (default 20; 0 = "
-		 "resp_timeout_ms).");
-
-static unsigned int ready_timeout_ms = 10000;
-module_param(ready_timeout_ms, uint, 0644);
-MODULE_PARM_DESC(ready_timeout_ms,
-		 "Give up on a device that has not answered by this long (ms) "
-		 "after the first attempt (default 10000).");
-
-/*
- * Bound on the response-address acknowledgement wait; see the probe readiness
- * note above ready_resp_ms.
- */
-static unsigned int addr_ack_ms = 500;
-module_param(addr_ack_ms, uint, 0644);
-MODULE_PARM_DESC(addr_ack_ms,
-		 "Wait up to this long (ms) for the device to acknowledge "
-		 "the response-buffer address (0x400 bit0) before the first "
-		 "command (default 500; 0 = do not wait, which usually loses "
-		 "the first command to the retransmit fallback).");
+/* response-address acknowledgement wait */
+#define CLARETT_ADDR_ACK_MS	500
+/* each fallback attempt's response deadline */
+#define CLARETT_READY_RESP_MS	20
+/* give up on a device that has not answered by then */
+#define CLARETT_READY_TIMEOUT_MS	10000
 
 /*
  * After clarett_hw_teardown() the BAR mapping may be gone: writes are dropped
@@ -107,6 +90,8 @@ u32 clarett_rl(struct clarett *c, u32 off)
 
 void clarett_hw_init(struct clarett *c)
 {
+	ktime_t t0;
+
 	/*
 	 * Pre-mailbox init: the two 0x510/0x500 writes every attach makes
 	 * (device open; not decoded beyond these values), the interrupt-cause
@@ -118,26 +103,20 @@ void clarett_hw_init(struct clarett *c)
 	clarett_wl(c, REG_MIDI_STATUS, 0x8);
 	clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);
 	clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
-	if (addr_ack_ms) {
-		ktime_t t0;
-
-		reinit_completion(&c->addr_acked);
-		WRITE_ONCE(c->addr_ack_wait, true);
-		t0 = ktime_get();
-		clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
-		if (wait_for_completion_timeout(&c->addr_acked,
-						msecs_to_jiffies(addr_ack_ms)))
-			dev_dbg(&c->pci->dev,
-				"readiness: response address acknowledged after %lld us\n",
-				ktime_us_delta(ktime_get(), t0));
-		else
-			dev_warn(&c->pci->dev,
-				 "response address not acknowledged within %u ms; asking anyway\n",
-				 addr_ack_ms);
-		WRITE_ONCE(c->addr_ack_wait, false);
-	} else {
-		clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
-	}
+	reinit_completion(&c->addr_acked);
+	WRITE_ONCE(c->addr_ack_wait, true);
+	t0 = ktime_get();
+	clarett_wl(c, REG_DMA_ADDR_HI, upper_32_bits(c->resp_dma));
+	if (wait_for_completion_timeout(&c->addr_acked,
+					msecs_to_jiffies(CLARETT_ADDR_ACK_MS)))
+		dev_dbg(&c->pci->dev,
+			"readiness: response address acknowledged after %lld us\n",
+			ktime_us_delta(ktime_get(), t0));
+	else
+		dev_warn(&c->pci->dev,
+			 "response address not acknowledged within %d ms; asking anyway\n",
+			 CLARETT_ADDR_ACK_MS);
+	WRITE_ONCE(c->addr_ack_wait, false);
 
 	memset(c->shadow, 0, sizeof(c->shadow));
 }
@@ -293,7 +272,7 @@ static void clarett_irq_event(struct clarett *c)
 
 	/*
 	 * Init is waiting for the response-address acknowledgement
-	 * (addr_ack_ms).
+	 * (CLARETT_ADDR_ACK_MS).
 	 */
 	if (READ_ONCE(c->addr_ack_wait) &&
 	    (cause & NOTIFY_REQ_ACCEPTED)) {
@@ -604,15 +583,16 @@ static int clarett_identify(struct clarett *c)
 	struct pci_dev *pci = c->pci;
 	bool collapsed = false;
 	const struct clarett_model *det;
-	unsigned long deadline = jiffies + msecs_to_jiffies(ready_timeout_ms);
+	unsigned long deadline =
+		jiffies + msecs_to_jiffies(CLARETT_READY_TIMEOUT_MS);
 	int tries = 0;
 
 	/*
-	 * Ask until the device answers (see the note above ready_resp_ms),
+	 * Ask until the device answers (see the probe readiness note above),
 	 * quietly; the last attempt is re-run with logging below. The budget is
 	 * short because a removal of the device waits for probe.
 	 */
-	c->resp_deadline_ms = ready_resp_ms;
+	c->resp_deadline_ms = CLARETT_READY_RESP_MS;
 	for (;;) {
 		tries++;
 		det = clarett_detect_model(c, &collapsed, true);
@@ -634,8 +614,8 @@ static int clarett_identify(struct clarett *c)
 	if (collapsed) {
 		/* never became ready: fail, don't register a placeholder */
 		dev_err(&pci->dev,
-			"device did not become ready within %u ms over %d attempts (mailbox %s) — refusing to register; power-cycle the unit to retry.\n",
-			ready_timeout_ms, tries,
+			"device did not become ready within %d ms over %d attempts (mailbox %s) — refusing to register; power-cycle the unit to retry.\n",
+			CLARETT_READY_TIMEOUT_MS, tries,
 			c->mbox_wedged ?
 			"wedged: no response, or one echoing another command's seq" :
 			"answering, but refusing the request");
@@ -1025,10 +1005,11 @@ ATTRIBUTE_GROUPS(clarett);
 static struct pci_driver clarett_driver = {
 	.name = KBUILD_MODNAME,
 	/*
-	 * Probe can spend up to ready_timeout_ms waiting for a device to become
-	 * ready. Asynchronous so that wait runs on its own worker, not in line
-	 * with every other driver's probe. (A removal of this device still
-	 * waits for its probe to finish, which is why the budget is short.)
+	 * Probe can spend up to CLARETT_READY_TIMEOUT_MS waiting for a device
+	 * to become ready. Asynchronous so that wait runs on its own worker,
+	 * not in line with every other driver's probe. (A removal of this
+	 * device still waits for its probe to finish, which is why the budget
+	 * is short.)
 	 */
 	.driver = {
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,

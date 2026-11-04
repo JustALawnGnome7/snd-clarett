@@ -10,16 +10,6 @@
 #include <linux/ktime.h>
 #include "clarett.h"
 
-static int tx_trace;
-module_param(tx_trace, int, 0644);
-MODULE_PARM_DESC(tx_trace,
-		 "Diagnostic (off by default): every Nth 0x300 period, log the "
-		 "engine's block-0 (TX) and block-1 (RX) DMA pointer regs "
-		 "(0x218/0x318) alongside the ctr step and our fill clock "
-		 "(pcm_frames). N = the value (e.g. tx_trace=32 logs one line "
-		 "per 32 periods; 1 = every period). Shows whether the engine "
-		 "consumes TX faster than the fill. Runtime-writable.");
-
 /*
  * The stream servicer. The data-plane DMA engine is flow-controlled: it raises
  * a period on the 0x300 cause register and waits for the host to ACK it by
@@ -132,22 +122,6 @@ static void clarett_svc_timing(struct clarett *c, struct clarett_svc_stats *st,
 		st->step_max = step;
 }
 
-/* tx_trace: the engine's ring pointers beside the fill clock. */
-static void clarett_svc_tx_trace(struct clarett *c, u32 ctr, u32 step)
-{
-	void __iomem *bar = c->bar0;
-	/* 0x218 engine TX read pos */
-	u32 txptr = readl(bar + STREAM_BLK0 + STREAM_OFF_PTR);
-	/* 0x318 engine RX write pos */
-	u32 rxptr = readl(bar + STREAM_BLK1 + STREAM_OFF_PTR);
-
-	dev_info(&c->pci->dev,
-		 "tx-trace[%d]: ctr=0x%x step=%u frames=%u | TXptr=0x%08x RXptr=0x%08x | fill=pcm_frames=%llu\n",
-		 atomic_read(&c->stream_periods), ctr, step,
-		 step * CLARETT_CTR_FRAMES, txptr, rxptr,
-		 (unsigned long long)c->pcm_frames);
-}
-
 /*
  * One 0x300 period event: advance the frame clock by the counter delta and
  * run the PCM tick. Returns false if the sample was rejected, in which case
@@ -200,9 +174,6 @@ static bool clarett_svc_event(struct clarett *c, u32 c2,
 	st->seen = true;
 
 	clarett_svc_timing(c, st, step);
-	if (tx_trace > 0 &&
-	    (atomic_read(&c->stream_periods) % tx_trace) == 0)
-		clarett_svc_tx_trace(c, ctr, step);
 
 	atomic_inc(&c->stream_periods);
 	/* advance by real captured frames (no-op if idle) */

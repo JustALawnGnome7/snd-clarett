@@ -60,23 +60,9 @@ MODULE_PARM_DESC(resp_trace,
 		 "size. Use with meter_poll_ms=0. Default 0.");
 
 /*
- * Deadline for a command's response DMA to land, separate from
- * CLARETT_MBOX_TIMEOUT_MS (the DONE wait). A response that misses it is retired
- * by the next command (clarett_retire_lost()).
- */
-static uint resp_timeout_ms = CLARETT_MBOX_TIMEOUT_MS;
-module_param(resp_timeout_ms, uint, 0644);
-MODULE_PARM_DESC(resp_timeout_ms,
-		 "Deadline (ms) for a command's response DMA to land before "
-		 "the trailing ack is withheld (default 100). Diagnostic: "
-		 "raise it to find out whether a slow command's response is "
-		 "merely LATE or never sent at all. resp_trace=1 prints the "
-		 "landing latency.");
-
-/*
  * The response deadline for one command: probe's override while it asks for
  * readiness, the long flash deadline for the FLASH category, else
- * resp_timeout_ms.
+ * CLARETT_RESP_TIMEOUT_MS.
  */
 static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
 {
@@ -84,7 +70,7 @@ static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
 		return c->resp_deadline_ms;
 	if ((opcode & ~CMD_EXEC_FLAG) >> 12 == 0x004)
 		return CLARETT_FLASH_TIMEOUT_MS;
-	return resp_timeout_ms;
+	return CLARETT_RESP_TIMEOUT_MS;
 }
 
 /*
@@ -302,9 +288,9 @@ static void clarett_mbox_submit(struct clarett *c, struct clarett_fcp_txn *t,
 /*
  * Wait for the command on the 0x400 phase bits the vec0 ISR completes:
  * accepted, then landed. Both deadlines follow the response deadline
- * (clarett_resp_ms(): resp_timeout_ms, ready_resp_ms while probe asks, longer
- * for a flash command). A command whose response has not landed is not acked
- * here; the next command retires it first (clarett_retire_lost()).
+ * (clarett_resp_ms(): CLARETT_RESP_TIMEOUT_MS, shorter while probe asks,
+ * longer for a flash command). A command whose response has not landed is not
+ * acked here; the next command retires it first (clarett_retire_lost()).
  */
 static void clarett_mbox_wait_phase(struct clarett *c,
 				    struct clarett_fcp_txn *t)
