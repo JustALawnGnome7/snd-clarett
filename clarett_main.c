@@ -686,9 +686,7 @@ static int clarett_setup_model(struct clarett *c)
 	 * Start the optional periodic GET_METER now (meter_poll_ms), so it is
 	 * already running when the monitor-enable writes below go out.
 	 */
-	if (clarett_meter_poll_ms > 0)
-		schedule_delayed_work(&c->meter_work,
-				      msecs_to_jiffies(clarett_meter_poll_ms));
+	clarett_meter_poll_start(c);
 
 	/*
 	 * Seed the shadow from the device so the enable-byte RMW below is safe.

@@ -266,7 +266,6 @@ struct snd_rawmidi_substream;
  * issues it periodically too (clarett_meter_work()).
  */
 #define FCP_GET_METER            0x001001
-#define CLARETT_METER_POLL_MS    40
 
 /*
  * Minimum spacing between the meter control's GET_METER reads; between them its
@@ -1243,8 +1242,7 @@ void clarett_engine_stop(struct clarett *c);
 void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0);
 
 /* follow.c */
-/* the meter_poll_ms module parameter */
-extern int clarett_meter_poll_ms;
+void clarett_meter_poll_start(struct clarett *c);
 void clarett_save_work(struct work_struct *work);
 void clarett_notify_work(struct work_struct *work);
 void clarett_follow_work(struct work_struct *work);

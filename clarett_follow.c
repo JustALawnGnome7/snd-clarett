@@ -15,8 +15,8 @@
  * CLARETT_METER_CACHE_MS), so by default an idle card issues no mailbox
  * commands. The worker also hosts the optional monitor_poll backstop.
  */
-int clarett_meter_poll_ms;
-module_param_named(meter_poll_ms, clarett_meter_poll_ms, int, 0444);
+static int meter_poll_ms;
+module_param(meter_poll_ms, int, 0444);
 MODULE_PARM_DESC(meter_poll_ms,
 		 "Period (ms) of an optional periodic GET_METER, which also "
 		 "drives monitor_poll (default 0: none; the meters are read on "
@@ -314,14 +314,20 @@ static void clarett_monitor_poll(struct clarett *c)
 		clarett_hw_gain_follow(c, buf);
 }
 
+/* Start the optional periodic GET_METER, if meter_poll_ms asks for one. */
+void clarett_meter_poll_start(struct clarett *c)
+{
+	if (meter_poll_ms > 0)
+		schedule_delayed_work(&c->meter_work,
+				      msecs_to_jiffies(meter_poll_ms));
+}
+
 void clarett_meter_work(struct work_struct *work)
 {
 	struct clarett *c = container_of(work, struct clarett, meter_work.work);
-	int delay = clarett_meter_poll_ms > 0 ?
-		    clarett_meter_poll_ms : CLARETT_METER_POLL_MS;
 	int n = c->hwdep_n_meter_slots;
 
-	if (clarett_meter_poll_ms > 0) {
+	if (meter_poll_ms > 0) {
 		if (n > 0 && c->hwdep_meter_levels) {
 			/*
 			 * The meter control exists (fcp-server set the map):
@@ -355,6 +361,6 @@ void clarett_meter_work(struct work_struct *work)
 		if (monitor_poll && READ_ONCE(c->ctl_ready))
 			clarett_monitor_poll(c);
 
-		schedule_delayed_work(&c->meter_work, msecs_to_jiffies(delay));
+		clarett_meter_poll_start(c);
 	}
 }

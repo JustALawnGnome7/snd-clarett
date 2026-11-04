@@ -105,9 +105,7 @@ void clarett_resume_work(struct work_struct *work)
 	}
 	clarett_pcm_resume(c);
 
-	if (clarett_meter_poll_ms > 0)
-		schedule_delayed_work(&c->meter_work,
-				      msecs_to_jiffies(clarett_meter_poll_ms));
+	clarett_meter_poll_start(c);
 	WRITE_ONCE(c->ctl_ready, true);
 	clarett_schedule_follow(c);
 	clarett_hwdep_notify(c, ~0u);
