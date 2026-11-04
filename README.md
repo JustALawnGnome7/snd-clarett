@@ -87,7 +87,7 @@ sudo make load              # loads it (auto-binds PCI 1cb5:0002)
 ```
 
 Build against another tree with `make KDIR=/path/to/kernel`, and pass module parameters with
-`sudo make load ARGS='enable_pcm=0'`.
+`sudo make load ARGS='index=5'`.
 
 To install it permanently instead, so it loads by name:
 

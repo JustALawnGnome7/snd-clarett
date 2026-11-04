@@ -633,33 +633,8 @@ static int clarett_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
  * them as is, and any other an all-categories wildcard (~0).
  */
 /*
- * Minimum gap between notification wakes (0 = no limiting; writable at
- * runtime). Each wake costs fcp-server a re-read of every notifiable control
- * the event matches. A turning monitor knob raises its event dozens of times a
- * second; 50 ms collapses that to one re-read per 50 ms, which still tracks the
- * knob smoothly.
- */
-static uint notify_ms = 50;
-module_param(notify_ms, uint, 0644);
-
-MODULE_PARM_DESC(notify_ms,
-		 "Minimum ms between notification wakes to userspace "
-		 "(default 50; 0 = every notification). Raise it to cut "
-		 "mailbox traffic while a front-panel control moves.");
-
-/*
- * The relay's rate limit, shared by the hw_gain_follow trigger
- * (clarett_schedule_follow).
- */
-unsigned int clarett_hwdep_notify_ms(void)
-{
-	return READ_ONCE(notify_ms);
-}
-
-/*
- * Coalesced wake: fires ~notify_ms after the FIRST notification of a burst —
- * see the rate-limit note in clarett_hwdep_notify() for why it must not be the
- * last one.
+ * Coalesced wake: fires CLARETT_NOTIFY_MS after the FIRST notification of a
+ * burst; see clarett_hwdep_notify() for why it must not be the last one.
  */
 static void clarett_hwdep_notify_wake(struct work_struct *work)
 {
@@ -672,12 +647,14 @@ static void clarett_hwdep_notify_wake(struct work_struct *work)
 void clarett_hwdep_notify(struct clarett *c, u32 ev)
 {
 	/*
-	 * Coalesce: record the event now, wake at most once per notify_ms.
+	 * Coalesce: record the event now, wake at most once per
+	 * CLARETT_NOTIFY_MS.
 	 *
 	 * schedule_delayed_work(), NOT mod_delayed_work(): it is a no-op while
-	 * the work is queued, so the wake lands notify_ms after the FIRST
-	 * event of a burst. mod_delayed_work() would push the deadline out on
-	 * every event, and against a knob that keeps turning never fire.
+	 * the work is queued, so the wake lands CLARETT_NOTIFY_MS after the
+	 * FIRST event of a burst. mod_delayed_work() would push the deadline
+	 * out on every event, and against a knob that keeps turning never
+	 * fire.
 	 */
 	if (!c->hwdep_ready)
 		return;
@@ -690,7 +667,7 @@ void clarett_hwdep_notify(struct clarett *c, u32 ev)
 	}
 	atomic_or(ev, &c->hwdep_notify_event);
 	schedule_delayed_work(&c->hwdep_notify_dwork,
-			      msecs_to_jiffies(notify_ms));
+			      msecs_to_jiffies(CLARETT_NOTIFY_MS));
 }
 
 /*

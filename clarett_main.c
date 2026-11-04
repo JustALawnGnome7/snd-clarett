@@ -72,13 +72,6 @@ static void clarett_put_slot(int slot)
 	mutex_unlock(&clarett_slot_lock);
 }
 
-static bool enable_pcm = true;
-module_param(enable_pcm, bool, 0444);
-MODULE_PARM_DESC(enable_pcm,
-		 "Register the PCM devices (playback + capture, S32_LE, "
-		 "descriptor-ring engine driven by the 0x300 servicer). "
-		 "Default on. Set 0 for a control-only card.");
-
 /*
  * THE DRIVER NEVER ARMS. A device that has been set up once restores its
  * session from flash at power-up, and a host-side bring-up would reset the
@@ -767,16 +760,14 @@ static bool clarett_create_interfaces(struct clarett *c)
 	clarett_schedule_follow(c);
 
 	/* PCM */
-	if (enable_pcm) {
-		err = clarett_create_pcm(c);
-		if (err)
-			dev_warn(&pci->dev,
-				 "PCM create failed (%d); continuing without PCM\n",
-				 err);
-		else
-			/* c->pcm is set before an alloc that can still fail */
-			pcm_ok = true;
-	}
+	err = clarett_create_pcm(c);
+	if (err)
+		dev_warn(&pci->dev,
+			 "PCM create failed (%d); continuing without PCM\n",
+			 err);
+	else
+		/* c->pcm is set before an alloc that can still fail */
+		pcm_ok = true;
 
 	/* DIN MIDI, on models with MIDI jacks (a no-op otherwise) */
 	err = clarett_create_midi(c);

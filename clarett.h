@@ -278,6 +278,15 @@ struct snd_rawmidi_substream;
  */
 #define CLARETT_SAVE_DELAY_MS    2000
 
+/*
+ * Minimum gap between notification wakes to fcp-server, and the delay before
+ * the knob follow. Each wake costs fcp-server a re-read of every notifiable
+ * control the event matches. A turning monitor knob raises its event dozens of
+ * times a second; 50 ms collapses that to one re-read per 50 ms, which still
+ * tracks the knob smoothly.
+ */
+#define CLARETT_NOTIFY_MS        50
+
 /* SET_CLOCK: payload {u32 sample_rate, u32 clock_source}. */
 #define FCP_SET_CLOCK            0x006003
 /*
@@ -668,7 +677,7 @@ struct clarett {
 	 */
 	atomic_t cmd_inflight;
 
-	/* hw_gain_follow, run on an event (clarett_schedule_follow) */
+	/* the knob follow, run on an event (clarett_schedule_follow) */
 	struct delayed_work follow_work;
 	/* system resume: re-attach after the host is awake */
 	struct delayed_work resume_work;
@@ -692,7 +701,7 @@ struct clarett {
 	 */
 	wait_queue_head_t hwdep_notify_wait;
 	atomic_t hwdep_notify_event;
-	/* coalesces relay wakes, at most one per notify_ms */
+	/* coalesces relay wakes, at most one per CLARETT_NOTIFY_MS */
 	struct delayed_work hwdep_notify_dwork;
 	/* dwork INIT'd: gates cancel (probe-error paths never got here) */
 	bool hwdep_ready;
@@ -1206,7 +1215,6 @@ int clarett_write_u8_nosave(struct clarett *c, u32 offset, u8 val,
  * the definition.
  */
 void clarett_schedule_persist(struct clarett *c);
-unsigned int clarett_hwdep_notify_ms(void);
 
 /* BAR0 access wrappers. */
 void clarett_wl(struct clarett *c, u32 off, u32 val);
@@ -1267,7 +1275,7 @@ void clarett_pcm_suspend(struct clarett *c);
 void clarett_pcm_resume(struct clarett *c);
 
 /* midi.c */
-/* register the DIN MIDI rawmidi (no-op if enable_midi off) */
+/* register the DIN MIDI rawmidi (no-op on a model without MIDI) */
 int clarett_create_midi(struct clarett *c);
 /* drain the RX FIFO from the ISR */
 void clarett_midi_irq(struct clarett *c);

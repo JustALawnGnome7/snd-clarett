@@ -36,12 +36,6 @@
 #include <sound/rawmidi.h>
 #include "clarett.h"
 
-static bool enable_midi = true;
-module_param(enable_midi, bool, 0444);
-MODULE_PARM_DESC(enable_midi,
-		 "Register the DIN MIDI rawmidi device (the register UART at "
-		 "BAR0 0x58c). Default on.");
-
 /*
  * TX flow control. The FIFO drains at the DIN wire rate, 3125 bytes/s or ~960
  * us per 3-byte word. The poll interval is a fraction of a word time; the
@@ -258,7 +252,7 @@ int clarett_create_midi(struct clarett *c)
 	char name[40];
 	int err;
 
-	if (!enable_midi || !c->model->has_midi)
+	if (!c->model->has_midi)
 		return 0;
 
 	/*

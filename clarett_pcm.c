@@ -414,33 +414,20 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos,
  * so near the read position it rewrites frames with the data they already
  * hold. A larger guard only loses audio from a client keeping a short queue: a
  * frame written less than the guard ahead of the read is never copied and
- * plays as silence.
+ * plays as silence. It is not a latency term (the buffer and the reported
+ * delay do not change with it) but a deadline: a frame has to be in the ALSA
+ * buffer this many frames, plus up to one period, before the engine reaches
+ * its slot.
  */
 #define CLARETT_TX_GUARD_FRAMES	CLARETT_FRAG_FRAMES		/* 16 frames */
 
 /*
  * Smallest ALSA buffer offered. The buffer is a power-of-two divisor of the
  * 4096-frame ring, which keeps ALSA frame k and ring frame k wrapping
- * together. 128 frames (2.7 ms at 48 kHz) is a clean floor, the one
- * CLARETT_MAX_PERIODS works against, and leaves room for a tx_guard raised to
- * 64 (the fill clamps the guard to half the buffer).
+ * together. 128 frames (2.7 ms at 48 kHz) is a clean floor, and the one
+ * CLARETT_MAX_PERIODS works against.
  */
 #define CLARETT_MIN_BUFFER_FRAMES	128
-
-/*
- * The guard as a lever. It is not a latency term (the buffer and the reported
- * delay do not change with it) but a deadline: a frame has to be in the ALSA
- * buffer this many frames, plus up to one period, before the engine reaches
- * its slot, or the silence already there plays (see CLARETT_TX_GUARD_FRAMES).
- * Clamped per fill to half the ALSA buffer and floored at one fragment.
- */
-static unsigned int tx_guard = CLARETT_TX_GUARD_FRAMES;
-module_param(tx_guard, uint, 0644);
-MODULE_PARM_DESC(tx_guard,
-		 "Frames the playback fill stays clear of the engine's TX read "
-		 "position (default 16, clamped to half the ALSA buffer, "
-		 "floored at one 16-frame fragment). Does not affect reported "
-		 "latency; see clarett_pcm.c before changing it.");
 
 /*
  * Largest ALSA buffer offered, in frames; 0 (the default) = the whole
@@ -486,15 +473,6 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
  * mid-period only rewrites frames with the data they already hold, so it
  * cannot tear anything.
  */
-/*
- * Frames ahead of the engine's read position that the fill leaves alone (the
- * fragment being read).
- */
-static u32 clarett_play_guard(u32 abuf)
-{
-	return clamp_t(u32, READ_ONCE(tx_guard), CLARETT_FRAG_FRAMES, abuf / 2);
-}
-
 /*
  * First fill after START. If the engine has already reached the guard window of
  * frame 0 — START landed just before a period event and the servicer only got
@@ -570,7 +548,7 @@ static void clarett_play_fill(struct clarett *c)
 	frame = (u32)c->model->playback_channels * 4;
 	ring  = clarett_tx_ring_bytes(c) / frame;
 	abuf  = ps->runtime->buffer_size;	/* <= ring, and divides it */
-	guard = clarett_play_guard(abuf);
+	guard = CLARETT_TX_GUARD_FRAMES;
 	if (ring <= guard)
 		return;
 

@@ -73,12 +73,12 @@ period (`0x300`) events.
   `clarett_model.notify_word` gets an all-categories wildcard (`~0`) instead. **Driver and maps
   move together:** a map whose masks predate the event bits (the Clarett's `1`, the Red's `1`)
   matches nothing this driver relays, so front-panel changes silently stop reaching the GUI; a new
-  map under an older, wildcard-relaying driver still works. Wakes are **rate-limited** to one per `notify_ms` — deliberately
+  map under an older, wildcard-relaying driver still works. Wakes are **rate-limited** to one per 50 ms — deliberately
   a rate limit (one interval after the *first* event of a burst), not a debounce, which against a
   control being moved continuously would never fire.
 - **The relay runs while streaming too.** An audio period raises no event bit, so a stream adds no
   relays. Every front-panel control tried on the Clarett and Red units raises an event.
-- **`hw_gain_follow` runs on events:** a relayed monitor or dim/mute event, the card coming up, and
+- **The knob follow runs on events:** a relayed monitor or dim/mute event, the card coming up, and
   `fcp-server` committing a SW/HW switch (which the device does not announce).
 
 The device needs no host heartbeat: left with no host traffic for minutes, it still answers and
@@ -98,8 +98,7 @@ local `fcp-server` patches, listed in that directory's README.
   global `Mute`/`Dim` act on those outputs — the master flag (offset 24/28) does nothing unless an
   output opts in via its enable bit. The remaining per-output
   mute/dim enables are not exposed. There is no per-output mute on this hardware.
-- **It keeps the software gain of a hardware-controlled output in step with the knob**
-  (`hw_gain_follow`). An output whose volume is set to HW ignores its stored software gain, and the
+- **It keeps the software gain of a hardware-controlled output in step with the knob.** An output whose volume is set to HW ignores its stored software gain, and the
   device never mirrors the knob back into it — so the GUI fader would not follow, and switching the
   output back to SW would jump to a stale value. On each monitor or dim/mute event the driver writes
   the knob position (byte 112) into the software gain of each HW-controlled output. These writes are
@@ -359,21 +358,14 @@ period, so divide by it before calling anything a stall. Judge a stream by `late
 
 ## Module parameters
 
-`modinfo snd-clarett` lists all of them. The ones that matter operationally:
+`modinfo snd-clarett` lists them:
 
 - `index`, `id`, `enable` — the standard ALSA per-card arrays: pin a card's number, set its ID
   string, or leave a unit unregistered (`enable=0`). A card takes the lowest entry no other live
   Clarett/Red card holds, so a unit power-cycled on its own keeps its entry. With several units,
   entries follow attach order, and a unit refused by `enable` does not keep its entry.
-- `enable_pcm` (default on) — register the PCM devices; `0` for a control-only card.
-- `enable_midi` (default on) — register the DIN MIDI rawmidi.
 - `max_buffer` — optional hard ceiling on the ALSA buffer, in frames (`0`, the default, leaves it to
   the per-period rule).
-- `notify_ms` (default 50) — rate limit for the notification relay.
-- `hw_gain_follow` (default on) — mirror the knob into the software gain of HW-controlled outputs.
-- `tx_guard` (default 16, one fragment) — frames the playback fill keeps clear of the device's read
-  position. A frame written less than this far ahead of the read is not played, so smaller is better
-  for a client that keeps little queued; a full-buffer client is unaffected.
 
 Per-command mailbox telemetry is a dynamic-debug message: enable it with
 `echo 'format "FCPr" +p' > /sys/kernel/debug/dynamic_debug/control`.

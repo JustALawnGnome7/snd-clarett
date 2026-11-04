@@ -45,6 +45,18 @@ void clarett_notify_work(struct work_struct *work)
 }
 
 /*
+ * Byte `off` as fetched into the monitor-region buffer, or -1 if it falls
+ * outside that window.
+ */
+static int clarett_cfg_byte(const u8 *cfg, u32 off)
+{
+	if (off < MONITOR_CFG_OFFSET ||
+	    off >= MONITOR_CFG_OFFSET + MONITOR_CFG_LEN)
+		return -1;
+	return cfg[off - MONITOR_CFG_OFFSET];
+}
+
+/*
  * Keep the SW gain of every output under HARDWARE control equal to the
  * front-panel knob.
  *
@@ -67,27 +79,6 @@ void clarett_notify_work(struct work_struct *work)
  * bytes from MONITOR_CFG_OFFSET, spanning the gains, the HW-enable bits and the
  * knob.
  */
-static bool hw_gain_follow = true;
-module_param(hw_gain_follow, bool, 0644);
-MODULE_PARM_DESC(hw_gain_follow,
-		 "Track the front-panel volume knob into the SW gain of "
-		 "every output set to HW, so the GUI fader follows it and a "
-		 "HW->SW toggle does not jump (default on; matches the USB "
-		 "models' scarlett2 behaviour). 0 leaves the stored SW gains "
-		 "untouched.");
-
-/*
- * Byte `off` as fetched into the monitor-region buffer, or -1 if it falls
- * outside that window.
- */
-static int clarett_cfg_byte(const u8 *cfg, u32 off)
-{
-	if (off < MONITOR_CFG_OFFSET ||
-	    off >= MONITOR_CFG_OFFSET + MONITOR_CFG_LEN)
-		return -1;
-	return cfg[off - MONITOR_CFG_OFFSET];
-}
-
 static void clarett_hw_gain_follow(struct clarett *c, const u8 *cfg)
 {
 	int mon = clarett_cfg_byte(cfg, MONITOR_VOLUME_OFFSET);
@@ -104,7 +95,7 @@ static void clarett_hw_gain_follow(struct clarett *c, const u8 *cfg)
 		int gain = clarett_cfg_byte(cfg, gain_off);
 		int err;
 
-		/* a model whose offsets escape the polled window */
+		/* a model whose offsets escape the fetched window */
 		if (hwen < 0 || gain < 0)
 			continue;
 		/*
@@ -187,12 +178,12 @@ static int clarett_monitor_fetch(struct clarett *c, u8 *buf)
 }
 
 /*
- * hw_gain_follow on an event. Scheduled when a relayed notification carries the
- * monitor or dim/mute bit, once when the card comes up (the stored SW gains are
- * whatever the last session left), and when fcp-server commits a SW/HW switch,
- * which the device does not announce. Delayed by notify_ms and a no-op while
- * already queued, so a turning knob (dozens of events a second) costs at most
- * one region read per notify_ms.
+ * The knob follow, run on an event: scheduled when a relayed notification
+ * carries the monitor or dim/mute bit, once when the card comes up (the stored
+ * SW gains are whatever the last session left), and when fcp-server commits a
+ * SW/HW switch, which the device does not announce. Delayed by
+ * CLARETT_NOTIFY_MS and a no-op while already queued, so a turning knob costs
+ * at most one region read per CLARETT_NOTIFY_MS.
  */
 void clarett_follow_work(struct work_struct *work)
 {
@@ -200,7 +191,7 @@ void clarett_follow_work(struct work_struct *work)
 					 follow_work.work);
 	u8 buf[MONITOR_CFG_LEN];
 
-	if (hw_gain_follow && !clarett_monitor_fetch(c, buf))
+	if (!clarett_monitor_fetch(c, buf))
 		clarett_hw_gain_follow(c, buf);
 }
 
@@ -211,8 +202,8 @@ void clarett_follow_work(struct work_struct *work)
  */
 void clarett_schedule_follow(struct clarett *c)
 {
-	unsigned long delay = msecs_to_jiffies(clarett_hwdep_notify_ms());
+	unsigned long delay = msecs_to_jiffies(CLARETT_NOTIFY_MS);
 
-	if (hw_gain_follow && c->model->n_out_gains && READ_ONCE(c->ctl_ready))
+	if (c->model->n_out_gains && READ_ONCE(c->ctl_ready))
 		schedule_delayed_work(&c->follow_work, delay);
 }
