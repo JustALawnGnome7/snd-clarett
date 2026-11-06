@@ -258,6 +258,11 @@ sudo rm /var/lib/alsa/asound.state
 - **Rarely, no card appears after a Thunderbolt attach.** The driver keeps asking the interface for
   up to 10 seconds and refuses to register if it never answers (it logs *"device did not become
   ready"*). Power-cycle the interface to retry.
+- **Some hosts will not start up with a Clarett switched on.** On at least one laptop the
+  firmware stops at a black screen, before its logo or the boot menu, while a powered Clarett
+  (Thunderbolt 2) is connected, and carries on as soon as the Clarett is switched off. It
+  happens before any operating system loads, so the driver plays no part; a Red on the same
+  host is unaffected. Switch the Clarett on after the host has started; it attaches normally.
 
 ## How it works / contributing
 
