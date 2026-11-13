@@ -21,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -84,6 +84,22 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %changelog
+* Fri Nov 13 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.4.0-1
+- Take the data plane's period events from the interrupt: the device
+  raises one per period on MSI vector 0, so the stream servicer is woken
+  rather than polling the period block every ~150 microseconds. The
+  servicer still reads the period register itself, since that read is
+  how a period is acknowledged. On a 60-channel capture it now costs
+  4.0%% of a core at a 512-frame period against 11.3%% polling
+- Keep the playback refill on its own cadence, so a client holding a
+  lead of a few frames is unaffected by the above
+- Require MSI: the probe fails if the vectors cannot be allocated or
+  hooked, and the polled mailbox completion cycle is gone. It was never
+  exercised on hardware, since no unit has come up with fewer than its
+  four vectors
+- Warn when a stream's engine raises no period event at all, a state
+  the device can enter and hold until it is power-cycled; it was
+  previously invisible at the default log level
 * Wed Nov 04 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.3.0-1
 - Add the standard index, id and enable card parameters
 - The Clock Source setting is kept by alsactl's saved state; the
