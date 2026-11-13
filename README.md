@@ -144,11 +144,11 @@ the WirePlumber configuration described under *Using it*.
 ### Secure Boot
 
 With Secure Boot enabled the kernel refuses an unsigned module (`Key was rejected by
-service`). Either turn Secure Boot off, or enrol the key the build system signs with:
+service`). Either turn Secure Boot off, or enroll the key the build system signs with:
 
-- **DKMS** signs with its own key; enrol it once with
+- **DKMS** signs with its own key; enroll it once with
   `sudo mokutil --import /var/lib/dkms/mok.pub` and confirm at the next reboot.
-- **akmod** signs with a key generated on first use; enrol it with
+- **akmod** signs with a key generated on first use; enroll it with
   `sudo mokutil --import /etc/pki/akmods/certs/public_key.der`.
 
 Some laptops ship with Secure Boot set to trust Windows only, in which case Linux's own

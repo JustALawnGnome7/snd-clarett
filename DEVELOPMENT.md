@@ -19,7 +19,7 @@ MIDI, the sample clock (the `Clock Source` control), and model detection.
 | `clarett_main.c` | PCI probe and removal, the attach sequence, IRQs, the serial sysfs file |
 | `clarett_models.c` | The per-model table and model detection |
 | `clarett_engine.c` | The data-plane engine (arm/run/stop) and the stream servicer |
-| `clarett_follow.c` | Deferred workers: settings persist, notification relay, front-panel follow, meter poll |
+| `clarett_follow.c` | Deferred workers: settings persist, notification relay, front-panel follow |
 | `clarett_pm.c` | System sleep (suspend/resume) |
 | `clarett_mailbox.c` | FCP command transport over BAR0 |
 | `clarett_hwdep.c` | The FCP hwdep ABI consumed by `fcp-server` |
@@ -246,8 +246,9 @@ without it, so the driver does not send it. Credit: Geoffrey D. Bennett establis
   shows the lock.
 - **There is no default route**: playback is silent until a PCM source is wired to an output in the
   router.
-- Surprise removal is handled: the servicer and meter poll stop before the card is disconnected, a
-  dead link (all-ones reads) ends the servicer, and the mailbox fails fast on a disconnected device.
+- Surprise removal is handled: the servicer and the deferred workers stop before the card is
+  disconnected, a dead link (all-ones reads) ends the servicer, and the mailbox fails fast on a
+  disconnected device.
 - **Removal does not wait for userspace.** `clarett_remove()` disconnects the card, tears the hardware
   side down at once (`clarett_hw_teardown()`: settings flush, engine stop, interrupt mask, MSI vectors,
   DMA quiesce) and frees the card with `snd_card_free_when_closed()`, so the rest happens whenever the
