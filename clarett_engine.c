@@ -50,6 +50,8 @@ struct clarett_svc_stats {
 	u64 run_gap_max_us, run_read_us_max;
 	u32 run_late, run_step_max;
 	bool seen;
+	/* when the servicer first saw stream_run (0 = never) */
+	ktime_t run_start;
 	/*
 	 * Tick lateness. The period counters cannot show it: they accumulate
 	 * the hardware counter delta, so a late servicer catches up on the next
@@ -77,7 +79,7 @@ struct clarett_svc_stats {
  * With no command in flight it also reads 0x100, which asserts bit31 every
  * period (read-to-clear), and 0x500. 0x400 is the vec0 ISR's alone. While a
  * command is in flight (cmd_inflight), 0x100 and 0x500 belong to the mailbox,
- * so only the stream blocks 0x300/0x200 are read; the mailbox's polled sweep
+ * so only the stream blocks 0x300/0x200 are read; the mailbox's cause sweep
  * skips those two while streaming (clarett_mailbox.c).
  */
 static u32 clarett_svc_read_causes(struct clarett *c,
@@ -244,6 +246,37 @@ static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
 			st->overruns);
 }
 
+/*
+ * The longest a running engine can go with no period event: four times the
+ * widest event spacing (a 1024-frame period at 44.1 kHz, ~23 ms).
+ */
+#define CLARETT_SILENT_RUN_MS	100
+
+/*
+ * Warn about a stream that ran with no period event at all: the engine took
+ * the arm, then never moved audio, and the app gets -EIO at its wait timeout.
+ * Seen after long arm/stop churn on one host; it survives a module reload, and
+ * a power cycle of the unit clears it. Nothing in such a run trips the
+ * anomaly gates of clarett_svc_summary(), so without this the log stays
+ * silent. Not for a device that left the bus, nor for an engine stopped
+ * before it could have raised an event.
+ */
+static void clarett_svc_check_silent(struct clarett *c,
+				     const struct clarett_svc_stats *st,
+				     bool gone)
+{
+	s64 ran_ms;
+
+	if (gone || !st->run_start || atomic_read(&c->stream_periods))
+		return;
+	ran_ms = ktime_ms_delta(ktime_get(), st->run_start);
+	if (ran_ms < CLARETT_SILENT_RUN_MS)
+		return;
+	dev_warn_ratelimited(&c->pci->dev,
+			     "stream engine raised no period in %lld ms; if every stream does this, power-cycle the unit\n",
+			     ran_ms);
+}
+
 static int clarett_stream_service(void *data)
 {
 	struct clarett *c = data;
@@ -276,6 +309,8 @@ static int clarett_stream_service(void *data)
 			usleep_range(300, 600);
 			continue;
 		}
+		if (!st.run_start)
+			st.run_start = ktime_get();
 
 		c2 = clarett_svc_read_causes(c, &st);
 		/*
@@ -318,6 +353,7 @@ static int clarett_stream_service(void *data)
 		usleep_range(100, 200);
 	}
 	clarett_svc_summary(c, &st);
+	clarett_svc_check_silent(c, &st, gone);
 	return 0;
 }
 

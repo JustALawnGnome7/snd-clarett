@@ -330,7 +330,9 @@ reads flash on the attach path.
   stream) in which something went wrong: a late servicer tick, a device-side period overrun, or an
   unusable `0x300` sample. Silence during playback is the healthy state.
 - **warn** — degraded but working: a short MSI vector count, a subsystem that failed to register, a
-  config-shadow seed failure, a transiently unreachable link.
+  config-shadow seed failure, a transiently unreachable link, and a stream whose engine raised no
+  period at all (`stream engine raised no period`: armed, but moving no audio; a power cycle of
+  the unit clears it).
 - **err** — the device never became ready (no card was registered), or MSI could not be set up
   (probe fails: vector 0 completes every mailbox command).
 - **debug** — everything else: register dumps at probe and arm, descriptor-ring geometry, the
