@@ -126,9 +126,47 @@ struct snd_rawmidi_substream;
 
 #define CMD_EXEC_FLAG            0x80000000u
 /*
- * REG_IRQ0_CAUSE bit29 (0x20000000, "DONE") reflects "0x400 has bits pending";
- * the vec0 ISR reads 0x100 first to clear it (clarett_irq_event()).
+ * REG_IRQ0_CAUSE (0x100) is a SUMMARY of the four cause blocks, not a cause
+ * block itself: its top nibble carries one bit per block, which REG_IRQ0_ENABLE
+ * enables as 0xf0000000. Established from vendor traces of all five models
+ * (~150k reads, in which only five distinct values ever appear):
+ *
+ *   bit31  block 1 (0x300), the stream period event. Agrees with 0x300's own
+ *          bit31 in 45905 of 45910 sweeps; every exception is this bit clear
+ *          with 0x300 set, which is an event landing between the two reads.
+ *   bit30  block 0 (0x200), the playback engine. CONFIRMED on hardware by
+ *          giving the TX ring the periodic IRQ marker the RX ring carries
+ *          (a scratch build): 0x200 then reports an event and an advancing
+ *          counter exactly as 0x300 does, and this bit appears with it --
+ *          once reading 0x40000000 alone. It is silent in normal operation
+ *          because nothing marks a TX descriptor, so the playback engine
+ *          raises no cause: see CLARETT_DESC_WRAP_TX, which sets bit0 (wrap)
+ *          on the last entry and never bit1 (IRQ).
+ *   bit29  0x400, the mailbox phase and the device events ("DONE"). It
+ *          reflects "0x400 has bits pending", so the vec0 ISR must read 0x100
+ *          FIRST while a command is in flight (clarett_irq_event()).
+ *   bit28  0x500, MIDI RX. Seen in exactly one capture, a MIDI receive, where
+ *          its 70 reads match that trace's 70 MIDI acks one for one.
+ *
+ * The low bits are a different class: bits 0-3 appear only ever TOGETHER, as
+ * 0xf, exactly once per stream stop (the write of 0 to REG_STREAM_IRQ_ARM) in
+ * all ten captures that stream -- 68 stops, 68 appearances -- and the vendor
+ * clears them by writing 0xf back, which is what clarett_engine_program() does
+ * at arm: it clears what the previous stop left standing. The servicer never
+ * sees them, being stopped before that write.
+ *
+ * Bits 4 and 5 are enabled too and have never been seen set. They are NOT the
+ * period-overrun error they were suspected of being: driven to 26 device-
+ * flagged overruns at the cadence floor (a 16-frame period at 48, 96 and 192
+ * kHz, capture and duplex), this register showed nothing but bits 31 and 29.
+ * The overrun is reported where it always was, in the block's own cause word
+ * (CLARETT_CTR_OVERRUN in 0x300). What is left open is narrower: two more of
+ * the stop class for engines these models lack, or an error class nobody has
+ * provoked. The servicer ORs every value it reads into its cause= telemetry
+ * and reports an unknown bit at info, so the next one to fire says so.
  */
+/* 0x100 bits whose meaning is established (above) */
+#define IRQ0_CAUSE_KNOWN         0xb000000fu
 #define DOORBELL_SUBMIT          1
 #define DOORBELL_ACK             2
 

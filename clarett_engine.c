@@ -36,6 +36,14 @@ struct clarett_svc_stats {
 	u32 bad_reads;
 	/* cumulative OR of every rejected 0x300 sample (badbits) */
 	u32 bad_or;
+	/*
+	 * Cumulative OR of every 0x100 summary read (IRQ0_CAUSE_KNOWN says
+	 * which bits are understood), and whether an unknown one has been
+	 * reported for this stream. Samples taken while a command is in flight
+	 * are not included: the vec0 ISR owns 0x100 then.
+	 */
+	u32 cause_or;
+	bool cause_told;
 	/* events flagged CLARETT_CTR_OVERRUN (device saw a missed ack) */
 	u32 overruns;
 	/*
@@ -92,9 +100,24 @@ static u32 clarett_svc_read_causes(struct clarett *c,
 	u64 rus;
 	u32 c2;
 
-	if (!busy)
-		/* 0x100 per-period cause (bit31) + mailbox DONE */
-		readl(bar + REG_IRQ0_CAUSE);
+	if (!busy) {
+		/* the 0x100 summary: block bits, and the stop class in 0-3 */
+		u32 sum = readl(bar + REG_IRQ0_CAUSE);
+
+		st->cause_or |= sum;
+		/*
+		 * A bit nobody has characterised. Worth one line at info,
+		 * since every capture of every model has only ever shown the
+		 * known ones, and the open question (whether bits 4 and 5 are
+		 * stream errors) is settled the first time this prints.
+		 */
+		if ((sum & ~IRQ0_CAUSE_KNOWN) && !st->cause_told) {
+			st->cause_told = true;
+			dev_info(&c->pci->dev,
+				 "stream-cause: 0x100=0x%08x has unknown bits 0x%08x\n",
+				 sum, sum & ~IRQ0_CAUSE_KNOWN);
+		}
+	}
 	/* 0x300 read-to-clear = period event + counter (owned) */
 	c2 = readl(bar + STREAM_BLK1);
 	/* 0x200 TX cause (owned) */
@@ -237,13 +260,13 @@ static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
 
 	clarett_svc_log(c, st->run_late || st->bad_reads || st->overruns,
 			"stream-svc: stopped (periods=%d ctr=0x%x wraps=%u ptr0=0x%x ptr1=0x%x; "
-			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u)\n",
+			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u cause=0x%08x)\n",
 			atomic_read(&c->stream_periods), c->stream_ctr,
 			st->wraps, readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
 			readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
 			st->run_gap_max_us, st->run_read_us_max, st->run_late,
 			st->run_step_max, st->bad_reads, st->bad_or,
-			st->overruns);
+			st->overruns, st->cause_or);
 }
 
 /*

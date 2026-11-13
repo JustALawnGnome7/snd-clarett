@@ -343,7 +343,8 @@ reads flash on the attach path.
 
 - **info** — the probe summary above, and a `stream-svc:` line for any 2-second window (or any
   stream) in which something went wrong: a late servicer tick, a device-side period overrun, or an
-  unusable `0x300` sample. Silence during playback is the healthy state.
+  unusable `0x300` sample. Also a one-off `stream-cause:` line per stream if the `0x100` summary
+  ever shows a bit whose meaning is not established. Silence during playback is the healthy state.
 - **warn** — degraded but working: a short MSI vector count, a subsystem that failed to register, a
   config-shadow seed failure, a transiently unreachable link, and a stream whose engine raised no
   period at all (`stream engine raised no period`: armed, but moving no audio; a power cycle of
@@ -372,7 +373,12 @@ echo 'func clarett_stream_service +p' | sudo tee /sys/kernel/debug/dynamic_debug
 
 Reading the servicer line: `gapmax` is the longest interval between ticks and tracks the nominal
 period, so divide by it before calling anything a stall. Judge a stream by `late`, `overrun` and
-`badreads`, which are zero when healthy. `readmax` is the slowest single register read.
+`badreads`, which are zero when healthy. `readmax` is the slowest single register read. `cause` is
+every bit the `0x100` summary showed during the run, OR'd together: `0x80000000` (a period event
+pending) is normal, `0x20000000` means a mailbox command overlapped a tick, `0xf` is the stream-stop
+class, and anything else is a bit nobody has characterised — the servicer says so at `info` the
+first time it sees one (`stream-cause:`), which is how the two enabled-but-never-seen bits get
+identified if they ever fire.
 `cat /proc/asound/card<N>/pcm*/sub*/status` shows which process owns a running stream
 (`owner_pid`) — the card allows one playback and one capture stream, so a second client gets
 *busy*.
