@@ -278,27 +278,21 @@ static void clarett_svc_check_silent(struct clarett *c,
 }
 
 /*
- * Wait for the next period event. The vec0 ISR raises one per device period
- * event, so this sleeps for a period at a time instead of the ~150 us poll
- * cycle the servicer used to run.
- *
- * The timeout is a backstop, and it also sets how often playback is topped up
- * between events (clarett_pcm_tx_refill): a client writing with a short lead
- * has its frames copied at this cadence, so the value is a deliberate
- * compromise rather than a safety margin alone. Lost or delayed interrupts
- * need no special handling beyond it, because the period counter's modular
- * delta recovers the advance of a late read (see CLARETT_CTR_MOD).
+ * Sleep until the next period interrupt, or CLARETT_SVC_REFILL_US, whichever
+ * comes first. Returns true if the ISR flagged a period event, which is what
+ * tells the caller to read the device; on a plain timeout it only tops
+ * playback up, which costs no register access.
  *
  * atomic_xchg consumes the flag inside the condition, so an event that lands
  * between the servicer's 0x300 read and this wait is not missed: it returns at
  * once and costs one read that finds nothing.
  */
-static void clarett_svc_wait(struct clarett *c)
+static bool clarett_svc_wait(struct clarett *c)
 {
-	wait_event_hrtimeout(c->svc_wq,
-			     atomic_xchg(&c->svc_wake, 0) ||
-			     kthread_should_stop(),
-			     us_to_ktime(CLARETT_SVC_FALLBACK_US));
+	return wait_event_hrtimeout(c->svc_wq,
+				    atomic_xchg(&c->svc_wake, 0) ||
+				    kthread_should_stop(),
+				    us_to_ktime(CLARETT_SVC_REFILL_US)) == 0;
 }
 
 static int clarett_stream_service(void *data)
@@ -306,6 +300,13 @@ static int clarett_stream_service(void *data)
 	struct clarett *c = data;
 	unsigned long next_log = jiffies + msecs_to_jiffies(2000);
 	struct clarett_svc_stats st = { .last_ev = ktime_get() };
+	/* when 0x300 was last read, against CLARETT_SVC_FALLBACK_US */
+	ktime_t last_read = ktime_get();
+	/*
+	 * the ISR flagged a period event. True to start, so the first pass
+	 * reads 0x300: an armed engine stays paused until it does.
+	 */
+	bool woken = true;
 	/*
 	 * set when the device leaves the bus: park the loop, never return early
 	 * (kthread_stop UAF)
@@ -335,6 +336,22 @@ static int clarett_stream_service(void *data)
 		}
 		if (!st.run_start)
 			st.run_start = ktime_get();
+
+		/*
+		 * Read the device only when there is a period event to
+		 * collect. Reading 0x300 is also how a period is acknowledged,
+		 * so an engine whose interrupt never arrives is covered by the
+		 * backstop rather than by polling.
+		 */
+		if (!woken && ktime_us_delta(ktime_get(), last_read) <
+			      CLARETT_SVC_FALLBACK_US) {
+			/* playback the app wrote since: no register access */
+			clarett_pcm_tx_refill(c);
+			woken = clarett_svc_wait(c);
+			continue;
+		}
+		woken = false;
+		last_read = ktime_get();
 
 		c2 = clarett_svc_read_causes(c, &st);
 		/*
@@ -374,7 +391,7 @@ static int clarett_stream_service(void *data)
 			clarett_svc_window(c, &st);
 			next_log = jiffies + msecs_to_jiffies(2000);
 		}
-		clarett_svc_wait(c);
+		woken = clarett_svc_wait(c);
 	}
 	clarett_svc_summary(c, &st);
 	clarett_svc_check_silent(c, &st, gone);

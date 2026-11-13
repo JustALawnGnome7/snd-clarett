@@ -1030,15 +1030,25 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
  */
 #define CLARETT_CTR_FRAMES	16
 /*
- * How long the servicer waits for a period interrupt before reading 0x300
- * anyway. Every period event raises an MSI on vec0, so this fires only when
- * one is lost or delayed; a host that stalls MMIO for tens of ms (some do)
- * recovers through the counter's modular delta either way. It is also the
- * cadence at which playback is topped up between events, which is what keeps
- * it this short: a client writing with a lead of a few frames would otherwise
- * have its frames copied only once per period. The poll loop this replaced ran
- * at ~150 us.
+ * The servicer's two cadences, which are deliberately different.
+ *
+ * REFILL_US is how often it wakes to top playback up (clarett_pcm_tx_refill),
+ * and it has to stay as fine as the poll loop's old sleep: a client holding a
+ * lead of a few frames writes into the region the fill has already passed, and
+ * what the fill put there is silence. Measured on a Red 8Line with a 48-frame
+ * lead at a 32-frame period, a 1 ms refill delivered 160 frames of a 480000
+ * frame ramp — intact (nothing torn) but almost entirely replaced by silence.
+ * The refill reads no register, so this wake costs memory traffic only, and
+ * nothing at all while no playback stream is attached (tx_dirty).
+ *
+ * FALLBACK_US bounds how long the servicer will go without READING 0x300,
+ * which is the expensive part (four MMIO reads, and the poll loop's real cost).
+ * Every period event raises an MSI on vec0, so the device is normally read on
+ * the interrupt and this only covers one that was lost or delayed; a late read
+ * costs nothing, since the counter's modular delta recovers the advance it
+ * missed.
  */
+#define CLARETT_SVC_REFILL_US	150
 #define CLARETT_SVC_FALLBACK_US	1000
 /*
  * Modulus of the 0x300 period counter: it wraps at 0x100. Knowing it is what

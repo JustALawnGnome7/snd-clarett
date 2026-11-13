@@ -221,8 +221,14 @@ on vector 0 along with everything else. It still reads `0x300` itself rather tha
 handler do it, because that read is how a period is acknowledged and the engine must not be acked
 from interrupt context; the handler only sets a flag and wakes the thread. A late read costs
 nothing: the period counter is modular, so the advance it missed is recovered by the next read's
-delta. A wait that times out (`CLARETT_SVC_FALLBACK_US`) reads anyway, which covers a lost interrupt
-and sets how often playback is topped up between events.
+delta, and `CLARETT_SVC_FALLBACK_US` bounds how long the thread will go without reading at all.
+
+The thread still wakes on a short timer as well (`CLARETT_SVC_REFILL_US`), because topping playback
+up between period events is a separate job from collecting them, and a client holding a lead of a
+few frames depends on it happening far more often than once a period — what it writes into a region
+the fill has already passed is lost as silence. That wake reads no register (an atomic and a copy
+off the software frame clock), and does nothing at all while no playback stream is attached, so the
+interrupt still removes essentially all of the streaming MMIO traffic.
 
 Before each arm the driver sends `SET_CLOCK{rate, source}` and three sync queries. The vendor's
 handshake also reads a port-name string per stream channel (`0x005000`) and declares the stream
