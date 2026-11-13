@@ -104,18 +104,29 @@ static u32 clarett_svc_read_causes(struct clarett *c,
 		/* the 0x100 summary: block bits, and the stop class in 0-3 */
 		u32 sum = readl(bar + REG_IRQ0_CAUSE);
 
-		st->cause_or |= sum;
 		/*
-		 * A bit nobody has characterised. Worth one line at info,
-		 * since every capture of every model has only ever shown the
-		 * known ones, and the open question (whether bits 4 and 5 are
-		 * stream errors) is settled the first time this prints.
+		 * An all-ones read is a FAILED PCIe transaction, never a cause
+		 * word -- the same dead-link read the 0x300 sample below
+		 * rejects, and some hosts produce it for tens of ms at a
+		 * time. Accumulating it would fill cause= with nonsense and
+		 * fire the report below on garbage, which then latches and
+		 * hides a real unknown bit. Measured on a host that does it.
 		 */
-		if ((sum & ~IRQ0_CAUSE_KNOWN) && !st->cause_told) {
-			st->cause_told = true;
-			dev_info(&c->pci->dev,
-				 "stream-cause: 0x100=0x%08x has unknown bits 0x%08x\n",
-				 sum, sum & ~IRQ0_CAUSE_KNOWN);
+		if (sum != 0xffffffff) {
+			st->cause_or |= sum;
+			/*
+			 * A bit nobody has characterised. Worth one line at
+			 * info, since every capture of every model has only
+			 * ever shown the known ones, and the open question
+			 * (whether bits 4 and 5 are stream errors) is settled
+			 * the first time this prints.
+			 */
+			if ((sum & ~IRQ0_CAUSE_KNOWN) && !st->cause_told) {
+				st->cause_told = true;
+				dev_info(&c->pci->dev,
+					 "stream-cause: 0x100=0x%08x has unknown bits 0x%08x\n",
+					 sum, sum & ~IRQ0_CAUSE_KNOWN);
+			}
 		}
 	}
 	/* 0x300 read-to-clear = period event + counter (owned) */
