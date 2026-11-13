@@ -165,8 +165,12 @@ struct snd_rawmidi_substream;
  * provoked. The servicer ORs every value it reads into its cause= telemetry
  * and reports an unknown bit at info, so the next one to fire says so.
  */
-/* 0x100 bits whose meaning is established (above) */
-#define IRQ0_CAUSE_KNOWN         0xb000000fu
+/*
+ * 0x100 bits whose meaning is established (above). bit30 is included although
+ * the shipped driver cannot raise it -- nothing marks a TX descriptor -- so
+ * that a build which does mark them is not told its own doing is unknown.
+ */
+#define IRQ0_CAUSE_KNOWN         0xf000000fu
 #define DOORBELL_SUBMIT          1
 #define DOORBELL_ACK             2
 
