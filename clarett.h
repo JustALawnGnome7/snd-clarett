@@ -125,8 +125,10 @@ struct snd_rawmidi_substream;
 #define MBOX_DATA                0x10
 
 #define CMD_EXEC_FLAG            0x80000000u
-/* mailbox-complete cause bit @ REG_IRQ0_CAUSE */
-#define IRQ_DONE_BIT             0x20000000u
+/*
+ * REG_IRQ0_CAUSE bit29 (0x20000000, "DONE") reflects "0x400 has bits pending";
+ * the vec0 ISR reads 0x100 first to clear it (clarett_irq_event()).
+ */
 #define DOORBELL_SUBMIT          1
 #define DOORBELL_ACK             2
 
@@ -521,10 +523,9 @@ struct clarett_model {
  */
 #define FCP_RESP_ERR_OK          0x00
 
-#define CLARETT_MBOX_TIMEOUT_MS  100
 /*
- * Deadline for a command's response DMA to land, separate from the DONE wait
- * above. A response that misses it is retired by the next command
+ * Deadline for a command to be accepted, and again for its response DMA to
+ * land. A response that misses it is retired by the next command
  * (clarett_retire_lost()).
  */
 #define CLARETT_RESP_TIMEOUT_MS  100
@@ -613,10 +614,11 @@ struct clarett {
 	struct mutex serial_lock;
 
 	/*
-	 * MSI / async notifications (vec0). With MSI up the ISR IS the mailbox
-	 * completion path: while cmd_inflight it clears 0x100, then completes
-	 * mbox_accepted/mbox_landed on the 0x400 phase bits. Without it,
-	 * clarett_fcp polls (the fallback cycle).
+	 * MSI / async notifications (vec0). The ISR IS the mailbox completion
+	 * path: while cmd_inflight it clears 0x100, then completes
+	 * mbox_accepted/mbox_landed on the 0x400 phase bits. Set at probe
+	 * (required) and cleared when the IRQs are freed; the mailbox refuses
+	 * commands while it is clear.
 	 */
 	bool irq_ready;
 	/* controls registered; notify path may snd_ctl_notify */

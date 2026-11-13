@@ -32,21 +32,24 @@ MIDI, the sample clock (the `Clock Source` control), and model detection.
 The device has one 64 KB MMIO BAR, which carries the whole register interface; audio moves by
 bus-master DMA. An FCP command is written into the mailbox at BAR0 `0x8020` (`cmd` with bit 31 as
 the execute flag, then `size | seq << 16`, `error`, and the payload at `+0x10` — the scarlett2
-header layout), and the doorbell at `0x408` is rung with `1`. Completion is polled on the DONE bit
-(`0x20000000`) of cause register `0x100`.
+header layout), and the doorbell at `0x408` is rung with `1`. The command completes on the phase
+bits of cause register `0x400`, delivered on MSI vector 0: bit 0 when the device accepts the
+request, bit 1 when its response has landed.
 
 GET responses do not come back through the BAR: the device DMAs them into a host buffer whose
 address is programmed at `0x410` (low) / `0x414` (high). The response carries a 16-byte echo of the
 FCP header, then the requested bytes.
 
-**The trailing ack (`0x408 = 2`) must wait for that response to land**, not merely for DONE. The
-DMA arrives asynchronously after DONE; acknowledging before it lands makes the device refuse the
-session (`err=3` on every later command). `clarett_resp_wait()` gates the ack on the response
-header, which is zeroed before each submit so a stale one cannot satisfy it.
+**The trailing ack (`0x408 = 2`) must wait for that response to land**, not merely for the device to
+accept the command. The DMA arrives asynchronously after that, so acknowledging before it lands makes
+the device refuse the session (`err=3` on every later command). Bit 1 is that signal, and
+`clarett_resp_wait()` then confirms the response header, which is zeroed before each submit so a stale
+one cannot satisfy it.
 
-Mailbox completion is polled rather than interrupt-driven, so the completion path never races the
-read-to-clear cause register against the ISR. MSI carries the notification (`0x400`) and stream
-period (`0x300`) events.
+The vec0 ISR is the only reader of `0x400` (read-to-clear): it records the phase bits for the
+command in flight and relays the bits above them, the device's events, to fcp-server. While a
+command is in flight it reads `0x100` first, because that register's bit 29 reflects "`0x400` has
+bits pending". MSI is required: probe fails if the vectors cannot be allocated or hooked.
 
 ## The hwdep ABI
 
@@ -328,7 +331,8 @@ reads flash on the attach path.
   unusable `0x300` sample. Silence during playback is the healthy state.
 - **warn** — degraded but working: a short MSI vector count, a subsystem that failed to register, a
   config-shadow seed failure, a transiently unreachable link.
-- **err** — the device never became ready, so no card was registered.
+- **err** — the device never became ready (no card was registered), or MSI could not be set up
+  (probe fails: vector 0 completes every mailbox command).
 - **debug** — everything else: register dumps at probe and arm, descriptor-ring geometry, the
   stream handshake, the per-command mailbox trace, and the healthy-case servicer telemetry.
 

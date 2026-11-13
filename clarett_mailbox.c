@@ -28,11 +28,9 @@
 #endif
 
 /*
- * Two completion cycles. With MSI up, a command completes on the device's own
- * 0x400 phase bits, delivered by the vec0 ISR: bit0 when the request is
- * accepted, bit1 when its response has landed. Without MSI (allocation or
- * request_irq failed, which the driver survives), it falls back to polling
- * 0x100 for DONE, sweeping the cause blocks and polling the response buffer.
+ * A command completes on the device's own 0x400 phase bits, delivered by the
+ * vec0 ISR: bit0 when the request is accepted, bit1 when its response has
+ * landed. MSI is required; probe fails without it.
  */
 
 /*
@@ -69,24 +67,13 @@ static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
 
 /*
  * True for a stream period-cause block (0x200 TX / 0x300 RX) while the PCM
- * engine is streaming. The mailbox skips these in its DONE sweep so it does not
+ * engine is streaming. The cause sweep skips these so it does not
  * read-to-clear a period event the stream servicer is waiting for (an audible
  * gap). When idle they read 0 and are swept normally.
  */
 static inline bool clarett_stream_cause(const struct clarett *c, u16 reg)
 {
 	return c->stream_on && (reg == STREAM_BLK0 || reg == STREAM_BLK1);
-}
-
-/*
- * Cause blocks the mailbox sweep leaves alone: the stream blocks while
- * streaming, and 0x400 whenever the vec0 ISR is up, which is then its only
- * reader (the ISR records the phase bits in mbox_phase).
- */
-static inline bool clarett_skip_cause(const struct clarett *c, u16 reg)
-{
-	return clarett_stream_cause(c, reg) ||
-	       (reg == REG_NOTIFY_CAUSE && c->irq_ready);
 }
 
 /* The FCP status word of the response that has just landed. */
@@ -221,13 +208,12 @@ static bool clarett_retire_lost(struct clarett *c)
 struct clarett_fcp_txn {
 	u32 opcode;
 	ktime_t t_submit;
-	/* 0x100 as last read; IRQ_DONE_BIT set once the command is accepted */
-	u32 cause, first_cause;
+	/* 0x400 bit0 seen: the device took the request */
+	bool accepted;
 	/* the echoed command word once the response has landed, else 0 */
 	u32 resp_echo;
 	u32 fcp_status;
-	s64 done_us, land_us, acc_us;
-	int polls;
+	s64 land_us, acc_us;
 };
 
 /*
@@ -293,18 +279,21 @@ static void clarett_mbox_wait_phase(struct clarett *c,
 	unsigned long tmo = msecs_to_jiffies(max(ms, 1u));
 	u32 exp_echo = CMD_EXEC_FLAG | t->opcode;
 
-	t->polls = 1;
 	if (!wait_for_completion_timeout(&c->mbox_accepted, tmo))
 		return;
 	t->acc_us = ktime_us_delta(ktime_get(), t->t_submit);
-	/* accepted: the call succeeds, as DONE did */
-	t->cause = IRQ_DONE_BIT;
+	t->accepted = true;
 	if (wait_for_completion_timeout(&c->mbox_landed, tmo))
 		t->resp_echo = clarett_resp_wait(c, exp_echo, t->t_submit,
 						 &t->land_us);
 	if (t->resp_echo) {
 		clarett_resp_tail_wait(c);
-		/* read the status word only after the response has landed */
+		/*
+		 * Command-level failures are in the FCP status word (resp+8),
+		 * not the mailbox error register: a rejected write lands a
+		 * nonzero status while the echo looks fine. Read it only after
+		 * the response has landed.
+		 */
 		dma_rmb();
 		t->fcp_status = clarett_resp_status(c);
 		clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
@@ -316,83 +305,18 @@ static void clarett_mbox_wait_phase(struct clarett *c,
 }
 
 /*
- * Polled fallback (no MSI): once DONE shows in 0x100, sweep the remaining
- * cause blocks (0x400 holds the command phase and is read-to-clear), do one
- * confirming full sweep, then wait for the response and ack. Sweep only AFTER
- * DONE: sweeping the phase register while the command is processing makes it
- * time out. An incomplete command is never acknowledged.
- */
-static void clarett_mbox_wait_polled(struct clarett *c,
-				     struct clarett_fcp_txn *t)
-{
-	static const u16 sweep[] = {
-		REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0,
-		REG_NOTIFY_CAUSE, 0x500
-	};
-	unsigned long deadline;
-	int s;
-
-	deadline = jiffies + msecs_to_jiffies(CLARETT_MBOX_TIMEOUT_MS);
-	do {
-		/* read-to-clear */
-		t->cause = clarett_rl(c, REG_IRQ0_CAUSE);
-		if (!t->polls)
-			t->first_cause = t->cause;
-		t->polls++;
-		if (t->cause & IRQ_DONE_BIT)
-			break;
-		cpu_relax();
-	} while (time_before(jiffies, deadline));
-
-	if (!(t->cause & IRQ_DONE_BIT))
-		return;
-	t->done_us = ktime_us_delta(ktime_get(), t->t_submit);
-	/*
-	 * The sweeps skip the stream blocks while streaming: a read here would
-	 * steal a period event from the servicer (clarett_stream_cause()).
-	 */
-	for (s = 1; s < ARRAY_SIZE(sweep); s++)
-		if (!clarett_skip_cause(c, sweep[s]))
-			/* rest of the DONE sweep */
-			clarett_rl(c, sweep[s]);
-	for (s = 0; s < ARRAY_SIZE(sweep); s++)
-		if (!clarett_skip_cause(c, sweep[s]))
-			/* confirming full sweep */
-			clarett_rl(c, sweep[s]);
-	t->resp_echo = clarett_resp_wait(c, CMD_EXEC_FLAG | t->opcode,
-					 t->t_submit, &t->land_us);
-	if (t->resp_echo) {
-		/* the header has landed; a long reply's tail may not have */
-		clarett_resp_tail_wait(c);
-		/*
-		 * Command-level failures are in the FCP status word (resp+8),
-		 * not the mailbox error register: a rejected write lands a
-		 * nonzero status while DONE and the echo look fine.
-		 */
-		dma_rmb();
-		t->fcp_status = clarett_resp_status(c);
-		clarett_wl(c, REG_DOORBELL, DOORBELL_ACK);
-	} else {
-		dev_warn_ratelimited(&c->pci->dev,
-				     "FCP op=0x%06x seq=%u: response never landed; ack withheld\n",
-				     t->opcode, c->seq);
-	}
-}
-
-/*
  * Per-transaction trace, at dev_dbg since the meters are read up to 20 times a
  * second. The "FCPr" lines add the response telemetry; match them on their own
  * with dynamic debug's format "FCPr".
  */
 static void clarett_mbox_trace(struct clarett *c,
-			       const struct clarett_fcp_txn *t, bool by_phase)
+			       const struct clarett_fcp_txn *t)
 {
 	const u8 *r = c->resp_buf;
 
 	dev_dbg(&c->pci->dev,
-		"FCP op=0x%06x seq=%u %s first_cause=0x%08x polls=%d done=%d phase=0x%x acc=%lldus land=%lldus status=0x%08x\n",
-		t->opcode, c->seq, by_phase ? "phase" : "done", t->first_cause,
-		t->polls, !!(t->cause & IRQ_DONE_BIT),
+		"FCP op=0x%06x seq=%u accepted=%d phase=0x%x acc=%lldus land=%lldus status=0x%08x\n",
+		t->opcode, c->seq, t->accepted,
 		atomic_read(&c->mbox_phase), t->acc_us, t->land_us,
 		t->fcp_status);
 
@@ -401,8 +325,8 @@ static void clarett_mbox_trace(struct clarett *c,
 		u32 rseq = r[FCP_RESP_SEQ_OFF] | r[FCP_RESP_SEQ_OFF + 1] << 8;
 
 		dev_dbg(&c->pci->dev,
-			"FCPr op=0x%06x seq=%u done=%lldus resp=%lldus rseq=%u err=%u size=%u phase=0x%x\n",
-			t->opcode, c->seq, t->done_us, t->land_us, rseq,
+			"FCPr op=0x%06x seq=%u acc=%lldus resp=%lldus rseq=%u err=%u size=%u phase=0x%x\n",
+			t->opcode, c->seq, t->acc_us, t->land_us, rseq,
 			r[FCP_RESP_STATUS_OFF], size,
 			atomic_read(&c->mbox_phase));
 		/* the payload head of every answered non-meter command */
@@ -411,8 +335,8 @@ static void clarett_mbox_trace(struct clarett *c,
 				(int)min(size, 32u), r + FCP_RESP_DATA_OFF);
 	} else {
 		dev_dbg(&c->pci->dev,
-			"FCPr op=0x%06x seq=%u done=%lldus resp=NONE (ack withheld) phase=0x%x\n",
-			t->opcode, c->seq, t->done_us,
+			"FCPr op=0x%06x seq=%u acc=%lldus resp=NONE (ack withheld) phase=0x%x\n",
+			t->opcode, c->seq, t->acc_us,
 			atomic_read(&c->mbox_phase));
 	}
 }
@@ -495,7 +419,7 @@ static int clarett_mbox_result(struct clarett *c,
 			       const struct clarett_fcp_txn *t,
 			       const u8 *resp_out, u16 resp_len)
 {
-	if (!(t->cause & IRQ_DONE_BIT) || !t->resp_echo)
+	if (!t->accepted || !t->resp_echo)
 		return -ETIMEDOUT;
 	if (c->mbox_wedged)
 		return -EIO;
@@ -523,7 +447,7 @@ static void clarett_mbox_next_seq(struct clarett *c,
 	if (t->resp_echo && !c->mbox_wedged) {
 		c->seq++;
 	} else if (!t->resp_echo &&
-		   ((t->cause & IRQ_DONE_BIT) || !retire_failed)) {
+		   (t->accepted || !retire_failed)) {
 		c->lost_pending = true;
 		c->lost_echo = CMD_EXEC_FLAG | t->opcode;
 		c->lost_seq = c->seq;
@@ -547,11 +471,10 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 {
 	struct clarett_fcp_txn t = {
 		.opcode = opcode,
-		.done_us = -1,
 		.land_us = -1,
 		.acc_us = -1,
 	};
-	bool by_phase, retire_failed;
+	bool retire_failed;
 	int ret;
 
 	if (len > CLARETT_MBOX_DATA_MAX)
@@ -569,8 +492,12 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 		return -ENODEV;
 
 	mutex_lock(&c->mbox_lock);
-	/* torn down: resp_buf and the BAR may already be freed */
-	if (c->hw_gone) {
+	/*
+	 * Torn down: resp_buf and the BAR may already be freed. Or the IRQs
+	 * are freed (teardown, before hw_gone): nothing would complete a
+	 * command.
+	 */
+	if (c->hw_gone || !c->irq_ready) {
 		mutex_unlock(&c->mbox_lock);
 		return -ENODEV;
 	}
@@ -578,17 +505,13 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 	retire_failed = clarett_retire_lost(c);
 	clarett_mbox_submit(c, &t, data, len);
 
-	by_phase = c->irq_ready;
-	if (by_phase)
-		clarett_mbox_wait_phase(c, &t);
-	else
-		clarett_mbox_wait_polled(c, &t);
+	clarett_mbox_wait_phase(c, &t);
 
 	/*
 	 * No mailbox register is read back: the error channel is resp+8 in the
 	 * DMA buffer, and a read here would race the device's response DMA.
 	 */
-	clarett_mbox_trace(c, &t, by_phase);
+	clarett_mbox_trace(c, &t);
 
 	clarett_mbox_check_wedge(c, &t);
 	ret = clarett_mbox_result(c, &t, resp_out, resp_len);
@@ -613,15 +536,15 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
  */
 void clarett_mbox_clear_causes(struct clarett *c)
 {
+	/* not 0x400: the vec0 ISR is its only reader */
 	static const u16 causes[] = {
-		REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0,
-		REG_NOTIFY_CAUSE, 0x500
+		REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0, 0x500
 	};
 	int i;
 
 	mutex_lock(&c->mbox_lock);
 	for (i = 0; i < ARRAY_SIZE(causes); i++)
-		if (!clarett_skip_cause(c, causes[i]))
+		if (!clarett_stream_cause(c, causes[i]))
 			clarett_rl(c, causes[i]);
 	mutex_unlock(&c->mbox_lock);
 }

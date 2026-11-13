@@ -356,7 +356,7 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
  * the first BAR access, as the device sees on a normal attach. The handlers
  * hook later (clarett_setup_irq); an unhandled MSI in between is harmless.
  */
-static void clarett_enable_msi(struct clarett *c)
+static int clarett_enable_msi(struct clarett *c)
 {
 	struct pci_dev *pci = c->pci;
 	int nvec;
@@ -367,10 +367,8 @@ static void clarett_enable_msi(struct clarett *c)
 	 */
 	nvec = pci_alloc_irq_vectors(pci, 1, CLARETT_NUM_VECTORS, PCI_IRQ_MSI);
 	if (nvec < 0) {
-		dev_warn(&pci->dev,
-			 "MSI alloc failed (%d); async notifications disabled\n",
-			 nvec);
-		return;
+		dev_err(&pci->dev, "MSI allocation failed (%d)\n", nvec);
+		return nvec;
 	}
 	c->n_vec = nvec;
 	/* a short count is worth a warn; the expected 4/4 is debug */
@@ -381,20 +379,18 @@ static void clarett_enable_msi(struct clarett *c)
 	else
 		dev_dbg(&pci->dev, "MSI: got %d/%d vectors\n", nvec,
 			CLARETT_NUM_VECTORS);
+	return 0;
 }
 
 /*
- * Hook the handlers onto the allocated vectors. Best-effort: on failure the
- * driver still works (polled mailbox) without notifications, and the vectors
- * stay allocated so the device keeps seeing MSI enabled.
+ * Hook the handlers onto the allocated vectors. Required: vec0 completes every
+ * mailbox command. On failure the vectors stay allocated, and the probe error
+ * path frees them (clarett_teardown_irq).
  */
-static void clarett_setup_irq(struct clarett *c)
+static int clarett_setup_irq(struct clarett *c)
 {
 	struct pci_dev *pci = c->pci;
 	int i, err;
-
-	if (!c->n_vec)	/* MSI alloc failed */
-		return;
 
 	for (i = 0; i < c->n_vec; i++) {
 		c->irq_ctx[i].c = c;
@@ -402,16 +398,16 @@ static void clarett_setup_irq(struct clarett *c)
 		err = request_irq(pci_irq_vector(pci, i), clarett_irq, 0,
 				  KBUILD_MODNAME, &c->irq_ctx[i]);
 		if (err) {
-			dev_warn(&pci->dev,
-				 "request_irq vec %d failed (%d); notifications disabled\n",
-				 i, err);
+			dev_err(&pci->dev, "request_irq vec %d failed (%d)\n",
+				i, err);
 			while (--i >= 0)
 				free_irq(pci_irq_vector(pci, i),
 					 &c->irq_ctx[i]);
-			return;
+			return err;
 		}
 	}
 	c->irq_ready = true;
+	return 0;
 }
 
 static void clarett_teardown_irq(struct clarett *c)
@@ -466,7 +462,7 @@ static void clarett_hw_teardown(struct clarett *c)
 	 * An ISR already past its ctl_ready check when the flag flipped may
 	 * have queued one more notify after the cancel above; re-cancel now
 	 * that free_irq has synced them all (a straggler that already started
-	 * runs its GET on the poll fallback — harmless).
+	 * finds the mailbox refusing, as irq_ready is now clear — harmless).
 	 */
 	cancel_work_sync(&c->notify_work);
 	/* notify_work may have queued one */
@@ -891,8 +887,12 @@ static int clarett_probe(struct pci_dev *pci, const struct pci_device_id *ent)
 	 * path. Handlers hook immediately too: mailbox completion is MSI-paced
 	 * from the first command (the notify path stays gated on ctl_ready).
 	 */
-	clarett_enable_msi(c);
-	clarett_setup_irq(c);
+	err = clarett_enable_msi(c);
+	if (err)
+		goto err_free;
+	err = clarett_setup_irq(c);
+	if (err)
+		goto err_free;
 
 	clarett_hw_init(c);
 
