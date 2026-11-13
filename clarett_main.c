@@ -323,11 +323,13 @@ static void clarett_irq_event(struct clarett *c)
 }
 
 /*
- * MSI handler, one Linux IRQ per vector (dev_id). vec0 carries the mailbox's
- * command phase and the device events (clarett_irq_event()). vec1/vec2 are the
- * stream period vectors; the servicer polls the period blocks, so here they are
- * only read. MSI is edge-triggered, so an uncleared cause cannot storm. Every
- * vector returns IRQ_HANDLED so the core does not disable it as spurious.
+ * MSI handler, one Linux IRQ per vector (dev_id). vec0 carries everything: the
+ * mailbox's command phase, the device events (clarett_irq_event()) and the data
+ * plane's period events, which is why a stream's interrupts land here too.
+ * vec1/vec2 have never been seen to fire on any model (see CLARETT_NUM_VECTORS)
+ * but are still read, so that a cause left standing on one could not keep its
+ * vector asserted. MSI is edge-triggered, so an uncleared cause cannot storm.
+ * Every vector returns IRQ_HANDLED so the core does not disable it as spurious.
  */
 static irqreturn_t clarett_irq(int irq, void *dev_id)
 {
@@ -347,6 +349,20 @@ static irqreturn_t clarett_irq(int irq, void *dev_id)
 	} else if (ic->idx == 1 || ic->idx == 2) {
 		/* read-to-clear */
 		readl(c->bar0 + (ic->idx == 1 ? STREAM_BLK0 : STREAM_BLK1));
+	}
+
+	/*
+	 * Hand a period event to the servicer. This handler does NOT read
+	 * 0x300: that register is read-to-clear and reading it is how a period
+	 * is acknowledged, so the servicer stays its only reader and the
+	 * engine is never acked from here. An interrupt that was a mailbox
+	 * completion rather than a period costs the servicer one read that
+	 * finds no event. The flag closes the window where an event arrives
+	 * while the servicer is between its read and its wait.
+	 */
+	if (READ_ONCE(c->stream_run)) {
+		atomic_set(&c->svc_wake, 1);
+		wake_up(&c->svc_wq);
 	}
 	return IRQ_HANDLED;
 }
@@ -549,6 +565,7 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 	mutex_init(&c->pcm_lock);
 	mutex_init(&c->serial_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
+	init_waitqueue_head(&c->svc_wq);
 	init_completion(&c->mbox_accepted);
 	init_completion(&c->mbox_landed);
 	init_completion(&c->addr_acked);
@@ -559,6 +576,7 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 	atomic_set(&c->notify_bits, 0);
 	atomic_set(&c->cmd_inflight, 0);
 	atomic_set(&c->mbox_phase, 0);
+	atomic_set(&c->svc_wake, 0);
 	/*
 	 * Teardown lives in private_free so snd_card_free sequences it after
 	 * the last userspace handle closes but before c is freed (works are all

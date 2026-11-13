@@ -277,6 +277,30 @@ static void clarett_svc_check_silent(struct clarett *c,
 			     ran_ms);
 }
 
+/*
+ * Wait for the next period event. The vec0 ISR raises one per device period
+ * event, so this sleeps for a period at a time instead of the ~150 us poll
+ * cycle the servicer used to run.
+ *
+ * The timeout is a backstop, and it also sets how often playback is topped up
+ * between events (clarett_pcm_tx_refill): a client writing with a short lead
+ * has its frames copied at this cadence, so the value is a deliberate
+ * compromise rather than a safety margin alone. Lost or delayed interrupts
+ * need no special handling beyond it, because the period counter's modular
+ * delta recovers the advance of a late read (see CLARETT_CTR_MOD).
+ *
+ * atomic_xchg consumes the flag inside the condition, so an event that lands
+ * between the servicer's 0x300 read and this wait is not missed: it returns at
+ * once and costs one read that finds nothing.
+ */
+static void clarett_svc_wait(struct clarett *c)
+{
+	wait_event_hrtimeout(c->svc_wq,
+			     atomic_xchg(&c->svc_wake, 0) ||
+			     kthread_should_stop(),
+			     us_to_ktime(CLARETT_SVC_FALLBACK_US));
+}
+
 static int clarett_stream_service(void *data)
 {
 	struct clarett *c = data;
@@ -350,7 +374,7 @@ static int clarett_stream_service(void *data)
 			clarett_svc_window(c, &st);
 			next_log = jiffies + msecs_to_jiffies(2000);
 		}
-		usleep_range(100, 200);
+		clarett_svc_wait(c);
 	}
 	clarett_svc_summary(c, &st);
 	clarett_svc_check_silent(c, &st, gone);
@@ -476,7 +500,8 @@ void clarett_engine_run(struct clarett *c)
 	/*
 	 * Low real-time priority: if userspace preempts the servicer, the TX
 	 * fill falls behind and the engine plays stale audio with no XRUN. It
-	 * sleeps ~150 us between polls, so it cannot starve the system.
+	 * sleeps until the next period interrupt (CLARETT_SVC_FALLBACK_US at
+	 * the latest), so it cannot starve the system.
 	 */
 	sched_set_fifo_low(c->stream_svc);
 }

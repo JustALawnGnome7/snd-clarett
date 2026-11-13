@@ -216,6 +216,14 @@ engine; the other joins the running clock. Each tick drains the RX ring into the
 refills the TX ring ahead of the device's read position, keeping `CLARETT_TX_GUARD_FRAMES` clear of
 it.
 
+The thread is woken by the interrupt, not by a timer: the device raises one MSI per period event,
+on vector 0 along with everything else. It still reads `0x300` itself rather than letting the
+handler do it, because that read is how a period is acknowledged and the engine must not be acked
+from interrupt context; the handler only sets a flag and wakes the thread. A late read costs
+nothing: the period counter is modular, so the advance it missed is recovered by the next read's
+delta. A wait that times out (`CLARETT_SVC_FALLBACK_US`) reads anyway, which covers a lost interrupt
+and sets how often playback is topped up between events.
+
 Before each arm the driver sends `SET_CLOCK{rate, source}` and three sync queries. The vendor's
 handshake also reads a port-name string per stream channel (`0x005000`) and declares the stream
 widths (`0x007002`/`0x007003`); none of that is needed, since the engine streams at full width

@@ -133,9 +133,17 @@ struct snd_rawmidi_substream;
 #define DOORBELL_ACK             2
 
 /*
- * MSI: the device delivers every control-plane interrupt on vector 0, the
- * mailbox's command phase and the device events alike; 0x400 tells them apart.
- * vec1/vec2 carry the stream period events.
+ * MSI: the device delivers EVERY interrupt on vector 0 — the mailbox's
+ * command phase, the device events, and the data plane's period events
+ * alike. 0x400 tells the first two apart; a period event raises no bit
+ * there at all, so the
+ * period cause and counter are read from 0x300 (owned by the servicer, which
+ * the ISR wakes). Established on hardware (Red 8Line, 60ch) by counting each
+ * vector's interrupts across a capture at two ALSA period sizes: vec0 rose by
+ * 1.009 and 1.001 interrupts per device period event at 512- and 64-frame
+ * periods — an eightfold change in cadence — while vec1, vec2 and vec3
+ * stayed at exactly zero. The vendor driver does not use this interrupt:
+ * it sweeps all five cause blocks on a 4 ms timer instead.
  */
 #define CLARETT_NUM_VECTORS      4
 /* the device signals control events on vec0 */
@@ -788,8 +796,12 @@ struct clarett {
 	void *stream_buf;
 	dma_addr_t stream_dma;
 	size_t stream_size;
-	/* polls/acks 0x300 to keep the engine clocked */
+	/* reads/acks 0x300 to keep the engine clocked */
 	struct task_struct *stream_svc;
+	/* vec0 ISR -> servicer: a period event is waiting */
+	wait_queue_head_t svc_wq;
+	/* set by the ISR, consumed by the servicer's wait */
+	atomic_t svc_wake;
 	/* running period count (servicer -> hw pointer) */
 	atomic_t stream_periods;
 	/* last 0x300 period counter (servicer-private) */
@@ -1017,6 +1029,17 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
  * or the IRQ-marker spacing.
  */
 #define CLARETT_CTR_FRAMES	16
+/*
+ * How long the servicer waits for a period interrupt before reading 0x300
+ * anyway. Every period event raises an MSI on vec0, so this fires only when
+ * one is lost or delayed; a host that stalls MMIO for tens of ms (some do)
+ * recovers through the counter's modular delta either way. It is also the
+ * cadence at which playback is topped up between events, which is what keeps
+ * it this short: a client writing with a lead of a few frames would otherwise
+ * have its frames copied only once per period. The poll loop this replaced ran
+ * at ~150 us.
+ */
+#define CLARETT_SVC_FALLBACK_US	1000
 /*
  * Modulus of the 0x300 period counter: it wraps at 0x100. Knowing it is what
  * lets a wrap and a LATE POLL be the same arithmetic — a modular difference
