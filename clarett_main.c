@@ -23,6 +23,7 @@
 #include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/jiffies.h>
+#include <linux/sizes.h>
 #include <sound/core.h>
 #include <sound/info.h>
 #include <sound/control.h>
@@ -606,7 +607,12 @@ static int clarett_map_device(struct clarett *c)
 	if (err)
 		return err;
 
-	c->resp_size = PAGE_SIZE;
+	/*
+	 * A fixed 4 KB, not PAGE_SIZE: it also caps the largest response
+	 * fcp-server may ask for, and that limit must not grow with the
+	 * host's page size past what the device has been seen to answer.
+	 */
+	c->resp_size = SZ_4K;
 	c->resp_buf = dmam_alloc_coherent(&pci->dev, c->resp_size,
 					  &c->resp_dma, GFP_KERNEL);
 	if (!c->resp_buf)
