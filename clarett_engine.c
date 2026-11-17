@@ -460,9 +460,9 @@ static void clarett_engine_program(struct clarett *c, dma_addr_t r0,
 
 	if (r0) {
 		/* 0x204 */
-		writel(c->model->playback_channels,
+		writel(c->playback_ch,
 		       bar + STREAM_BLK0 + STREAM_OFF_CHANS);
-		writel(clarett_period_bytes(c->model->playback_channels),
+		writel(clarett_period_bytes(c->playback_ch),
 		       /* 0x208 period */
 		       bar + STREAM_BLK0 + STREAM_OFF_SIZE);
 		writel(upper_32_bits(r0),
@@ -474,9 +474,9 @@ static void clarett_engine_program(struct clarett *c, dma_addr_t r0,
 	}
 	if (r1) {
 		/* 0x304 */
-		writel(c->model->capture_channels,
+		writel(c->capture_ch,
 		       bar + STREAM_BLK1 + STREAM_OFF_CHANS);
-		writel(clarett_period_bytes(c->model->capture_channels),
+		writel(clarett_period_bytes(c->capture_ch),
 		       /* 0x308 period */
 		       bar + STREAM_BLK1 + STREAM_OFF_SIZE);
 		writel(upper_32_bits(r1),
@@ -520,7 +520,7 @@ void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1)
 		readl(bar + STREAM_BLK1 + STREAM_OFF_BASE_LO),
 		readl(bar + STREAM_BLK1 + STREAM_OFF_CTRL),
 		readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
-		c->model->playback_channels, c->model->capture_channels);
+		c->playback_ch, c->capture_ch);
 }
 
 /*

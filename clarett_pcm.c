@@ -78,8 +78,6 @@ static int clarett_clock_src_info(struct snd_kcontrol *kctl,
 				  struct snd_ctl_elem_info *uinfo)
 {
 	struct clarett *c = snd_kcontrol_chip(kctl);
-	const struct clarett_model *m = c->model;
-
 	unsigned int i;
 
 	/*
@@ -88,12 +86,12 @@ static int clarett_clock_src_info(struct snd_kcontrol *kctl,
 	 */
 	uinfo->type  = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
 	uinfo->count = 1;
-	uinfo->value.enumerated.items = m->n_clock_srcs;
+	uinfo->value.enumerated.items = c->n_clock_srcs;
 	i = uinfo->value.enumerated.item;
-	if (i >= m->n_clock_srcs)
-		i = m->n_clock_srcs - 1;
+	if (i >= c->n_clock_srcs)
+		i = c->n_clock_srcs - 1;
 	uinfo->value.enumerated.item = i;
-	strscpy(uinfo->value.enumerated.name, m->clock_srcs[i].name,
+	strscpy(uinfo->value.enumerated.name, c->clock_srcs[i].name,
 		sizeof(uinfo->value.enumerated.name));
 	return 0;
 }
@@ -102,12 +100,11 @@ static int clarett_clock_src_get(struct snd_kcontrol *kctl,
 				 struct snd_ctl_elem_value *ucontrol)
 {
 	struct clarett *c = snd_kcontrol_chip(kctl);
-	const struct clarett_model *m = c->model;
 	int cur = clarett_clock_source(c);
 	u8 i;
 
-	for (i = 0; i < m->n_clock_srcs; i++) {
-		if (m->clock_srcs[i].value == cur) {
+	for (i = 0; i < c->n_clock_srcs; i++) {
+		if (c->clock_srcs[i].value == cur) {
 			ucontrol->value.enumerated.item[0] = i;
 			return 0;
 		}
@@ -121,15 +118,14 @@ static int clarett_clock_src_put(struct snd_kcontrol *kctl,
 				 struct snd_ctl_elem_value *ucontrol)
 {
 	struct clarett *c = snd_kcontrol_chip(kctl);
-	const struct clarett_model *m = c->model;
 	unsigned int i = ucontrol->value.enumerated.item[0];
 	u32 rate = READ_ONCE(c->cur_rate);
 	u8 clk[8];
 	int value;
 
-	if (i >= m->n_clock_srcs)
+	if (i >= c->n_clock_srcs)
 		return -EINVAL;
-	value = m->clock_srcs[i].value;
+	value = c->clock_srcs[i].value;
 	if (value == clarett_clock_source(c))
 		return 0;
 
@@ -146,7 +142,7 @@ static int clarett_clock_src_put(struct snd_kcontrol *kctl,
 	clarett_put_le32(clk + 4, value);
 	if (clarett_fcp(c, FCP_SET_CLOCK, clk, sizeof(clk)))
 		dev_dbg(&c->pci->dev, "clock source %s: SET_CLOCK failed\n",
-			m->clock_srcs[i].name);
+			c->clock_srcs[i].name);
 	return 1;
 }
 
@@ -160,7 +156,7 @@ static const struct snd_kcontrol_new clarett_clock_src_ctl = {
 
 int clarett_add_clock_control(struct clarett *c)
 {
-	if (!c->model->n_clock_srcs)
+	if (!c->n_clock_srcs)
 		return 0;
 	return snd_ctl_add(c->card, snd_ctl_new1(&clarett_clock_src_ctl, c));
 }
@@ -173,7 +169,7 @@ int clarett_add_clock_control(struct clarett *c)
 /*
  * Constant capability template; the per-model geometry fields (channels,
  * buffer/period bytes, periods_max) and the rate set (rates/rate_min/rate_max,
- * per the model's max_rate) are filled in clarett_pcm_open().
+ * per the speed bands the device answered) are filled in clarett_pcm_open().
  *
  * BATCH: .pointer advances a whole period at a time, not continuously; without
  * the flag a timer-scheduled client (PipeWire outside Pro Audio) keeps less
@@ -243,7 +239,7 @@ static unsigned int clarett_speed_band(unsigned int rate)
 static u8 clarett_rx_live_channels(struct clarett *c, unsigned int rate)
 {
 	return min(c->rx_live[clarett_speed_band(rate)],
-		   c->model->capture_channels);
+		   c->capture_ch);
 }
 
 /*
@@ -257,7 +253,7 @@ static u8 clarett_rx_live_channels(struct clarett *c, unsigned int rate)
  */
 static void clarett_set_rx_live(struct clarett *c, unsigned int rate)
 {
-	u8 chans = c->model->capture_channels;
+	u8 chans = c->capture_ch;
 	u8 live  = clarett_rx_live_channels(c, rate);
 
 	WRITE_ONCE(c->rx_dead_bytes, (u32)(chans - live) * 4);
@@ -280,7 +276,7 @@ static void clarett_set_rx_live(struct clarett *c, unsigned int rate)
  * power-of-two divisor of it, so the destination wraps one or more times per
  * ring pass and has to be clipped separately from the source.
  *
- * On models with clarett_model.rx_loopback_at set, each frame is reordered on
+ * With clarett.rx_loopback_at set, each frame is reordered on
  * the way: the loopback pair moves to the end and the channels after it move
  * down two, so ALSA channel n is the router's PCM n.
  */
@@ -290,14 +286,14 @@ static void clarett_rx_drain(struct clarett *c, u8 *alsa, u32 apos, u32 pos,
 			     u32 nframes, u32 abuf)
 {
 	u8 *ring = clarett_rx_area(c);
-	u32 frame = (u32)c->model->capture_channels * 4;
+	u32 frame = (u32)c->capture_ch * 4;
 	u32 slot  = c->rx_slot;
 	u32 ring_frames = CLARETT_STREAM_NDESC * CLARETT_FRAG_FRAMES;
 	/* S/MUX-removed tail; see clarett_set_rx_live() */
 	u32 dead = READ_ONCE(c->rx_dead_bytes);
 	u32 live = READ_ONCE(c->rx_live_bytes);
 	/* loopback pair's byte offset in a device frame */
-	u32 lb   = (u32)c->model->rx_loopback_at * 4;
+	u32 lb   = (u32)c->rx_loopback_at * 4;
 
 	/*
 	 * With the reorder, the dead device tail lands two channels lower in
@@ -375,10 +371,10 @@ static void clarett_tx_fill(struct clarett *c, const u8 *alsa, u32 apos,
 			    u32 pos, u32 nframes, u32 abuf)
 {
 	u8 *ring = clarett_tx_area(c);
-	u32 frame = (u32)c->model->playback_channels * 4;
+	u32 frame = (u32)c->playback_ch * 4;
 	u32 slot  = c->tx_slot;
 	/* 16, or fewer on a wide stream */
-	u32 ff    = clarett_tx_frag_frames(c->model->playback_channels);
+	u32 ff    = clarett_tx_frag_frames(c->playback_ch);
 	u32 ring_frames = CLARETT_STREAM_NDESC * ff;
 
 	while (nframes) {
@@ -545,7 +541,7 @@ static void clarett_play_fill(struct clarett *c)
 	if (!smp_load_acquire(&c->play_running))
 		return;
 
-	frame = (u32)c->model->playback_channels * 4;
+	frame = (u32)c->playback_ch * 4;
 	ring  = clarett_tx_ring_bytes(c) / frame;
 	abuf  = ps->runtime->buffer_size;	/* <= ring, and divides it */
 	guard = CLARETT_TX_GUARD_FRAMES;
@@ -613,7 +609,7 @@ void clarett_pcm_tx_refill(struct clarett *c)
 static void clarett_cap_drain(struct clarett *c, struct snd_pcm_substream *cs,
 			      u32 add_frames)
 {
-	u32 frame = (u32)c->model->capture_channels * 4;
+	u32 frame = (u32)c->capture_ch * 4;
 	u32 ring  = clarett_rx_ring_bytes(c) / frame;
 	/* <= ring, and divides it */
 	u32 abuf  = cs->runtime->buffer_size;
@@ -808,22 +804,22 @@ static int clarett_rule_period_by_buffer(struct snd_pcm_hw_params *params,
 
 /*
  * Advertised rate set. 44.1 and 48 kHz (single speed) are always offered;
- * 88.2/96 (double) and 176.4/192 (quad) are added up to the model's
- * clarett_model.max_rate. All six are SET_CLOCK enums the device lists.
+ * 88.2/96 (double) and 176.4/192 (quad) are added for each speed band the
+ * device answered STREAM_INFO for (clarett_read_rx_live()). All six are
+ * SET_CLOCK enums the device lists.
  */
 static unsigned int clarett_rate_caps(struct clarett *c, unsigned int *rmin,
 				      unsigned int *rmax)
 {
-	unsigned int cap = c->model->max_rate;
 	unsigned int rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000;
 
 	*rmin = 44100;
 	*rmax = 48000;
-	if (cap >= 88200) {
+	if (c->speed_bands >= 2) {
 		rates |= SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000;
 		*rmax = 96000;
 	}
-	if (cap >= 176400) {
+	if (c->speed_bands >= 3) {
 		rates |= SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000;
 		*rmax = 192000;
 	}
@@ -898,16 +894,16 @@ static int clarett_pcm_open(struct snd_pcm_substream *ss)
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	struct snd_pcm_runtime *runtime = ss->runtime;
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
-	u8 chans   = play ? c->model->playback_channels :
-			    c->model->capture_channels;
+	u8 chans   = play ? c->playback_ch :
+			    c->capture_ch;
 	u32 frame  = (u32)chans * 4;
 	/*
 	 * Both directions get the SHORTER ring's ceiling. A Red's playback ring
 	 * is half its capture ring, so otherwise their default periods differ,
 	 * and two clients configuring at once fail the period lock.
 	 */
-	u32 tx_frame = (u32)c->model->playback_channels * 4;
-	u32 rx_frame = (u32)c->model->capture_channels * 4;
+	u32 tx_frame = (u32)c->playback_ch * 4;
+	u32 rx_frame = (u32)c->capture_ch * 4;
 	u32 ring_frames = min_t(u32, clarett_tx_ring_bytes(c) / tx_frame,
 				clarett_rx_ring_bytes(c) / rx_frame);
 	size_t buf = (size_t)ring_frames * frame;
@@ -1027,7 +1023,7 @@ void clarett_pcm_resume(struct clarett *c)
 	u32 rate = READ_ONCE(c->cur_rate);
 	u8 clk[8];
 
-	if (!c->model->n_clock_srcs)
+	if (!c->n_clock_srcs)
 		return;
 	clarett_put_le32(clk, rate ? rate : CLARETT_DEFAULT_RATE);
 	clarett_put_le32(clk + 4, clarett_clock_source(c));
@@ -1332,7 +1328,7 @@ static void clarett_build_rings(struct clarett *c)
 	size_t tbl     = clarett_pcm_tbl_bytes();
 
 	size_t tx_ring = clarett_pcm_tx_ring(c);
-	u32 tx_frag = clarett_tx_frag_bytes(c->model->playback_channels);
+	u32 tx_frag = clarett_tx_frag_bytes(c->playback_ch);
 	/* TX descriptor stride: audio bytes, or a padded slot */
 	u32 tx_slot = c->tx_slot;
 	/* RX descriptor stride: audio bytes, or a padded slot */
@@ -1364,7 +1360,7 @@ static void clarett_build_rings(struct clarett *c)
 	dev_dbg(&c->pci->dev,
 		"descriptor rings: %u entries, tx audio=0x%x slot=0x%x, rx audio=0x%x slot=0x%x, RX IRQ every %u desc (%u frames/period)\n",
 		CLARETT_STREAM_NDESC, tx_frag, tx_slot,
-		clarett_frag_bytes(c->model->capture_channels), rx_slot,
+		clarett_frag_bytes(c->capture_ch), rx_slot,
 		clarett_irq_descs(c), clarett_irq_period_frames(c));
 }
 
@@ -1410,7 +1406,7 @@ int clarett_create_pcm(struct clarett *c)
 	 */
 	dev_dbg(&c->pci->dev,
 		"PCM registered (playback %uch / capture %uch, S32_LE @%u, bufs tx=%zu rx=%zu B @%pad)\n",
-		c->model->playback_channels, c->model->capture_channels,
+		c->playback_ch, c->capture_ch,
 		CLARETT_PCM_RATE, txbuf, rxbuf, &c->stream_dma);
 
 	return 0;

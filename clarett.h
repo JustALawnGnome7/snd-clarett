@@ -112,6 +112,12 @@ struct snd_rawmidi_substream;
  */
 /* descriptors per ring (model-independent) */
 #define CLARETT_STREAM_NDESC     256
+/*
+ * Sanity bound on a reported stream width, per direction. The widest seen is
+ * 64 (the Red range); a reply above this is treated as garbage, not as a
+ * device to size 256 fragments for.
+ */
+#define CLARETT_MAX_STREAM_CHANS 128
 
 /* --- PCM (data plane) --------------------------------------------------- */
 /* default rate, all models (see clocking enum) */
@@ -342,10 +348,12 @@ struct snd_rawmidi_substream;
 /* SET_CLOCK: payload {u32 sample_rate, u32 clock_source}. */
 #define FCP_SET_CLOCK            0x006003
 /*
- * Clock-source enum values. Internal, ADAT and S/PDIF are the same on every
- * model; S/PDIF is 3 on the 2Pre too (4 there locks to any external source).
- * Sync Status tells whether one locked, not the audio: S/PDIF and ADAT arrive
- * on their capture channels whatever the clock source.
+ * Clock-source enum values, for the model tables (the fallback when the device
+ * does not answer CLOCK_LIST). The 2Pre lists S/PDIF as 4, its optical input,
+ * which locks to S/PDIF or ADAT alike; 3, which the other Claretts list, also
+ * selects S/PDIF there but is not what the vendor sends. Sync Status tells
+ * whether one locked, not the audio: S/PDIF and ADAT arrive on their capture
+ * channels whatever the clock source.
  */
 #define CLARETT_CLOCK_ADAT       0 /* "ADAT 1" on the 8PreX and Red 8Line */
 /* the second ADAT port (ADAT 9-16 In), 8PreX and Red */
@@ -408,9 +416,37 @@ struct snd_rawmidi_substream;
 #define FCP_GET_62               0x006002
 
 /*
+ * MODEL_ID {u32 offset, u32 len} reads a 12-byte identity record
+ * {u32 family, u32 model, u32 (undecoded, 0 on the Claretts read)}; a range
+ * past byte 12 is refused. Family 1 is the Clarett line, 2 the Red range, and
+ * the model word differs on every model read (struct clarett_model's
+ * id_family/id_model). The vendor driver asks it ({0, 8}) before anything
+ * else; probe asks it straight after STREAM_INFO. Thunderbolt firmware only:
+ * a USB Clarett refuses it.
+ */
+#define FCP_MODEL_ID             0x800005
+#define MODEL_ID_FAMILY_CLARETT  1
+#define MODEL_ID_FAMILY_RED      2
+
+/*
+ * CLOCK_LIST -> {u16 clock value, u16 name id} per selectable clock source, in
+ * the order the vendor software lists them: the value is what SET_CLOCK
+ * carries, the name id an entry of the PORT_NAME string table. The 2Pre
+ * answers Internal 24, S/PDIF 4, ADAT 0, and the vendor driver sends exactly
+ * those values. PORT_NAME {u16 id} -> a NUL-terminated name from one fixed
+ * table per family (ids 3-8 are the clock names; past the table the device
+ * refuses). Probe builds the "Clock Source" control from the two
+ * (clarett_read_clock_srcs()).
+ */
+#define FCP_CLOCK_LIST           0x006000
+#define FCP_PORT_NAME            0x005000
+#define CLARETT_MAX_CLOCK_SRCS   16
+#define CLARETT_CLOCK_NAME_LEN   32
+
+/*
  * Other opcodes, for reference; the driver issues none of them itself.
- *   0x800005 READ_SEG and 0x006000/0x006001/0x007000: version/identity
- *     queries a normal attach makes.
+ *   0x006001 {} -> the supported rates as u32s (44100..192000 on the 2Pre);
+ *     0x007000: identity queries a normal attach makes.
  *   0x000001 {u16 category} -> one byte: the CAPABILITY READ, non-zero = that
  *     opcode category is live. fcp-server calls it first and refuses the
  *     device unless INIT (0x000) and DATA (0x800) both answer, so it is the
@@ -425,21 +461,36 @@ struct snd_rawmidi_substream;
  *     {u8 offset, u8 pad, u8 count, u8 band} reads the routing back as u32
  *     entries (src << 12 | dst), at most 28 per reply whatever count asks
  *     for.
- *   0x005000 {u16 id} reads a fixed port-name string (the same table on every
- *     model, so it describes no model's ports); 0x007002/0x007003 are a normal
- *     attach's playback/capture width declarations, sent with no payload.
- *     None of these is needed to stream.
+ *   None of these is needed to stream.
  */
 
 /*
- * Per-model descriptor. One const instance per supported model, detected at
- * probe and pinned as clarett.model. Every value that differs between models
- * lives here; the mailbox/engine *code* stays model-agnostic. Encodings are
- * per-model — never assume a value carries across models.
+ * STREAM_CHANS_TX/RX {u32 speed band, u16 count (ignored)} -> one 16-byte
+ * record per playback/capture stream channel at that band, in stream order:
+ * {u8 0, u8 index, u16 port id, u16 port id, u16 port class, u32 0,
+ * u32 type}. Port id and class are PORT_NAME ids (the 2Pre's capture: Input
+ * 1-2 class Analog, S/PDIF 1-2, Loop 1-2 class LOOP, then ADAT 1-8; at
+ * double and quad speed the same list cut to the S/MUX width). A band past 2
+ * is refused. The vendor driver sends both at every stream setup; probe reads
+ * the capture list for the loopback pair (clarett_read_rx_layout()).
+ */
+#define FCP_STREAM_CHANS_TX      0x007002
+#define FCP_STREAM_CHANS_RX      0x007003
+#define CLARETT_CHAN_REC_BYTES   16
+#define CLARETT_PORT_CLASS_LOOP  0x0c
+
+/*
+ * Per-model descriptor: what the device does not report about itself (names,
+ * config offsets, clock sources, the loopback position, MIDI). One const
+ * instance per known model, detected at probe and pinned as clarett.model; a
+ * unit no entry claims gets its family's defaults instead
+ * (clarett_detect_model) and still streams, since the stream is sized from
+ * the device's own geometry.
+ * Encodings are per-model — never assume a value carries across models.
  *
  * Every model shares PCI id 1cb5:0002, so the id_table cannot distinguish them;
- * the model is detected from the device's reported stream geometry
- * (clarett_detect_model).
+ * the model is detected from the device's MODEL_ID answer, or its stream
+ * geometry (clarett_detect_model).
  */
 struct clarett_out_gain {
 	const char *name;	/* ALSA control name prefix, e.g. "Monitor 1" */
@@ -448,8 +499,8 @@ struct clarett_out_gain {
 
 /*
  * One selectable clock source: the enum value SET_CLOCK carries, and the label
- * the "Clock Source" ALSA control shows. Per model, Internal first (the
- * default, and what a user without digital inputs wants).
+ * the "Clock Source" ALSA control shows. The device lists its own
+ * (CLOCK_LIST); a model's table is the fallback if it does not answer.
  */
 struct clarett_clock_src {
 	const char *name;
@@ -499,43 +550,56 @@ struct clarett_model {
 	 */
 	u8 tb_gen;
 	/*
+	 * The device's MODEL_ID answer {family, model}, which identifies the
+	 * model outright (clarett_detect_model()). 0 = not yet read from a
+	 * unit: such a model is matched by stream geometry (and tb_gen), but
+	 * only for a unit whose answer no other entry claims.
+	 */
+	u8 id_family;
+	u8 id_model;
+	/*
 	 * Hardware-meter source selector (8PreX only; others have one or no
 	 * source).
 	 */
 	const struct clarett_meter_source *meter_sources;
 	int n_meter_sources;
 
-	/* data plane / PCM geometry */
+	/*
+	 * The stream geometry this model reports (STREAM_INFO band 0). Used
+	 * only to identify the model and to cross-check a MODEL_ID match: the
+	 * stream itself is sized from the device's answer (clarett.capture_ch,
+	 * clarett.playback_ch).
+	 */
 	u8 capture_channels;			/* block-1 RX stream width */
 	u8 playback_channels;			/* block-0 TX stream width */
-	/*
-	 * Highest supported sample rate; 0 = single speed (48k) only. The
-	 * stream width does not change with the rate, so this only advertises
-	 * the higher SET_CLOCK rates. Raise it for a new model only after
-	 * checking those rates on hardware.
-	 */
-	u32 max_rate;
 	/*
 	 * ADAT S/MUX: the frame stays capture_channels wide at every rate, but
 	 * the device stops writing the ADAT channels S/MUX removes (8 -> 4 -> 2
 	 * per port), and the driver blanks them (clarett_set_rx_live()). These
 	 * are the leading capture channels still written at double and quad
 	 * speed; the rest is a contiguous tail. 0 = all channels live. The
-	 * device reports the same counts (STREAM_INFO bands 1 and 2), which the
-	 * driver uses; this table is the fallback, and a disagreement is
-	 * logged.
+	 * device reports the same counts (STREAM_INFO bands 1 and 2), and the
+	 * driver uses its answer: this table is only a cross-check, and a
+	 * disagreement is logged. A nonzero value also says the model is known
+	 * to run at that speed, so a band the device then does not answer is
+	 * worth a warning.
 	 */
 	u8 rx_live_mid;		/* capture channels written at 88.2/96 kHz */
 	u8 rx_live_high;	/* capture channels written at 176.4/192 kHz */
 	/*
-	 * Device capture channel of the first of the two loopback channels; 0 =
-	 * leave the stream order alone. The device puts loopback after the
-	 * fixed inputs and before ADAT, so the channels S/MUX removes stay a
-	 * tail of the frame. The router names the pair last (PCM 19-20 on a
-	 * 4Pre), so clarett_rx_drain() moves it to the end of each frame and
-	 * shifts the channels after it down two, which makes ALSA capture
-	 * channel n the router's PCM n. rx_live_{mid,high} still count DEVICE
-	 * channels.
+	 * Move the capture stream's loopback pair to the end of each frame.
+	 * The device puts loopback after the fixed inputs and before ADAT, so
+	 * the channels S/MUX removes stay a tail of the frame; the Clarett
+	 * router names the pair last (PCM 19-20 on a 4Pre), so
+	 * clarett_rx_drain() moves it and shifts the channels after it down
+	 * two, which makes ALSA capture channel n the router's PCM n. The Red
+	 * maps name capture in stream order, so the Reds leave it alone. Where
+	 * the pair is comes from the device (clarett.rx_loopback_at).
+	 */
+	bool loopback_last;
+	/*
+	 * The pair's device channel as measured on this model: a cross-check
+	 * on the device's answer, and the fallback if it gives none.
 	 */
 	u8 rx_loopback_at;
 	/* selectable clock sources, Internal first */
@@ -641,6 +705,17 @@ struct clarett {
 	void __iomem *bar0;
 	/* selected at probe; see struct clarett_model */
 	const struct clarett_model *model;
+	/*
+	 * The device's stream geometry (STREAM_INFO band 0), which sizes the
+	 * rings, the descriptors, the engine's arm registers and the PCM,
+	 * whatever the model table says.
+	 */
+	u8 playback_ch;
+	u8 capture_ch;
+	/* the device's MODEL_ID answer, if it gave one (id_ok) */
+	u32 id_family;
+	u32 id_model;
+	bool id_ok;
 
 	/* serialises FCP transactions */
 	struct mutex mbox_lock;
@@ -804,11 +879,30 @@ struct clarett {
 	 */
 	int clock_src;
 	/*
+	 * the "Clock Source" items: the device's CLOCK_LIST, named from
+	 * PORT_NAME, or the model's table if the device gave none
+	 * (clarett_read_clock_srcs)
+	 */
+	struct clarett_clock_src clock_srcs[CLARETT_MAX_CLOCK_SRCS];
+	char clock_names[CLARETT_MAX_CLOCK_SRCS][CLARETT_CLOCK_NAME_LEN];
+	u8 n_clock_srcs;
+	/*
 	 * capture channels the device writes at single/double/quad
-	 * speed: STREAM_INFO's answer, read at probe, or the model
-	 * table's where the device gave none (clarett_read_rx_live)
+	 * speed: STREAM_INFO's answer, read at probe
+	 * (clarett_read_rx_live); valid for the first speed_bands
 	 */
 	u8 rx_live[CLARETT_SPEED_BANDS];
+	/*
+	 * speed bands the device answered STREAM_INFO for (1 = single
+	 * speed only, 3 = up to 192 kHz): the rates the PCM offers
+	 */
+	u8 speed_bands;
+	/*
+	 * device capture channel of the first loopback channel, which
+	 * clarett_rx_drain() moves to the end of each frame; 0 = leave the
+	 * stream order alone (clarett_read_rx_layout)
+	 */
+	u8 rx_loopback_at;
 	/*
 	 * leading bytes of each capture frame the device fills at the
 	 * negotiated rate, and the S/MUX-removed tail after them, which the
@@ -1175,7 +1269,7 @@ static inline size_t clarett_pcm_tbl_bytes(void)
 static inline size_t clarett_pcm_tx_samples(const struct clarett *c)
 {
 	return (size_t)CLARETT_STREAM_NDESC *
-	       clarett_tx_frag_bytes(c->model->playback_channels);
+	       clarett_tx_frag_bytes(c->playback_ch);
 }
 
 static inline size_t clarett_pcm_tx_dev_bytes(const struct clarett *c)
@@ -1195,7 +1289,7 @@ static inline size_t clarett_pcm_tx_dev_bytes(const struct clarett *c)
 static inline size_t clarett_pcm_rx_samples(const struct clarett *c)
 {
 	return (size_t)CLARETT_STREAM_NDESC *
-	       clarett_frag_bytes(c->model->capture_channels);
+	       clarett_frag_bytes(c->capture_ch);
 }
 
 static inline size_t clarett_pcm_rx_dev_bytes(const struct clarett *c)
@@ -1310,8 +1404,10 @@ int clarett_enable_monitor_hw_controls(struct clarett *c);
 extern const struct clarett_model clarett_2pre;
 const struct clarett_model *
 clarett_detect_model(struct clarett *c, bool *collapsed, bool quiet);
-void clarett_log_twin(struct clarett *c);
+void clarett_log_ident(struct clarett *c);
 void clarett_read_rx_live(struct clarett *c);
+void clarett_read_clock_srcs(struct clarett *c);
+void clarett_read_rx_layout(struct clarett *c);
 
 /* engine.c — data-plane engine (shared with pcm.c) */
 void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1);

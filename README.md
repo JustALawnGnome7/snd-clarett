@@ -171,8 +171,8 @@ Then use **alsa-scarlett-gui** for the full mixer, router and meters, or
 
 ### Model detection
 
-Every model shares one PCI id, so the model is detected from the device itself: it reports its
-own stream geometry, which is unique per model. There is nothing to configure, and the driver
+Every model shares one PCI id, so the model is detected from the device itself: it reports a
+model number, and its stream geometry is checked against it. There is nothing to configure, and the driver
 logs what it found:
 
 ```
@@ -182,9 +182,10 @@ snd_clarett 0000:0a:00.0: Clarett 2Pre: App 1016, FPGA 1021; FCP hwdep, PCM 4/14
 `App`/`FPGA` (and `Front` on a Red) are the unit's firmware versions. The serial is not logged; it is
 in `/sys/bus/pci/devices/<bdf>/serial`.
 
-There is deliberately no way to override detection: channel counts, DMA geometry and the meter
-layout are all sized from the model, so a wrong guess would stream the wrong width. If the
-driver cannot identify the device it refuses to register and says so in the kernel log.
+There is deliberately no way to override detection. The stream is sized from the channel counts
+the device reports, not from the model, so a unit the driver does not recognise still records and
+plays at its full width: it attaches with its product family's defaults (`Clarett` or `Red` as the
+card name, no model-specific controls) and says in the kernel log that it needs adding.
 
 ### PCM (recording and playback)
 

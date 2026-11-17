@@ -655,7 +655,7 @@ static int clarett_identify(struct clarett *c)
 			tries);
 	/*
 	 * One logged pass on any failure: a refusal's status/size, or an
-	 * unmatched geometry.
+	 * unusable stream width.
 	 */
 	if (!det)
 		det = clarett_detect_model(c, &collapsed, false);
@@ -673,17 +673,18 @@ static int clarett_identify(struct clarett *c)
 
 	if (!det) {
 		/*
-		 * A clean answer with a geometry no clarett_model claims:
-		 * refuse rather than size the rings for different hardware. The
-		 * warn above carries the pair to add to the table.
+		 * A clean answer with a stream width no ring can be sized
+		 * for. The warn above carries the values.
 		 */
 		dev_err(&pci->dev,
-			"unknown Clarett model (stream geometry matches none in the table) — refusing to register. Add a clarett_model entry for the playback/capture pair logged above.\n");
+			"unusable stream geometry — refusing to register; see the values logged above.\n");
 		return -ENODEV;
 	}
 	c->model = det;
-	clarett_log_twin(c);
+	clarett_log_ident(c);
 	clarett_read_rx_live(c);
+	clarett_read_clock_srcs(c);
+	clarett_read_rx_layout(c);
 	/* Nothing arms the device, so its flash-persisted routing stands. */
 	return 0;
 }
@@ -706,9 +707,9 @@ static int clarett_setup_model(struct clarett *c)
 	 * gets its own slot of the next power of two, which divides the page,
 	 * over a page-aligned area.
 	 */
-	c->rx_slot = clarett_frag_bytes(c->model->capture_channels);
+	c->rx_slot = clarett_frag_bytes(c->capture_ch);
 	c->rx_slot = roundup_pow_of_two(c->rx_slot);
-	c->tx_slot = clarett_tx_frag_bytes(c->model->playback_channels);
+	c->tx_slot = clarett_tx_frag_bytes(c->playback_ch);
 	c->tx_slot = roundup_pow_of_two(c->tx_slot);
 
 	/*
@@ -842,8 +843,8 @@ static void clarett_log_summary(struct clarett *c, int seeded, bool pcm_ok)
 			       n ? ", " : "");
 	if (pcm_ok)
 		n += scnprintf(feat + n, sizeof(feat) - n, "%sPCM %u/%uch",
-			       n ? ", " : "", c->model->playback_channels,
-			       c->model->capture_channels);
+			       n ? ", " : "", c->playback_ch,
+			       c->capture_ch);
 	if (READ_ONCE(c->rmidi))
 		n += scnprintf(feat + n, sizeof(feat) - n, "%sMIDI",
 			       n ? ", " : "");

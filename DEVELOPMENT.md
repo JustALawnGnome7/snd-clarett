@@ -144,33 +144,47 @@ Probe sequence:
    100 ms, because a response that lands at all lands within a millisecond.
 3. **Detect.** Every model shares PCI id `1cb5:0002` and an identical pre-mailbox surface —
    registers, PCI config space and the BAR0 serial and firmware-info words (placeholders, the same
-   on every unit) — but the session reports the model's stream geometry: `STREAM_INFO{band 0}` (`0x007001`)
-   answers `{u16 playback_channels, u16 capture_channels}`, a pair unique per model. Probe then asks
-   bands 1 and 2 (double and quad speed) for the capture width S/MUX leaves; see Sample rates below.
+   on every unit) — but the session names the model. `STREAM_INFO{band 0}` (`0x007001`) answers
+   `{u16 playback_channels, u16 capture_channels}`, a pair unique per model bar the Red twins, and is
+   the readiness test. `MODEL_ID` (`0x800005`, `{u32 offset, u32 len}` into a 12-byte record) answers
+   `{u32 family, u32 model, u32}`: family 1 is the Clarett line, 2 the Red range, and the model word
+   differs on every model read. It is the first command the vendor driver sends. A `MODEL_ID` match
+   decides the model, and its geometry must agree with the table; a model whose `MODEL_ID` has not
+   been read from a unit is matched by geometry instead. Probe then asks `STREAM_INFO` bands 1 and 2
+   (double and quad speed) for the capture width S/MUX leaves; see Sample rates below.
 4. **Give up.** A unit that has not answered within those 10 s fails the probe with a
    message to power-cycle it. The budget is kept short because a removal of the device (the user
    power-cycling it) waits for its probe to finish.
 
-**Detection is the only path — there is no override.** If the device never answers, or answers
-with a geometry no `clarett_model` claims, probe **fails with `-ENODEV` and registers no card**,
-logging why (and, for an unknown geometry, the raw `playback=/capture=` pair). Channel counts, DMA
-ring and descriptor geometry, fragment strides and the meter layout are all derived from the model,
-so a wrong guess would stream the wrong width into wrongly strided rings. Supporting new hardware is
-a `clarett_model` entry keyed on the logged pair.
+**Detection is the only path — there is no override — but the stream does not depend on it.**
+The `STREAM_INFO{band 0}` answer is kept per card (`playback_ch`/`capture_ch`), and the rings,
+descriptors, fragment strides, the engine's arm registers and the PCM are all sized from it, never
+from the model table, whose channel counts are only identification keys. The model supplies what the
+device does not report: names and slug, config offsets, clock sources, the loopback position, MIDI,
+the notification word. A unit no entry claims (an unknown `MODEL_ID` and geometry, or a `MODEL_ID`
+whose entry has a different geometry) **still attaches, on its family's defaults** (Clarett or Red,
+from `MODEL_ID`'s family word or register `0x000`): the family's clock sources, notification word and
+MIDI or front-panel word, the stream in the device's order, no per-model controls, and a warning with
+the raw `MODEL_ID`, geometry and `0x000` values to add a `clarett_model` entry from. Probe fails with
+`-ENODEV` only if the device never answers, or reports a width outside 1-128. A unit matched by
+geometry logs its `MODEL_ID` at info level, to be added to its entry.
 
-| Model | Playback / capture channels | Slug |
-|---|---|---|
-| Clarett 2Pre | 4 / 14 | `clarett-2pre` |
-| Clarett 4Pre | 8 / 20 | `clarett-4pre` |
-| Clarett 8Pre | 20 / 20 | `clarett-8pre` |
-| Clarett 8PreX | 28 / 28 | `clarett-8prex` |
-| Red 8Line | 64 / 60 | `red-8line` |
-| Red 16Line (untested) | 64 / 64 | `red-16line` |
-| Red 4Pre (untested) | 64 / 60 | `red-4pre` |
-| Red 8Pre (untested) | 64 / 64 | `red-8pre` |
+| Model | Playback / capture channels | `MODEL_ID` | Slug |
+|---|---|---|---|
+| Clarett 2Pre | 4 / 14 | 1, 4 | `clarett-2pre` |
+| Clarett 4Pre | 8 / 20 | 1, 3 | `clarett-4pre` |
+| Clarett 8Pre | 20 / 20 | 1, 1 | `clarett-8pre` |
+| Clarett 8PreX | 28 / 28 | 1, 2 | `clarett-8prex` |
+| Red 8Line | 64 / 60 | 2, 6 | `red-8line` |
+| Red 16Line (untested) | 64 / 64 | not read | `red-16line` |
+| Red 4Pre (untested) | 64 / 60 | not read | `red-4pre` |
+| Red 8Pre (untested) | 64 / 64 | not read | `red-8pre` |
 
 The Red models pair up by geometry: the 4Pre reports the 8Line's pair and the 8Pre the 16Line's.
-Within a pair the unit's own Thunderbolt controller decides (`tb_gen`, `clarett_unit_tb_gen()`): the
+The Red 8Line is identified by its `MODEL_ID`, and a unit answering a `MODEL_ID` the table does not
+list is never matched by geometry to a model whose `MODEL_ID` is known, so a Red 4Pre cannot be taken
+for the 8Line. Where both twins' `MODEL_ID`s are unknown (the 8Pre and 16Line), or the device does
+not answer `MODEL_ID`, the unit's own Thunderbolt controller decides (`tb_gen`, `clarett_unit_tb_gen()`): the
 Pre models are Thunderbolt 2 units and the Line models Thunderbolt 3. That controller is always the
 endpoint's immediate upstream bridge — through a dock, an adapter or another unit's daisy-chain port,
 all of which sit further up the chain — so the test holds on any host. If the bridge is not a known
@@ -242,20 +256,29 @@ without it, so the driver does not send it. Credit: Geoffrey D. Bennett establis
 - **Buffer size is bounded per stream by the period**: at most `CLARETT_MAX_PERIODS` (4) periods,
   with a floor of `CLARETT_MIN_BUFFER_FRAMES` (128), and always a power of two, so it divides the
   4096-frame hardware ring. `max_buffer` adds an optional hard ceiling.
-- **Sample rates** 44.1-192 kHz on every supported model. The stream width does not change with
-  rate. At double and quad speed the channels S/MUX removes still arrive in the stream with junk
-  in them, so the servicer blanks that dead tail of the capture frame every period. How many
-  channels stay live at each speed comes from the device (STREAM_INFO's capture word at bands 1
-  and 2, read at probe). The per-model `rx_live_mid`/`rx_live_high` table is the fallback for a
-  band the device does not answer, and a cross-check: a disagreement is logged at probe.
+- **Sample rates** 44.1-192 kHz on every supported model. Which rates are offered comes from the
+  device: probe asks `STREAM_INFO` for bands 1 (88.2/96 kHz) and 2 (176.4/192 kHz), and each band
+  answered with a valid capture width adds its rates; the first one not answered ends the list.
+  The stream width does not change with rate. At double and quad speed the channels S/MUX removes
+  still arrive in the stream with junk in them, so the servicer blanks that dead tail of the
+  capture frame every period; how many channels stay live is that same `STREAM_INFO` capture word.
+  The per-model `rx_live_mid`/`rx_live_high` table is only a cross-check: a disagreement is logged
+  at probe, and so is a band the device does not answer for a model the table says runs at it.
   Credit: Geoffrey D. Bennett identified STREAM_INFO and its speed bands.
 - **Capture channel order matches the router's PCM names.** The Claretts send the loopback pair
   after the fixed inputs and before ADAT (so S/MUX only ever removes a tail), while the router
   numbers it last (PCM 19-20 on a 4Pre or 8Pre). The capture copy moves the pair to the end of
-  each frame (`clarett_model.rx_loopback_at`), so ALSA capture channel n is the router's PCM n at
-  every rate. The Red range's maps name capture channels in stream order and need no reordering.
+  each frame, so ALSA capture channel n is the router's PCM n at every rate. Where the pair sits
+  comes from the device: `0x007003 {u32 band}` lists every capture channel at that speed (16 bytes
+  each: index, port id, port class, type), and the pair is the two channels of class LOOP
+  (`0x0c`). The model's measured position is the fallback and a cross-check. The Red range's maps
+  name capture channels in stream order, so the Reds keep the device's order
+  (`clarett_model.loopback_last`).
 - **Clock source** is the `Clock Source` ALSA control, one per card; alsactl's saved state keeps it
-  across reloads and re-attaches. It is sent with the sample rate in `SET_CLOCK` at every arm, and
+  across reloads and re-attaches. Its items come from the device, as the vendor driver's do:
+  `0x006000` lists each source's `SET_CLOCK` value and name id, and `0x005000` gives the name (the
+  2Pre lists Internal 24, S/PDIF 4, ADAT 0; the other Claretts' S/PDIF is 3). The model's table is
+  the fallback if the device does not answer. It is sent with the sample rate in `SET_CLOCK` at every arm, and
   a change to the control is sent at once at the current rate, streaming or not. `Sync Status` (from `fcp-server`)
   shows the lock.
 - **There is no default route**: playback is silent until a PCM source is wired to an output in the
