@@ -1,5 +1,7 @@
 # snd-clarett — Focusrite Clarett/Red (Thunderbolt) ALSA driver
 
+![Stacked smallest to largest: the Clarett 2Pre, 4Pre, 8Pre and 8PreX](docs/claretts.jpg)
+
 Out-of-tree ALSA driver for Focusrite's Thunderbolt audio interfaces — the **Clarett** and
 **Red** ranges — as a single module, with the model detected at probe. Supported today: the
 **Clarett 2Pre**, **4Pre**, **8Pre** and **8PreX**, and the **Red 8Line**, all at 44.1-192 kHz.
