@@ -47,10 +47,15 @@ struct clarett_svc_stats {
 	/* events flagged CLARETT_CTR_OVERRUN (device saw a missed ack) */
 	u32 overruns;
 	/*
+	 * 0x100 reads showing IRQ0_CAUSE_TX_UNDERRUN (the playback engine ran
+	 * dry). A count of samples, not of separate events.
+	 */
+	u32 underruns;
+	/*
 	 * Previous window's values of the cumulative counters, so a window can
 	 * tell whether IT was bad.
 	 */
-	u32 prev_bad_reads, prev_overruns;
+	u32 prev_bad_reads, prev_overruns, prev_underruns;
 	/*
 	 * Run-wide worst case, for the one-line summary at stop (the windows
 	 * reset their own maxima).
@@ -114,6 +119,8 @@ static u32 clarett_svc_read_causes(struct clarett *c,
 		 */
 		if (sum != 0xffffffff) {
 			st->cause_or |= sum;
+			if (sum & IRQ0_CAUSE_TX_UNDERRUN)
+				st->underruns++;
 			/*
 			 * A bit nobody has characterised. Worth one line at
 			 * info, since every capture of every model has only
@@ -232,25 +239,27 @@ static void clarett_svc_fold(struct clarett_svc_stats *st)
 /*
  * Close a 2-second window: log it, fold it into the run, start the next. The
  * line is at info only when the window had a late tick, a device-side period
- * overrun or a rejected sample. Every window, without the mailbox trace:
+ * overrun, a playback underrun or a rejected sample. Every window, without the mailbox trace:
  *   echo 'format "stream-svc:" +p' |
  *     tee /sys/kernel/debug/dynamic_debug/control
  */
 static void clarett_svc_window(struct clarett *c, struct clarett_svc_stats *st)
 {
 	bool bad = st->gap_late || st->bad_reads != st->prev_bad_reads ||
-		   st->overruns != st->prev_overruns;
+		   st->overruns != st->prev_overruns ||
+		   st->underruns != st->prev_underruns;
 
 	clarett_svc_log(c, bad,
-			"stream-svc: periods=%d ctr=0x%x wraps=%u gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u\n",
+			"stream-svc: periods=%d ctr=0x%x wraps=%u gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u underrun=%u\n",
 			atomic_read(&c->stream_periods), c->stream_ctr,
 			st->wraps, st->gap_max_us, st->read_us_max,
 			st->gap_late, st->step_max, st->bad_reads, st->bad_or,
-			st->overruns);
+			st->overruns, st->underruns);
 
 	clarett_svc_fold(st);
 	st->prev_bad_reads = st->bad_reads;
 	st->prev_overruns = st->overruns;
+	st->prev_underruns = st->underruns;
 
 	st->gap_max_us = 0;
 	st->read_us_max = 0;
@@ -260,7 +269,8 @@ static void clarett_svc_window(struct clarett *c, struct clarett_svc_stats *st)
 
 /*
  * One summary per stream, at info only if the run had anything wrong with it.
- * The ring pointers show whether the engine walked the descriptor table at all.
+ * ptr0/ptr1 are the two engines' levels (STREAM_OFF_PTR): zero means that
+ * engine never fetched anything.
  */
 static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
 {
@@ -269,15 +279,16 @@ static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
 	/* fold the final (partial) window in before summarising */
 	clarett_svc_fold(st);
 
-	clarett_svc_log(c, st->run_late || st->bad_reads || st->overruns,
+	clarett_svc_log(c, st->run_late || st->bad_reads || st->overruns ||
+			st->underruns,
 			"stream-svc: stopped (periods=%d ctr=0x%x wraps=%u ptr0=0x%x ptr1=0x%x; "
-			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u cause=0x%08x)\n",
+			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u underrun=%u cause=0x%08x)\n",
 			atomic_read(&c->stream_periods), c->stream_ctr,
 			st->wraps, readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
 			readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
 			st->run_gap_max_us, st->run_read_us_max, st->run_late,
 			st->run_step_max, st->bad_reads, st->bad_or,
-			st->overruns, st->cause_or);
+			st->overruns, st->underruns, st->cause_or);
 }
 
 /*

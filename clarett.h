@@ -98,7 +98,14 @@ struct snd_rawmidi_substream;
 #define   STREAM_OFF_BASE_LO     0x10
 /* ring base bus address high 32 */
 #define   STREAM_OFF_BASE_HI     0x14
-/* DMA position (read-only) */
+/*
+ * The engine's working level (read-only): it holds steady while the engine
+ * keeps up, reads zero before the engine has fetched anything, and reaches
+ * zero on the playback block when that engine runs dry (IRQ0_CAUSE_TX_UNDERRUN).
+ * Its unit is not known; it is not a ring position. +0x1c holds its minimum
+ * since the last read and +0x20 the ring position in 16-frame units; the
+ * driver uses neither.
+ */
 #define   STREAM_OFF_PTR         0x18
 /* 8PreX: 28 PCM channels/direction (populates clarett_8prex) */
 #define STREAM_CHANS             0x1c
@@ -162,22 +169,32 @@ struct snd_rawmidi_substream;
  * at arm: it clears what the previous stop left standing. The servicer never
  * sees them, being stopped before that write.
  *
- * Bits 4 and 5 are enabled too and have never been seen set. They are NOT the
- * period-overrun error they were suspected of being: driven to 26 device-
- * flagged overruns at the cadence floor (a 16-frame period at 48, 96 and 192
- * kHz, capture and duplex), this register showed nothing but bits 31 and 29.
- * The overrun is reported where it always was, in the block's own cause word
- * (CLARETT_CTR_OVERRUN in 0x300). What is left open is narrower: two more of
- * the stop class for engines these models lack, or an error class nobody has
- * provoked. The servicer ORs every value it reads into its cause= telemetry
- * and reports an unknown bit at info, so the next one to fire says so.
+ * bit4   the playback engine has run dry: its descriptor fetch fell behind
+ *        the sample clock. Established on hardware (Red 8Line) by making the
+ *        engine consume descriptors eight times faster than the clock
+ *        (REG_STREAM_IRQ_CFG = 2): the playback block's level (STREAM_OFF_PTR)
+ *        fell to zero and stayed there, this bit appeared with it, and vector
+ *        0 fired once per descriptor (~25,000/s). At four times the engine
+ *        kept up and none of the three happened. A host that is late
+ *        refilling the ring cannot raise it: the device has no ownership bit
+ *        and plays whatever the ring holds.
+ *
+ * Bits 4 and 5 are NOT the period-overrun error they were suspected of being:
+ * driven to 26 device-flagged overruns at the cadence floor (a 16-frame period
+ * at 48, 96 and 192 kHz, capture and duplex), this register showed nothing but
+ * bits 31 and 29. The overrun is reported where it always was, in the block's
+ * own cause word (CLARETT_CTR_OVERRUN in 0x300). Bit 5 has never been seen
+ * set; a capture-side counterpart of bit 4 is a guess. The servicer counts
+ * bit 4 (underrun= in its telemetry), ORs every value it reads into cause=,
+ * and reports any other unknown bit at info, so the next one to fire says so.
  */
 /*
  * 0x100 bits whose meaning is established (above). bit30 is included although
  * the shipped driver cannot raise it -- nothing marks a TX descriptor -- so
  * that a build which does mark them is not told its own doing is unknown.
  */
-#define IRQ0_CAUSE_KNOWN         0xf000000fu
+#define IRQ0_CAUSE_TX_UNDERRUN   0x00000010u
+#define IRQ0_CAUSE_KNOWN         0xf000001fu
 #define DOORBELL_SUBMIT          1
 #define DOORBELL_ACK             2
 
