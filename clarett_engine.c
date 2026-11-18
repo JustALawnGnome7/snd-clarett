@@ -430,6 +430,7 @@ static int clarett_stream_service(void *data)
 			usleep_range(100, 200);
 			continue;
 		}
+		clarett_pcm_sample_live(c);
 		/* between events: copy playback the app wrote since */
 		clarett_pcm_tx_refill(c);
 		if (time_after(jiffies, next_log)) {

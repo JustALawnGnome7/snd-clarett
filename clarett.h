@@ -103,10 +103,17 @@ struct snd_rawmidi_substream;
  * keeps up, reads zero before the engine has fetched anything, and reaches
  * zero on the playback block when that engine runs dry (IRQ0_CAUSE_TX_UNDERRUN).
  * Its unit is not known; it is not a ring position. +0x1c holds its minimum
- * since the last read and +0x20 the ring position in 16-frame units; the
- * driver uses neither.
+ * since the last read (unused).
  */
 #define   STREAM_OFF_PTR         0x18
+/*
+ * The engine's ring position in 16-frame units (read-only, live, not cleared
+ * by reading), zero at arm; its width is the ring's length in units. It runs
+ * from zero to one period ahead of the counter last latched from 0x300. It
+ * gives .pointer the position between period events, and capture is copied up
+ * to it.
+ */
+#define   STREAM_OFF_POS         0x20
 /* 8PreX: 28 PCM channels/direction (populates clarett_8prex) */
 #define STREAM_CHANS             0x1c
 /*
@@ -995,6 +1002,20 @@ struct clarett {
 	/* engine frame clock since arm (shared by both directions) */
 	u64 pcm_frames;
 	/*
+	 * Where the playback engine has read to, on the same clock: pcm_frames
+	 * plus the ring position's lead over the last event. Sampled by the
+	 * servicer whenever it reads the device; only moves forward; may lag
+	 * pcm_frames while no playback runs (users take the larger).
+	 */
+	u64 play_live;
+	/*
+	 * Capture: how far the RX ring has been copied into the ALSA buffer,
+	 * on the same clock. Every period event copies up to the event, and
+	 * between events the servicer copies up to the engine's live position,
+	 * so this runs ahead of pcm_frames by up to a period. Under pcm_lock.
+	 */
+	u64 cap_drained;
+	/*
 	 * Where each direction joined that shared clock (its frame 0): ALSA
 	 * zeroes hw_ptr at every prepare, so .pointer reports relative to it.
 	 * base % ring is also the rotation between ALSA buffer and hardware
@@ -1460,6 +1481,8 @@ int clarett_add_clock_control(struct clarett *c);
 void clarett_pcm_tick(struct clarett *c, u32 add_frames);
 /* servicer: refill TX if the app wrote since the tick */
 void clarett_pcm_tx_refill(struct clarett *c);
+/* servicer: follow both engines' live positions between period events */
+void clarett_pcm_sample_live(struct clarett *c);
 /* system sleep: tear the engine down, silence TX */
 void clarett_pcm_suspend(struct clarett *c);
 /* system sleep: re-send the Clock Source */

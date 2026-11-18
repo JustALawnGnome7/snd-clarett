@@ -470,6 +470,15 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
  * cannot tear anything.
  */
 /*
+ * Where the playback engine has read to: the live sample when one is ahead of
+ * the frame clock, else the clock (no playback sampled since the last event).
+ */
+static u64 clarett_play_pos(struct clarett *c)
+{
+	return max(READ_ONCE(c->pcm_frames), READ_ONCE(c->play_live));
+}
+
+/*
  * First fill after START. If the engine has already reached the guard window of
  * frame 0 — START landed just before a period event and the servicer only got
  * here after it — frame 0 can no longer be written in time. Push the anchor
@@ -480,11 +489,12 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
 static void clarett_play_prime(struct clarett *c,
 			       struct snd_pcm_substream *ps, u32 guard)
 {
+	u64 pos = clarett_play_pos(c);
+
 	if (c->play_primed)
 		return;
 	c->play_primed = true;
-	while (c->pcm_frames <= c->play_base &&
-	       c->pcm_frames + guard > c->play_base)
+	while (pos <= c->play_base && pos + guard > c->play_base)
 		WRITE_ONCE(c->play_base,
 			   c->play_base + ps->runtime->period_size);
 }
@@ -558,8 +568,12 @@ static void clarett_play_fill(struct clarett *c)
 	 * behind or stops: when a stream ends, the last period again, one
 	 * buffer later. Right after START the anchor lies ahead of the runway's
 	 * start; begin there, leaving the frames before frame 0 silent.
+	 *
+	 * The read position is the live one: .pointer reports it, so the app
+	 * may already have written up to a buffer past it, and counting from
+	 * the last event instead would read that as an underrun.
 	 */
-	from = c->pcm_frames + guard;
+	from = clarett_play_pos(c) + guard;
 	n = ring - guard;
 	if (c->play_base > from) {
 		u64 lead = c->play_base - from;
@@ -598,8 +612,8 @@ void clarett_pcm_tx_refill(struct clarett *c)
 }
 
 /*
- * Capture drain: the add_frames the engine just wrote, from the current ring
- * position (slot-aware) to the matching position in the stream's own ALSA
+ * Capture drain: the add_frames the engine wrote from engine frame `from`, out
+ * of the ring (slot-aware) to the matching position in the stream's own ALSA
  * buffer (offset by where it attached).
  *
  * Clamped to the ALSA buffer and skipped forward to the newest n frames: after
@@ -607,7 +621,7 @@ void clarett_pcm_tx_refill(struct clarett *c)
  * on the hw_ptr jump), but it gets the most recent audio.
  */
 static void clarett_cap_drain(struct clarett *c, struct snd_pcm_substream *cs,
-			      u32 add_frames)
+			      u64 from, u32 add_frames)
 {
 	u32 frame = (u32)c->capture_ch * 4;
 	u32 ring  = clarett_rx_ring_bytes(c) / frame;
@@ -616,12 +630,77 @@ static void clarett_cap_drain(struct clarett *c, struct snd_pcm_substream *cs,
 	u32 n     = min(add_frames, abuf);
 	/* lag longer than the buffer: keep the NEWEST n */
 	u32 skip  = add_frames - n;
-	u64 q = c->pcm_frames + skip;
-	u64 aq = c->pcm_frames + skip - c->pcm_base;
+	u64 q = from + skip;
+	u64 aq = from + skip - c->pcm_base;
 	u32 pos = do_div(q, ring);
 	u32 apos = do_div(aq, abuf);
 
 	clarett_rx_drain(c, cs->runtime->dma_area, apos, pos, n, abuf);
+}
+
+/*
+ * Where one engine is now, on the frame clock, from its ring position
+ * (STREAM_OFF_POS of `blk`, a ring of `ring` frames). The position runs from
+ * zero to one period ahead of the counter last latched from 0x300, which
+ * pcm_frames already counts, so the difference places it without wrap
+ * ambiguity. Returns 0 if the read failed or the sample is not usable.
+ */
+static u64 clarett_engine_live(struct clarett *c, u32 blk, u32 ring)
+{
+	/* the ring is a power of two in frames, so in units too */
+	u32 units = ring / CLARETT_CTR_FRAMES;
+	u32 pos, lead;
+
+	if (!units)
+		return 0;
+	pos = readl(c->bar0 + blk + STREAM_OFF_POS);
+	/* a failed read (dead or stalled link) */
+	if (pos == 0xffffffff)
+		return 0;
+	lead = (pos - c->stream_ctr) & (units - 1);
+	/* more than a period ahead is not a position this clock can place */
+	if (lead * CLARETT_CTR_FRAMES > clarett_irq_period_frames(c))
+		return 0;
+	return c->pcm_frames + lead * CLARETT_CTR_FRAMES;
+}
+
+/*
+ * Servicer, on each pass that reads the device (every period event, and at
+ * least every CLARETT_SVC_FALLBACK_US): follow both engines between events, to
+ * 16 frames. Playback: record how far the engine has read, which .pointer
+ * reports. Capture: copy what the engine has written since the last copy into
+ * the ALSA buffer, so .pointer can report it.
+ *
+ * Only the servicer writes pcm_frames and play_live; cap_drained and the copy
+ * are under pcm_lock, against attach and hw_free.
+ */
+void clarett_pcm_sample_live(struct clarett *c)
+{
+	struct snd_pcm_substream *cs;
+	u64 live;
+
+	if (READ_ONCE(c->play_running)) {
+		live = clarett_engine_live(c, STREAM_BLK0,
+					   clarett_tx_ring_bytes(c) /
+					   ((u32)c->playback_ch * 4));
+		if (live > c->play_live)
+			WRITE_ONCE(c->play_live, live);
+	}
+
+	if (!READ_ONCE(c->pcm_sub))
+		return;
+	live = clarett_engine_live(c, STREAM_BLK1,
+				   clarett_rx_ring_bytes(c) /
+				   ((u32)c->capture_ch * 4));
+	mutex_lock(&c->pcm_lock);
+	cs = c->pcm_sub;
+	if (cs && cs->runtime->dma_area && live > c->cap_drained) {
+		clarett_cap_drain(c, cs, c->cap_drained,
+				  live - c->cap_drained);
+		/* the samples before the position (.pointer acquires) */
+		smp_store_release(&c->cap_drained, live);
+	}
+	mutex_unlock(&c->pcm_lock);
 }
 
 /*
@@ -662,10 +741,16 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 	cs = c->pcm_sub;
 	ps = c->pcm_play_sub;
 
-	if (cs && cs->runtime->dma_area)
-		clarett_cap_drain(c, cs, add_frames);
+	/* up to the event, from wherever the copies between events got to */
+	if (cs && cs->runtime->dma_area &&
+	    c->pcm_frames + add_frames > c->cap_drained)
+		clarett_cap_drain(c, cs, c->cap_drained,
+				  c->pcm_frames + add_frames - c->cap_drained);
 
 	c->pcm_frames += add_frames;
+	if (c->cap_drained < c->pcm_frames)
+		/* after the copy above (.pointer acquires) */
+		smp_store_release(&c->cap_drained, c->pcm_frames);
 
 	/* fill from where the engine is NOW, after the advance */
 	clarett_play_fill(c);
@@ -1103,6 +1188,8 @@ static int clarett_pcm_attach(struct clarett *c, struct snd_pcm_substream *ss,
 		c->stream_on = true;
 		/* first direction in: the shared clock starts here */
 		c->pcm_frames = 0;
+		c->play_live = 0;
+		c->cap_drained = 0;
 	}
 	if (play) {
 		c->pcm_play_sub = ss;
@@ -1112,6 +1199,8 @@ static int clarett_pcm_attach(struct clarett *c, struct snd_pcm_substream *ss,
 	} else {
 		c->pcm_sub = ss;
 		c->pcm_base = c->pcm_frames;
+		/* a new stream: copies start at its frame 0 */
+		WRITE_ONCE(c->cap_drained, c->pcm_frames);
 		c->pcm_last_period = 0;
 		WRITE_ONCE(c->pcm_running, false);
 	}
@@ -1274,8 +1363,17 @@ static snd_pcm_uframes_t clarett_pcm_pointer(struct snd_pcm_substream *ss)
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	u64 base = play ? READ_ONCE(c->play_base) : READ_ONCE(c->pcm_base);
-	u64 now = READ_ONCE(c->pcm_frames);
-	u64 frames;
+	u64 now, frames;
+
+	/* the live position: playback read, capture copied */
+	if (play) {
+		now = clarett_play_pos(c);
+	} else {
+		/* pairs with the release after each capture copy */
+		u64 copied = smp_load_acquire(&c->cap_drained);
+
+		now = max(READ_ONCE(c->pcm_frames), copied);
+	}
 
 	/*
 	 * Playback anchored ahead of the engine (START): nothing has played
