@@ -21,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -84,6 +84,24 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %changelog
+* Tue Nov 17 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.4.1-1
+- Size the stream from what the device reports: the rings, descriptors
+  and PCM follow its STREAM_INFO geometry, the offered rates follow the
+  speed bands it answers, and the model table only identifies the unit
+- Identify the model by the device's MODEL_ID where it answers, and let
+  a unit no table entry claims attach on its family's defaults instead
+  of refusing it
+- Build the Clock Source items from the device's own clock list. On the
+  Clarett 2Pre S/PDIF is now value 4, the value the device lists; on the
+  8PreX and Red the external items are named ADAT1, ADAT2 and Word Clock,
+  as the device names them, so a saved state on one of those restores
+  once to Internal
+- Take the capture loopback pair's position from the device's channel
+  list, with the model table as fallback and cross-check
+- Fix the mailbox response buffer, and the largest hwdep response, at
+  4 KB on every page size
+- Report the 0x100 summary register's bits in the servicer telemetry,
+  ignoring dead-link (all-ones) reads
 * Fri Nov 13 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.4.0-1
 - Take the data plane's period events from the interrupt: the device
   raises one per period on MSI vector 0, so the stream servicer is woken
