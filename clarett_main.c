@@ -127,13 +127,13 @@ void clarett_hw_init(struct clarett *c)
 	ktime_t t0;
 
 	/*
-	 * Pre-mailbox init: the two 0x510/0x500 writes every attach makes
-	 * (device open; not decoded beyond these values), the interrupt-cause
-	 * enable, then the response-buffer address, waiting for the device to
-	 * acknowledge it. The enable goes first because the acknowledgement
-	 * arrives as an interrupt. Sleeps.
+	 * Pre-mailbox init: the MIDI TX ready threshold and the 0x500 write
+	 * every attach makes (not decoded beyond its value), the
+	 * interrupt-cause enable, then the response-buffer address, waiting
+	 * for the device to acknowledge it. The enable goes first because the
+	 * acknowledgment arrives as an interrupt. Sleeps.
 	 */
-	clarett_wl(c, 0x510, 0x8);
+	clarett_wl(c, REG_MIDI_TX_THRESH, MIDI_TX_THRESH_VAL);
 	clarett_wl(c, REG_MIDI_STATUS, 0x8);
 	clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);
 	clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));

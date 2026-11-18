@@ -72,6 +72,15 @@ struct snd_rawmidi_substream;
  * while it is clear is DISCARDED.
  */
 #define MIDI_TX_READY            0x00010000u
+/*
+ * TX ready threshold (4 bits): MIDI_TX_READY is set while the 16-word TX FIFO
+ * has more than this many words free. Written MIDI_TX_THRESH_VAL at attach,
+ * as the vendor does. 0x514 next to it reads 0x847 on every unit and fits a
+ * description of the block (log2 of the 128-word RX and 16-word TX FIFOs, 8
+ * data bits); nothing uses it.
+ */
+#define REG_MIDI_TX_THRESH       0x510
+#define MIDI_TX_THRESH_VAL       0x8
 
 /*
  * Data-plane streaming registers. Two structurally identical ring blocks:

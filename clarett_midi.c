@@ -11,8 +11,10 @@
  * by raw byte grouping, independent of message boundaries.
  *
  *   TX  write a word to REG_MIDI_DATA, up to three queued bytes at a time.
- *       Every write is gated on MIDI_TX_READY in REG_MIDI_STATUS: the FIFO is
- *       nine words deep and discards a word written while it is full.
+ *       Every write is gated on MIDI_TX_READY in REG_MIDI_STATUS: the FIFO
+ *       holds 16 words and discards a word written while it is full, and
+ *       the bit is set only while more than REG_MIDI_TX_THRESH words are
+ *       free (9 or more at the attach value).
  *
  *   RX  read a word from REG_MIDI_DATA; count 0 means the RX FIFO is
  *       empty. The device decides how many bytes a word carries: the 2Pre
@@ -45,8 +47,9 @@
 #define CLARETT_MIDI_TX_TIMEOUT_US  100000
 
 /*
- * Runaway bound on the RX drain loop, above the FIFO's measured 139 bytes, so a
- * full FIFO always empties in one pass.
+ * Runaway bound on the RX drain loop, above the most the device buffers (128
+ * one-byte words, then packed words to 159 bytes in all), so a full FIFO
+ * always empties in one pass.
  */
 #define CLARETT_MIDI_RX_GUARD       256
 
