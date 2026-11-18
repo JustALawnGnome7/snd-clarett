@@ -74,8 +74,9 @@ struct snd_rawmidi_substream;
 #define MIDI_TX_READY            0x00010000u
 
 /*
- * Data-plane streaming registers. Two structurally identical ring blocks; block
- * 0 (0x200) → MSI vec1, block 1 (0x300) → vec2.
+ * Data-plane streaming registers. Two structurally identical ring blocks:
+ * block 0 (0x200) playback, block 1 (0x300) capture. Their events arrive on
+ * MSI vector 0 like every other interrupt (see CLARETT_NUM_VECTORS).
  */
 /* stream-start writes 0x10 */
 #define REG_STREAM_IRQ_CFG       0x108
@@ -83,9 +84,9 @@ struct snd_rawmidi_substream;
 #define REG_STREAM_IRQ_CFG2      0x10c
 /* stream-start writes 0x7 then 0x0 */
 #define REG_STREAM_IRQ_ARM       0x110
-/* ring block 0 (vec1); +0x00 = cause (read-to-clear) */
+/* ring block 0; +0x00 = cause (read-to-clear) */
 #define STREAM_BLK0              0x200
-/* ring block 1 (vec2) */
+/* ring block 1 */
 #define STREAM_BLK1              0x300
 /* channel count = 0x1c (28) */
 #define   STREAM_OFF_CHANS       0x04
@@ -190,8 +191,8 @@ struct snd_rawmidi_substream;
  * vector's interrupts across a capture at two ALSA period sizes: vec0 rose by
  * 1.009 and 1.001 interrupts per device period event at 512- and 64-frame
  * periods — an eightfold change in cadence — while vec1, vec2 and vec3
- * stayed at exactly zero. The vendor driver does not use this interrupt:
- * it sweeps all five cause blocks on a 4 ms timer instead.
+ * stayed at exactly zero. The vendor driver handles it the same way: a
+ * sweep of 0x100 and the cause blocks after every vector 0 interrupt.
  */
 #define CLARETT_NUM_VECTORS      4
 /* the device signals control events on vec0 */
