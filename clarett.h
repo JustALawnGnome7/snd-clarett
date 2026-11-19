@@ -110,9 +110,9 @@ struct snd_rawmidi_substream;
 /*
  * The engine's working level (read-only): it holds steady while the engine
  * keeps up, reads zero before the engine has fetched anything, and reaches
- * zero on the playback block when that engine runs dry (IRQ0_CAUSE_TX_UNDERRUN).
- * Its unit is not known; it is not a ring position. +0x1c holds its minimum
- * since the last read (unused).
+ * zero on the playback block when that engine runs dry
+ * (IRQ0_CAUSE_TX_UNDERRUN). Its unit is not known; it is not a ring position.
+ * +0x1c holds its minimum since the last read (unused).
  */
 #define   STREAM_OFF_PTR         0x18
 /*

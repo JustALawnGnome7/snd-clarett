@@ -239,7 +239,8 @@ static void clarett_svc_fold(struct clarett_svc_stats *st)
 /*
  * Close a 2-second window: log it, fold it into the run, start the next. The
  * line is at info only when the window had a late tick, a device-side period
- * overrun, a playback underrun or a rejected sample. Every window, without the mailbox trace:
+ * overrun, a playback underrun or a rejected sample. Every window, without
+ * the mailbox trace:
  *   echo 'format "stream-svc:" +p' |
  *     tee /sys/kernel/debug/dynamic_debug/control
  */
