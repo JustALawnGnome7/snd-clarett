@@ -40,7 +40,7 @@
 %global debug_package %{nil}
 
 Name:           %{kmod_name}-kmod
-Version:        0.4.1
+Version:        0.4.2
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module
 
@@ -121,6 +121,18 @@ done
 %{?akmod_install}
 
 %changelog
+* Thu Nov 19 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.4.2-1
+- Report a live stream position between period events, in both
+  directions: the servicer follows each ring block's position register
+  wherever it already reads the device (at least every millisecond), so
+  ALSA's position moves in 16-frame steps instead of a period at a time.
+  Capture copies the ring into the ALSA buffer up to that position, and
+  playback fills and checks a stream's start against it
+- Count the playback engine running dry (bit 4 of the 0x100 summary
+  register) as underrun= in the servicer telemetry, logged at info like
+  an overrun, instead of reporting it as an unknown bit
+- Correct the comments on the ring-block vectors, the engine level
+  register and the MIDI FIFO sizes and TX ready threshold
 * Tue Nov 17 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.4.1-1
 - Size the stream from what the device reports: the rings, descriptors
   and PCM follow its STREAM_INFO geometry, the offered rates follow the
