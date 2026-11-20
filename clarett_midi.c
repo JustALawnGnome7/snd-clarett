@@ -94,19 +94,18 @@ static void clarett_midi_drain(struct clarett *c,
 }
 
 /*
- * From the ISR, on every vector. The FIFO is drained and acked whether or not
- * the input is open, since the ack is what re-arms the interrupt; the bytes go
- * to the substream only while it is open and triggered.
+ * From the interrupt sweep, when 0x100 bit28 says MIDI data has arrived. The
+ * FIFO is drained and acked whether or not the input is open, since the ack is
+ * what re-arms the interrupt; the bytes go to the substream only while it is
+ * open and triggered.
  */
 void clarett_midi_irq(struct clarett *c)
 {
 	struct snd_rawmidi_substream *ss;
 
 	/*
-	 * Serialise: this runs for every MSI vector, and while streaming the
-	 * period vectors fire on other CPUs concurrently with vec0. Two
-	 * drainers of the one FIFO would reorder the bytes. Also taken by
-	 * clarett_midi_resume(), with IRQs off.
+	 * Serialise against clarett_midi_resume()'s drain (IRQs off there):
+	 * two drainers of the one FIFO would reorder the bytes.
 	 */
 	spin_lock(&c->midi_rx_lock);
 

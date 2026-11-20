@@ -224,25 +224,25 @@ be relied on.
 
 ## PCM data plane
 
-Capture and playback share one descriptor-ring engine, driven by a SCHED_FIFO servicer thread that
-handles the `0x300` period events (`clarett_pcm.c`). Whichever direction prepares first arms the
-engine; the other joins the running clock. Each tick drains the RX ring into the capture buffer and
-refills the TX ring ahead of the device's read position, keeping `CLARETT_TX_GUARD_FRAMES` clear of
-it.
+Capture and playback share one descriptor-ring engine (`clarett_pcm.c`). Whichever direction
+prepares first arms the engine; the other joins the running clock.
 
-The thread is woken by the interrupt, not by a timer: the device raises one MSI per period event,
-on vector 0 along with everything else. It still reads `0x300` itself rather than letting the
-handler do it, because that read is how a period is acknowledged and the engine must not be acked
-from interrupt context; the handler only sets a flag and wakes the thread. A late read costs
-nothing: the period counter is modular, so the advance it missed is recovered by the next read's
-delta, and `CLARETT_SVC_FALLBACK_US` bounds how long the thread will go without reading at all.
+Every interrupt the device raises, period events included, arrives on vector 0, and one function
+reads all of its cause registers: `clarett_irq_sweep()` reads the `0x100` summary, then only the
+blocks it flags (`0x300` period, `0x200`, `0x400` mailbox phase and events, then the MIDI receive
+FIFO). Reading `0x300` is how a period is acknowledged, so the engine is acked in the interrupt
+itself; at a 16-frame period that removed nearly all of the device's period-overrun flags. The sweep
+counts the frames the engine advanced (the period counter is modular, so a late read recovers what
+it missed) and wakes a SCHED_FIFO servicer thread, which drains the RX ring into the capture buffer
+and calls `snd_pcm_period_elapsed()`. If no period event arrives for `CLARETT_SVC_FALLBACK_US` the
+thread runs the sweep itself, as a backstop against a lost interrupt.
 
-The thread still wakes on a short timer as well (`CLARETT_SVC_REFILL_US`), because topping playback
-up between period events is a separate job from collecting them, and a client holding a lead of a
-few frames depends on it happening far more often than once a period — what it writes into a region
-the fill has already passed is lost as silence. That wake reads no register (an atomic and a copy
-off the software frame clock), and does nothing at all while no playback stream is attached, so the
-interrupt still removes essentially all of the streaming MMIO traffic.
+The PCM is nonatomic, so `.ack` can sleep: playback is copied into the TX ring on every write the
+app makes, only the frames it wrote, ahead of the device's read position with
+`CLARETT_TX_GUARD_FRAMES` kept clear. The ring past the app's data is kept silent a full ring ahead,
+since the device has no ownership bit and would otherwise replay the previous lap when a client falls
+behind or stops. A client holding a lead of a few frames depends on its writes reaching the ring at
+once: what it writes into a region already passed is lost as silence.
 
 Before each arm the driver sends `SET_CLOCK{rate, source}` and three sync queries. The vendor's
 handshake also reads a port-name string per stream channel (`0x005000`) and declares the stream

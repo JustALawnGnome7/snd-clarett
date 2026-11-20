@@ -6,13 +6,13 @@
  * The hardware is ONE full-duplex DMA engine over two ring blocks in a single
  * contiguous coherent buffer (c->stream_buf): block 0 (0x200 = TX/playback)
  * then block 1 (0x300 = RX/capture). It raises a period on the 0x300 cause
- * register and waits for the host to ACK by reading it;
- * clarett_stream_service() (clarett_engine.c) is that ACK loop and the shared
- * frame clock for both directions. Each 0x300 event carries the frames the
- * engine advanced (ctr delta * CLARETT_CTR_FRAMES); clarett_pcm_tick() then
- * drains the RX ring into the capture ALSA buffer (behind the write pointer)
- * and refills the TX ring from the playback ALSA buffer (ahead of the read
- * pointer).
+ * register and waits for the host to ack it by reading it; the interrupt
+ * sweep acks it, and clarett_stream_service() (clarett_engine.c) keeps the
+ * shared frame clock for both directions from what the sweep collected. Each
+ * 0x300 event carries the frames the engine advanced (ctr delta *
+ * CLARETT_CTR_FRAMES); clarett_pcm_tick() then drains the RX ring into the
+ * capture ALSA buffer (behind the write pointer). Playback is copied into the
+ * TX ring as the app writes it (.ack), ahead of the read pointer.
  *
  * Two ALSA substreams share the one engine: whichever prepares first arms it
  * full-duplex, the other attaches at the current clock. The engine clocks only
@@ -458,18 +458,6 @@ static u32 clarett_buffer_max_frames(u32 ring_frames)
 }
 
 /*
- * Playback fill: refresh the whole runway ahead of the engine (from GUARD past
- * the read position to just before it), so a lagged tick can never underfill
- * and the current read is never torn. Caller holds pcm_lock. Runs on every
- * period tick AND whenever the app has written since the last fill (.ack ->
- * tx_dirty -> clarett_pcm_tx_refill).
- *
- * The tick alone is not enough: it runs BEFORE period_elapsed, so the app's new
- * audio for the region the engine plays next lands only after it. Refilling
- * mid-period only rewrites frames with the data they already hold, so it
- * cannot tear anything.
- */
-/*
  * Where the playback engine has read to: the live sample when one is ahead of
  * the frame clock, else the clock (no playback sampled since the last event).
  */
@@ -521,34 +509,44 @@ static snd_pcm_uframes_t clarett_play_ahead(struct clarett *c,
 	return ahead;
 }
 
+/*
+ * Playback fill, incremental. On the engine frame clock, the TX ring holds this
+ * stream's data up to tx_data_to and silence from there to tx_silence_to;
+ * beyond that, the previous lap. Each call copies only what the app has
+ * written since (up to appl_ptr), and extends the silence to a ring ahead of
+ * the read position, so a client that falls behind or stops plays silence,
+ * never a lap-old buffer (the device has no ownership bit to tell). Nothing
+ * within the guard of the read position is written: a frame the app writes
+ * after its slot came that close is not played, and silence is.
+ *
+ * Caller holds pcm_lock. Runs on every app write (.ack, which the nonatomic
+ * PCM lets sleep), at START and STOP, and on every period event, which moves
+ * the runway on.
+ *
+ * The read position is the live one: .pointer reports it, so the app may
+ * already have written up to a buffer past it, and counting from the last
+ * event instead would read that as an underrun.
+ */
 static void clarett_play_fill(struct clarett *c)
 {
 	struct snd_pcm_substream *ps = c->pcm_play_sub;
-	u32 frame, ring, abuf, guard, n, written;
-	u64 from, q, aq;
-	u32 start, astart;
+	u32 frame, ring, abuf, guard;
+	u64 pos, lo, hi, ref, appl, from, to, q, aq;
 
-	/* before the copy: an .ack that lands during it re-arms */
-	atomic_set(&c->tx_dirty, 0);
 	if (!ps || !ps->runtime->dma_area)
 		return;
 	/*
-	 * Stopped (drained or dropped): silence the runway the fill queued, or
-	 * the engine can wrap back into the last period before close does it.
-	 * A drain stops only once the engine has read every frame. Done before
-	 * the running test, so a quick restart (xrun recovery) also starts from
-	 * a silent ring.
+	 * Stopped (drained or dropped): silence the ring, or the engine can
+	 * wrap back into the last period before close does it. A drain stops
+	 * only once the engine has read every frame. Done before the running
+	 * test, so a quick restart (xrun recovery) also starts from a silent
+	 * ring.
 	 */
-	if (READ_ONCE(c->tx_silence)) {
-		WRITE_ONCE(c->tx_silence, false);
+	if (c->tx_silence) {
+		c->tx_silence = false;
 		clarett_zero_tx(c);
 	}
-	/*
-	 * Pairs with the smp_store_release() in clarett_pcm_trigger(): once
-	 * the stream is seen running, the play_base it was anchored at is
-	 * visible too.
-	 */
-	if (!smp_load_acquire(&c->play_running))
+	if (!c->play_running)
 		return;
 
 	frame = (u32)c->playback_ch * 4;
@@ -560,55 +558,40 @@ static void clarett_play_fill(struct clarett *c)
 
 	clarett_play_prime(c, ps, guard);
 
+	pos = clarett_play_pos(c);
+	lo = pos + guard;
+	hi = pos + ring;
+	/* where the app has written to, as an engine frame */
+	ref = max(pos, c->play_base);
+	appl = ref + clarett_play_ahead(c, ps, ref, abuf);
+
+	/* the app took frames back (a rewind): they turn to silence again */
+	if (appl < c->tx_data_to) {
+		c->tx_data_to = appl;
+		c->tx_silence_to = appl;
+	}
+
 	/*
-	 * The whole runway, from the guard to just behind the read position —
-	 * but only as far as the app has actually written (appl_ptr); the rest
-	 * is silence. Copying past appl_ptr would queue whatever the buffer
-	 * held a lap earlier, and the engine plays that whenever the app falls
-	 * behind or stops: when a stream ends, the last period again, one
-	 * buffer later. Right after START the anchor lies ahead of the runway's
-	 * start; begin there, leaving the frames before frame 0 silent.
-	 *
-	 * The read position is the live one: .pointer reports it, so the app
-	 * may already have written up to a buffer past it, and counting from
-	 * the last event instead would read that as an underrun.
+	 * New data. Right after START frame 0 (play_base) lies ahead of the
+	 * runway's start; the frames before it stay silent.
 	 */
-	from = clarett_play_pos(c) + guard;
-	n = ring - guard;
-	if (c->play_base > from) {
-		u64 lead = c->play_base - from;
-
-		if (lead >= n)
-			return;
-		from = c->play_base;
-		n -= lead;
+	from = max3(c->tx_data_to, lo, c->play_base);
+	to = min(appl, hi);
+	if (to > from) {
+		q = from;
+		aq = from - c->play_base;
+		clarett_tx_fill(c, ps->runtime->dma_area, do_div(aq, abuf),
+				do_div(q, ring), to - from, abuf);
+		c->tx_data_to = to;
 	}
-	written = min_t(u32, n, clarett_play_ahead(c, ps, from, abuf));
-	q = from;
-	aq = from - c->play_base;
-	/* hardware ring position */
-	start = do_div(q, ring);
-	/* same frame in the ALSA buffer */
-	astart = do_div(aq, abuf);
 
-	clarett_tx_fill(c, ps->runtime->dma_area, astart, start, written, abuf);
-	if (written < n) {
-		q = from + written;
-		clarett_tx_fill(c, NULL, 0, do_div(q, ring), n - written, abuf);
+	/* silence past the data, a ring ahead of the read position */
+	from = max3(c->tx_silence_to, c->tx_data_to, lo);
+	if (hi > from) {
+		q = from;
+		clarett_tx_fill(c, NULL, 0, do_div(q, ring), hi - from, abuf);
+		c->tx_silence_to = hi;
 	}
-}
-
-/*
- * Servicer, between period events: refill if the app has written since the last
- * fill.
- */
-void clarett_pcm_tx_refill(struct clarett *c)
-{
-	if (!atomic_read(&c->tx_dirty))
-		return;
-	mutex_lock(&c->pcm_lock);
-	clarett_play_fill(c);
-	mutex_unlock(&c->pcm_lock);
 }
 
 /*
@@ -742,10 +725,10 @@ static bool clarett_period_crossed(u64 frames, snd_pcm_uframes_t period_size,
 }
 
 /*
- * From the servicer on every 0x300 period event, with the frames the engine
- * advanced since the last one. One engine clock drives both directions: copy
- * the frames the engine just WROTE from the RX ring to the capture buffer, and
- * refill the TX ring AHEAD of its read pointer from the playback buffer.
+ * From the servicer after the interrupt sweep collected period events, with
+ * the frames the engine advanced since the last call. One engine clock drives
+ * both directions: copy the frames the engine just WROTE from the RX ring to
+ * the capture buffer, and move the TX runway on (clarett_play_fill()).
  *
  * pcm_lock serialises the copies against hw_free, which clears the substream
  * pointer and frees the ALSA buffer; period_elapsed is called after unlocking
@@ -1275,9 +1258,9 @@ static void clarett_pcm_arm(struct clarett *c, unsigned int rate)
 	clarett_engine_arm(c, r0, r1);
 
 	/*
-	 * ACK from here, not the trigger: the engine stalls within ms of the
-	 * arm if unserviced. The triggers only gate whether periods are
-	 * reported to ALSA (pcm_running / play_running).
+	 * Release the ack from here, not the trigger: the engine stalls within
+	 * ms of the arm if unserviced. The triggers only gate whether periods
+	 * are reported to ALSA (pcm_running / play_running).
 	 */
 	WRITE_ONCE(c->stream_run, true);
 	clarett_engine_run(c);
@@ -1331,11 +1314,13 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 {
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
-	u64 now = READ_ONCE(c->pcm_frames);
+	u64 now;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		if (play) {
+			mutex_lock(&c->pcm_lock);
+			now = c->pcm_frames;
 			/*
 			 * Frame 0 plays one period after the clock START sees.
 			 * pcm_frames lags the engine by up to a period, so a
@@ -1352,11 +1337,15 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 				   now + ss->runtime->period_size);
 			c->play_last_period = 0;
 			c->play_primed = false;
+			c->tx_data_to = 0;
+			c->tx_silence_to = 0;
 			/* anchor visible before running */
 			smp_store_release(&c->play_running, true);
-			/* fill the prefilled buffer now, not a tick later */
-			atomic_set(&c->tx_dirty, 1);
+			/* the prefilled buffer goes into the ring now */
+			clarett_play_fill(c);
+			mutex_unlock(&c->pcm_lock);
 		} else {
+			now = READ_ONCE(c->pcm_frames);
 			/*
 			 * Frame 0 is the next event, as for playback. The
 			 * copies run under pcm_lock, so the servicer moves
@@ -1380,10 +1369,12 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_STOP:
 		if (play) {
+			mutex_lock(&c->pcm_lock);
 			WRITE_ONCE(c->play_running, false);
-			WRITE_ONCE(c->tx_silence, true);
-			/* the servicer silences the ring on its next poll */
-			atomic_set(&c->tx_dirty, 1);
+			c->tx_silence = true;
+			/* silence the ring (or the next fill does) */
+			clarett_play_fill(c);
+			mutex_unlock(&c->pcm_lock);
 		} else {
 			WRITE_ONCE(c->pcm_running, false);
 		}
@@ -1427,18 +1418,20 @@ static snd_pcm_uframes_t clarett_pcm_pointer(struct snd_pcm_substream *ss)
 }
 
 /*
- * Atomic context (stream lock held), called whenever the app moves appl_ptr.
- * Only flag it: the copy is up to a ring of audio and needs pcm_lock, so the
- * servicer does it on its next poll (clarett_pcm_tx_refill), within a few
- * hundred microseconds. Playback advertises SNDRV_PCM_INFO_SYNC_APPLPTR so mmap
- * clients report appl_ptr through the kernel and this fires for them too.
+ * Called whenever the app moves appl_ptr (the PCM is nonatomic, so this may
+ * sleep): copy what it wrote into the TX ring at once. Playback advertises
+ * SNDRV_PCM_INFO_SYNC_APPLPTR so mmap clients report appl_ptr through the
+ * kernel and this fires for them too.
  */
 static int clarett_pcm_ack(struct snd_pcm_substream *ss)
 {
 	struct clarett *c = snd_pcm_substream_chip(ss);
 
-	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		atomic_set(&c->tx_dirty, 1);
+	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		mutex_lock(&c->pcm_lock);
+		clarett_play_fill(c);
+		mutex_unlock(&c->pcm_lock);
+	}
 	return 0;
 }
 
@@ -1514,6 +1507,13 @@ int clarett_create_pcm(struct clarett *c)
 		return err;
 
 	pcm->private_data = c;
+	/*
+	 * Nonatomic: trigger, pointer and ack run in process context under the
+	 * stream mutex, so .ack can take pcm_lock and fill the TX ring on every
+	 * app write. snd_pcm_period_elapsed() is called only from the servicer
+	 * thread, which may sleep.
+	 */
+	pcm->nonatomic = true;
 	strscpy(pcm->name, c->model->name, sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &clarett_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &clarett_pcm_ops);

@@ -65,17 +65,6 @@ static unsigned int clarett_resp_ms(const struct clarett *c, u32 opcode)
 	return CLARETT_RESP_TIMEOUT_MS;
 }
 
-/*
- * True for a stream period-cause block (0x200 TX / 0x300 RX) while the PCM
- * engine is streaming. The cause sweep skips these so it does not
- * read-to-clear a period event the stream servicer is waiting for (an audible
- * gap). When idle they read 0 and are swept normally.
- */
-static inline bool clarett_stream_cause(const struct clarett *c, u16 reg)
-{
-	return c->stream_on && (reg == STREAM_BLK0 || reg == STREAM_BLK1);
-}
-
 /* The FCP status word of the response that has just landed. */
 static u32 clarett_resp_status(const struct clarett *c)
 {
@@ -531,21 +520,13 @@ static int __clarett_fcp(struct clarett *c, u32 opcode, const u8 *data,
 }
 
 /*
- * Read-to-clear the cause blocks between probe's readiness attempts, so each
- * starts from a clean slate.
+ * Clear the cause blocks between probe's readiness attempts, so each starts
+ * from a clean slate. Through the interrupt sweep, their only reader.
  */
 void clarett_mbox_clear_causes(struct clarett *c)
 {
-	/* not 0x400: the vec0 ISR is its only reader */
-	static const u16 causes[] = {
-		REG_IRQ0_CAUSE, STREAM_BLK1, STREAM_BLK0, 0x500
-	};
-	int i;
-
 	mutex_lock(&c->mbox_lock);
-	for (i = 0; i < ARRAY_SIZE(causes); i++)
-		if (!clarett_stream_cause(c, causes[i]))
-			clarett_rl(c, causes[i]);
+	clarett_irq_sweep(c, true);
 	mutex_unlock(&c->mbox_lock);
 }
 

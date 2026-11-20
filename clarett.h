@@ -11,7 +11,8 @@
 #include <linux/types.h>
 #include <linux/bitmap.h>	/* DECLARE_BITMAP — shadow_known */
 #include <linux/mutex.h>
-#include <linux/spinlock.h>	/* spinlock_t — MIDI RX drain */
+#include <linux/spinlock.h>	/* spinlock_t — interrupt sweep, MIDI RX */
+#include <linux/ktime.h>	/* ktime_t — interrupt sweep telemetry */
 #include <linux/pci.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>		/* wait_queue_head_t — hwdep relay */
@@ -200,15 +201,27 @@ struct snd_rawmidi_substream;
  * at 48, 96 and 192 kHz, capture and duplex), this register showed nothing but
  * bits 31 and 29. The overrun is reported where it always was, in the block's
  * own cause word (CLARETT_CTR_OVERRUN in 0x300). Bit 5 has never been seen
- * set; a capture-side counterpart of bit 4 is a guess. The servicer counts
- * bit 4 (underrun= in its telemetry), ORs every value it reads into cause=,
- * and reports any other unknown bit at info, so the next one to fire says so.
+ * set; a capture-side counterpart of bit 4 is a guess. The interrupt sweep
+ * counts bit 4 (underrun= in the servicer telemetry), ORs every value it reads
+ * into cause=, and reports any other unknown bit at info, so the next one to
+ * fire says so.
+ *
+ * Reading 0x100 is not what re-arms the interrupt: with nothing reading it,
+ * the device still raised one MSI per period event (Red 8Line, 60ch duplex,
+ * periods 64 and 512). And bit28 is set on every interrupt that brings MIDI
+ * data (Clarett 8PreX, a cable loop), which is also the only time the vendor
+ * driver reads the MIDI FIFO. So the sweep (clarett_irq_sweep()) reads 0x100
+ * first and then only the blocks it flags.
  */
 /*
  * 0x100 bits whose meaning is established (above). bit30 is included although
  * the shipped driver cannot raise it -- nothing marks a TX descriptor -- so
  * that a build which does mark them is not told its own doing is unknown.
  */
+#define IRQ0_CAUSE_RX            0x80000000u	/* 0x300 */
+#define IRQ0_CAUSE_TX            0x40000000u	/* 0x200 */
+#define IRQ0_CAUSE_NOTIFY        0x20000000u	/* 0x400 */
+#define IRQ0_CAUSE_MIDI          0x10000000u	/* MIDI receive */
 #define IRQ0_CAUSE_TX_UNDERRUN   0x00000010u
 #define IRQ0_CAUSE_KNOWN         0xf000001fu
 #define DOORBELL_SUBMIT          1
@@ -218,14 +231,14 @@ struct snd_rawmidi_substream;
  * MSI: the device delivers EVERY interrupt on vector 0 — the mailbox's
  * command phase, the device events, and the data plane's period events
  * alike. 0x400 tells the first two apart; a period event raises no bit
- * there at all, so the
- * period cause and counter are read from 0x300 (owned by the servicer, which
- * the ISR wakes). Established on hardware (Red 8Line, 60ch) by counting each
- * vector's interrupts across a capture at two ALSA period sizes: vec0 rose by
- * 1.009 and 1.001 interrupts per device period event at 512- and 64-frame
- * periods — an eightfold change in cadence — while vec1, vec2 and vec3
- * stayed at exactly zero. The vendor driver handles it the same way: a
- * sweep of 0x100 and the cause blocks after every vector 0 interrupt.
+ * there at all, so the period cause and counter are read from 0x300 (by the
+ * interrupt sweep, which wakes the servicer). Established on hardware (Red
+ * 8Line, 60ch) by counting each vector's interrupts across a capture at two
+ * ALSA period sizes: vec0 rose by 1.009 and 1.001 interrupts per device
+ * period event at 512- and 64-frame periods — an eightfold change in cadence
+ * — while vec1, vec2 and vec3 stayed at exactly zero. The vendor driver
+ * handles it the same way: a sweep of 0x100 and the cause blocks after every
+ * vector 0 interrupt.
  */
 #define CLARETT_NUM_VECTORS      4
 /* the device signals control events on vec0 */
@@ -736,6 +749,26 @@ struct clarett_irqctx {
 	unsigned int idx;
 };
 
+/*
+ * What the interrupt sweep sees of a stream's period events (under irq_lock).
+ * The servicer copies it into its telemetry window (clarett_svc_collect()).
+ */
+struct clarett_irq_stats {
+	/* when the last period event was collected */
+	ktime_t last_ev;
+	/*
+	 * Per window: the longest gap between events and the events later
+	 * than clarett_tick_late_us(); the largest counter step (a doubled
+	 * step is a missed event); the longest sweep (a stall inside a
+	 * readl() shows here).
+	 */
+	u64 gap_max_us, sweep_us_max;
+	u32 gap_late, step_max;
+	/* per stream, cumulative */
+	u32 wraps, bad_reads, bad_or, overruns, underruns, cause_or;
+	bool seen, cause_told;
+};
+
 /* --- per-card state ----------------------------------------------------- */
 struct clarett {
 	struct pci_dev *pci;
@@ -814,10 +847,10 @@ struct clarett {
 	struct completion addr_acked;
 	bool addr_ack_wait;	/* the ISR completes addr_acked on 0x400 bit0 */
 	/*
-	 * 0x400 command-phase bits (NOTIFY_PHASE_MASK) the vec0 ISR read while
-	 * the current command was in flight. The ISR is the only reader of
-	 * 0x400 when MSI is up, since it is read-to-clear; this is where the
-	 * mailbox learns what it saw.
+	 * 0x400 command-phase bits (NOTIFY_PHASE_MASK) the interrupt sweep read
+	 * while the current command was in flight. The sweep is the only
+	 * reader of 0x400, since it is read-to-clear; this is where the mailbox
+	 * learns what it saw.
 	 */
 	atomic_t mbox_phase;
 	/*
@@ -974,17 +1007,31 @@ struct clarett {
 	size_t stream_size;
 	/* reads/acks 0x300 to keep the engine clocked */
 	struct task_struct *stream_svc;
-	/* vec0 ISR -> servicer: a period event is waiting */
+	/* interrupt sweep -> servicer: a period event is waiting */
 	wait_queue_head_t svc_wq;
-	/* set by the ISR, consumed by the servicer's wait */
+	/* set by the sweep, consumed by the servicer's wait */
 	atomic_t svc_wake;
-	/* running period count (servicer -> hw pointer) */
+	/* period events collected this stream (the sweep counts them) */
 	atomic_t stream_periods;
-	/* last 0x300 period counter (servicer-private) */
+	/*
+	 * The 0x300 counter pcm_frames counts to: taken by the servicer with
+	 * the units it adds (clarett_svc_take()), so the live position is
+	 * placed against the same event the frame clock reached.
+	 */
 	u32 stream_ctr;
-	/* last positive ctr delta (reused across counter wraps) */
+	/*
+	 * Serialises the cause sweep (clarett_irq_sweep()), which runs from
+	 * the MSI handler and from the servicer's backstop. The fields below
+	 * it are the sweep's.
+	 */
+	spinlock_t irq_lock;
+	/* the 0x300 counter as last read, and its last positive step */
+	u32 irq_ctr;
 	u32 stream_ctr_step;
-	/* servicer ACKs 0x300 only while set (PCM trigger gate) */
+	/* counter units collected and not yet taken by the servicer */
+	u32 irq_pending;
+	struct clarett_irq_stats irq_st;
+	/* the sweep acks 0x300 only while set (from arm to engine stop) */
 	bool stream_run;
 
 	/*
@@ -1008,10 +1055,15 @@ struct clarett {
 	bool pcm_running;
 	/* playback trigger START..STOP: gate period delivery */
 	bool play_running;
-	/* app wrote playback frames since the last fill (.ack) */
-	atomic_t tx_dirty;
 	/* STOP: the next fill silences the TX ring (close may be late) */
 	bool tx_silence;
+	/*
+	 * Playback fill marks on the engine frame clock (clarett_play_fill(),
+	 * under pcm_lock): the TX ring holds this stream's data up to
+	 * tx_data_to and silence from there to tx_silence_to. Reset at START.
+	 */
+	u64 tx_data_to;
+	u64 tx_silence_to;
 	/* START: cleared; the first fill checks the anchor is still ahead */
 	bool play_primed;
 	/*
@@ -1059,8 +1111,8 @@ struct clarett {
 
 	/*
 	 * DIN MIDI (rawmidi over the REG_MIDI_DATA register UART). RX is
-	 * drained from the ISR (clarett_midi_irq) and pushed to midi_in when
-	 * the input is triggered; TX is drained from midi_out into
+	 * drained from the interrupt sweep (clarett_midi_irq) and pushed to
+	 * midi_in when the input is triggered; TX is drained from midi_out into
 	 * REG_MIDI_DATA by midi_tx_work. The *_up flags are the rawmidi trigger
 	 * gates. rmidi is set LAST at create and doubles as the ISR's "MIDI
 	 * live" guard.
@@ -1229,25 +1281,19 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
  */
 #define CLARETT_CTR_FRAMES	16
 /*
- * The servicer's two cadences, which are deliberately different.
+ * The servicer wakes on each period event the interrupt sweep collects, and
+ * after FALLBACK_US without one runs the sweep itself (the backstop, which
+ * also reads 0x300 unflagged). Every period event raises an MSI on vec0, so
+ * the backstop only covers one that was lost or delayed; a late read costs
+ * nothing, since the counter's modular delta recovers the advance it missed.
+ * It is also the cadence of the live-position sampling between events.
  *
- * REFILL_US is how often it wakes to top playback up (clarett_pcm_tx_refill),
- * and it has to stay as fine as the poll loop's old sleep: a client holding a
- * lead of a few frames writes into the region the fill has already passed, and
- * what the fill put there is silence. Measured on a Red 8Line with a 48-frame
- * lead at a 32-frame period, a 1 ms refill delivered 160 frames of a 480000
- * frame ramp — intact (nothing torn) but almost entirely replaced by silence.
- * The refill reads no register, so this wake costs memory traffic only, and
- * nothing at all while no playback stream is attached (tx_dirty).
- *
- * FALLBACK_US bounds how long the servicer will go without READING 0x300,
- * which is the expensive part (four MMIO reads, and the poll loop's real cost).
- * Every period event raises an MSI on vec0, so the device is normally read on
- * the interrupt and this only covers one that was lost or delayed; a late read
- * costs nothing, since the counter's modular delta recovers the advance it
- * missed.
+ * Playback needs no cadence of its own: .ack copies what the app writes at
+ * once. A client holding a lead of a few frames depends on that. With a 1 ms
+ * refill instead (an earlier build), a Red 8Line with a 48-frame lead at a
+ * 32-frame period delivered 160 frames of a 480000-frame ramp: intact, but
+ * almost entirely replaced by silence.
  */
-#define CLARETT_SVC_REFILL_US	150
 #define CLARETT_SVC_FALLBACK_US	1000
 /*
  * Modulus of the 0x300 period counter: it wraps at 0x100. Knowing it is what
@@ -1476,6 +1522,9 @@ void clarett_read_rx_layout(struct clarett *c);
 void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1);
 void clarett_engine_run(struct clarett *c);
 void clarett_engine_stop(struct clarett *c);
+void clarett_engine_irq_summary(struct clarett *c, u32 sum);
+void clarett_engine_irq_period(struct clarett *c, u32 c2);
+u32 clarett_irq_sweep(struct clarett *c, bool full);
 void clarett_quiesce_dma(struct pci_dev *pci, void __iomem *bar0);
 
 /* follow.c */
@@ -1503,8 +1552,6 @@ int clarett_create_pcm(struct clarett *c);
  */
 int clarett_add_clock_control(struct clarett *c);
 void clarett_pcm_tick(struct clarett *c, u32 add_frames);
-/* servicer: refill TX if the app wrote since the tick */
-void clarett_pcm_tx_refill(struct clarett *c);
 /* servicer: follow both engines' live positions between period events */
 void clarett_pcm_sample_live(struct clarett *c);
 /* system sleep: tear the engine down, silence TX */

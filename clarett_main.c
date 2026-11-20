@@ -269,27 +269,16 @@ int clarett_enable_monitor_hw_controls(struct clarett *c)
 				  HWEN_MONITOR_DIM_MASK, HWEN_ACTIVATE);
 }
 
-/* vec0: the 0x400 command phase and device events. */
+/*
+ * 0x400: the command phase and device events (read-to-clear). The phase bits
+ * are recorded for the command in flight; the event bits go to the relay
+ * either way.
+ */
 static void clarett_irq_event(struct clarett *c)
 {
 	bool inflight = atomic_read(&c->cmd_inflight);
 	u32 cause, ev;
 
-	/*
-	 * This is the only reader of 0x400 (read-to-clear), once per vec0 MSI,
-	 * in or out of a command: a second reader would take bits this one
-	 * needs. The phase bits are recorded for the command in flight; the
-	 * event bits go to the relay either way.
-	 */
-	/*
-	 * 0x100 FIRST when a command is in flight: its DONE bit (bit29)
-	 * reflects "0x400 has bits pending", so reading 0x400 first
-	 * clears what DONE reports and the command times out. The read
-	 * clears DONE; the command itself completes on the phase bits
-	 * below.
-	 */
-	if (inflight)
-		readl(c->bar0 + REG_IRQ0_CAUSE); /* read-to-clear */
 	cause = readl(c->bar0 + REG_NOTIFY_CAUSE);
 	ev = cause & NOTIFY_EVENT_MASK;
 
@@ -324,47 +313,83 @@ static void clarett_irq_event(struct clarett *c)
 }
 
 /*
- * MSI handler, one Linux IRQ per vector (dev_id). vec0 carries everything: the
- * mailbox's command phase, the device events (clarett_irq_event()) and the data
- * plane's period events, which is why a stream's interrupts land here too.
- * vec1/vec2 have never been seen to fire on any model (see CLARETT_NUM_VECTORS)
- * but are still read, so that a cause left standing on one could not keep its
- * vector asserted. MSI is edge-triggered, so an uncleared cause cannot storm.
- * Every vector returns IRQ_HANDLED so the core does not disable it as spurious.
+ * The cause sweep, the ONLY reader of the cause registers: the 0x100 summary
+ * first, then each block it flags, in the vendor driver's order -- 0x300 (the
+ * stream period event; reading it is the engine's ack), 0x200, 0x400 (the
+ * mailbox phase and device events), then the MIDI receive FIFO. A block read
+ * before its event lands is caught by that event's own interrupt.
+ *
+ * `full` also reads 0x300 and 0x200 when 0x100 does not flag them: the
+ * servicer's backstop (no period interrupt for CLARETT_SVC_FALLBACK_US) and
+ * probe, which must not depend on a summary bit a gated sweep has already
+ * consumed. 0x300 is read only while stream_run, or while no engine is armed:
+ * an armed engine is not acked before the stream is released.
+ *
+ * Returns the 0x100 value; all-ones is a failed read (the device left the bus
+ * or the link is unreachable) and nothing else was read.
+ */
+static u32 clarett_irq_sweep_locked(struct clarett *c, bool full)
+{
+	void __iomem *bar = c->bar0;
+	bool run = READ_ONCE(c->stream_run);
+	ktime_t t0 = ktime_get();
+	u32 sum;
+
+	lockdep_assert_held(&c->irq_lock);
+	sum = readl(bar + REG_IRQ0_CAUSE);
+	if (sum == 0xffffffff) {
+		if (run) {
+			c->irq_st.bad_reads++;
+			c->irq_st.bad_or |= sum;
+		}
+		return sum;
+	}
+	if (run)
+		clarett_engine_irq_summary(c, sum);
+	if ((sum & IRQ0_CAUSE_RX) || full) {
+		if (run)
+			clarett_engine_irq_period(c, readl(bar + STREAM_BLK1));
+		else if (!c->stream_on)
+			readl(bar + STREAM_BLK1);
+	}
+	if ((sum & IRQ0_CAUSE_TX) || full)
+		readl(bar + STREAM_BLK0);
+	if (sum & IRQ0_CAUSE_NOTIFY)
+		clarett_irq_event(c);
+	if ((sum & IRQ0_CAUSE_MIDI) && READ_ONCE(c->rmidi))
+		clarett_midi_irq(c);
+	if (run) {
+		u64 us = ktime_us_delta(ktime_get(), t0);
+
+		if (us > c->irq_st.sweep_us_max)
+			c->irq_st.sweep_us_max = us;
+	}
+	return sum;
+}
+
+u32 clarett_irq_sweep(struct clarett *c, bool full)
+{
+	unsigned long flags;
+	u32 sum;
+
+	spin_lock_irqsave(&c->irq_lock, flags);
+	sum = clarett_irq_sweep_locked(c, full);
+	spin_unlock_irqrestore(&c->irq_lock, flags);
+	return sum;
+}
+
+/*
+ * MSI handler, one Linux IRQ per vector (dev_id). Every interrupt this device
+ * raises arrives on vec0 (see CLARETT_NUM_VECTORS), but the sweep says what
+ * happened, not the vector, so all of them run it. MSI is edge-triggered, so
+ * an uncleared cause cannot storm. Every vector returns IRQ_HANDLED so the
+ * core does not disable it as spurious.
  */
 static irqreturn_t clarett_irq(int irq, void *dev_id)
 {
 	struct clarett_irqctx *ic = dev_id;
-	struct clarett *c = ic->c;
 
-	/*
-	 * Which vector signals MIDI RX is not known, so drain on every one;
-	 * that also keeps an undrained FIFO from livelocking a vector.
-	 */
-	if (READ_ONCE(c->rmidi))
-		clarett_midi_irq(c);
-
-	if (ic->idx == CLARETT_VEC_EVENT) {
-		clarett_irq_event(c);
-	/* data-plane period IRQs */
-	} else if (ic->idx == 1 || ic->idx == 2) {
-		/* read-to-clear */
-		readl(c->bar0 + (ic->idx == 1 ? STREAM_BLK0 : STREAM_BLK1));
-	}
-
-	/*
-	 * Hand a period event to the servicer. This handler does NOT read
-	 * 0x300: that register is read-to-clear and reading it is how a period
-	 * is acknowledged, so the servicer stays its only reader and the
-	 * engine is never acked from here. An interrupt that was a mailbox
-	 * completion rather than a period costs the servicer one read that
-	 * finds no event. The flag closes the window where an event arrives
-	 * while the servicer is between its read and its wait.
-	 */
-	if (READ_ONCE(c->stream_run)) {
-		atomic_set(&c->svc_wake, 1);
-		wake_up(&c->svc_wq);
-	}
+	clarett_irq_sweep(ic->c, false);
 	return IRQ_HANDLED;
 }
 
@@ -564,6 +589,7 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 	mutex_init(&c->mbox_lock);
 	mutex_init(&c->hwdep_lock);
 	mutex_init(&c->pcm_lock);
+	spin_lock_init(&c->irq_lock);
 	mutex_init(&c->serial_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
 	init_waitqueue_head(&c->svc_wq);
