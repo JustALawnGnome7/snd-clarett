@@ -1008,6 +1008,11 @@ struct clarett {
 	bool tx_silence;
 	/* START: cleared; the first fill checks the anchor is still ahead */
 	bool play_primed;
+	/*
+	 * capture START moved pcm_base to the next event; the servicer restarts
+	 * the copies there (clarett_cap_rebase) and clears it
+	 */
+	bool cap_rebase;
 	/* engine frame clock since arm (shared by both directions) */
 	u64 pcm_frames;
 	/*
@@ -1030,7 +1035,11 @@ struct clarett {
 	 * base % ring is also the rotation between ALSA buffer and hardware
 	 * ring offsets in the copies.
 	 */
-	u64 pcm_base;	/* capture: value of pcm_frames when it attached */
+	/*
+	 * capture: set at prepare, moved at START to the next event, the same
+	 * frame as play_base, so a linked duplex has no offset between them
+	 */
+	u64 pcm_base;
 	/*
 	 * playback: the engine frame where ALSA frame 0 plays. Set at
 	 * prepare, moved at START one period ahead (it may lie ahead of

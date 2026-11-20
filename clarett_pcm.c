@@ -639,6 +639,28 @@ static void clarett_cap_drain(struct clarett *c, struct snd_pcm_substream *cs,
 }
 
 /*
+ * Under pcm_lock, before any capture copy: if capture START has moved pcm_base
+ * (clarett_pcm_trigger), restart the copies at the new frame 0, copying again
+ * from the ring whatever the engine has already written past it, then let
+ * .pointer report.
+ */
+static void clarett_cap_rebase(struct clarett *c, struct snd_pcm_substream *cs)
+{
+	u64 base;
+
+	if (!READ_ONCE(c->cap_rebase))
+		return;
+	base = READ_ONCE(c->pcm_base);
+	c->cap_drained = base;
+	if (cs && cs->runtime->dma_area && c->pcm_frames > base) {
+		clarett_cap_drain(c, cs, base, c->pcm_frames - base);
+		c->cap_drained = c->pcm_frames;
+	}
+	/* copies and cap_drained before .pointer sees the flag clear */
+	smp_store_release(&c->cap_rebase, false);
+}
+
+/*
  * Where one engine is now, on the frame clock, from its ring position
  * (STREAM_OFF_POS of `blk`, a ring of `ring` frames). The position runs from
  * zero to one period ahead of the counter last latched from 0x300, which
@@ -694,6 +716,7 @@ void clarett_pcm_sample_live(struct clarett *c)
 				   ((u32)c->capture_ch * 4));
 	mutex_lock(&c->pcm_lock);
 	cs = c->pcm_sub;
+	clarett_cap_rebase(c, cs);
 	if (cs && cs->runtime->dma_area && live > c->cap_drained) {
 		clarett_cap_drain(c, cs, c->cap_drained,
 				  live - c->cap_drained);
@@ -740,6 +763,7 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 
 	cs = c->pcm_sub;
 	ps = c->pcm_play_sub;
+	clarett_cap_rebase(c, cs);
 
 	/* up to the event, from wherever the copies between events got to */
 	if (cs && cs->runtime->dma_area &&
@@ -760,7 +784,7 @@ void clarett_pcm_tick(struct clarett *c, u32 add_frames)
 	 * *_running gates). Period indices are counted on each direction's own
 	 * clock (pcm_frames - base), matching what .pointer reports.
 	 */
-	if (cs && READ_ONCE(c->pcm_running))
+	if (cs && READ_ONCE(c->pcm_running) && c->pcm_frames >= c->pcm_base)
 		cap_elapsed =
 			clarett_period_crossed(c->pcm_frames - c->pcm_base,
 					       cs->runtime->period_size,
@@ -1201,6 +1225,7 @@ static int clarett_pcm_attach(struct clarett *c, struct snd_pcm_substream *ss,
 		c->pcm_base = c->pcm_frames;
 		/* a new stream: copies start at its frame 0 */
 		WRITE_ONCE(c->cap_drained, c->pcm_frames);
+		WRITE_ONCE(c->cap_rebase, false);
 		c->pcm_last_period = 0;
 		WRITE_ONCE(c->pcm_running, false);
 	}
@@ -1319,7 +1344,9 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			 * still ahead of the engine, and it keeps this stream's
 			 * period boundaries on events (off them, a two-period
 			 * client would refill behind the engine). .pointer
-			 * reports 0 until then, so the wait is in the delay.
+			 * reports 0 until then. Capture START takes the same
+			 * frame, so a linked duplex has no offset between the
+			 * two directions.
 			 */
 			WRITE_ONCE(c->play_base,
 				   now + ss->runtime->period_size);
@@ -1330,8 +1357,16 @@ static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			/* fill the prefilled buffer now, not a tick later */
 			atomic_set(&c->tx_dirty, 1);
 		} else {
-			c->pcm_last_period = div_u64(now - c->pcm_base,
-						     ss->runtime->period_size);
+			/*
+			 * Frame 0 is the next event, as for playback. The
+			 * copies run under pcm_lock, so the servicer moves
+			 * them there (clarett_cap_rebase).
+			 */
+			WRITE_ONCE(c->pcm_base,
+				   now + ss->runtime->period_size);
+			c->pcm_last_period = 0;
+			/* the base before the flag */
+			smp_store_release(&c->cap_rebase, true);
 			WRITE_ONCE(c->pcm_running, true);
 		}
 		return 0;
@@ -1362,22 +1397,27 @@ static snd_pcm_uframes_t clarett_pcm_pointer(struct snd_pcm_substream *ss)
 {
 	struct clarett *c = snd_pcm_substream_chip(ss);
 	bool play = ss->stream == SNDRV_PCM_STREAM_PLAYBACK;
-	u64 base = play ? READ_ONCE(c->play_base) : READ_ONCE(c->pcm_base);
-	u64 now, frames;
+	u64 base, now, frames;
 
 	/* the live position: playback read, capture copied */
 	if (play) {
+		base = READ_ONCE(c->play_base);
 		now = clarett_play_pos(c);
 	} else {
-		/* pairs with the release after each capture copy */
-		u64 copied = smp_load_acquire(&c->cap_drained);
+		u64 copied;
 
+		/* START moved the base; the copies have not followed yet */
+		if (smp_load_acquire(&c->cap_rebase))
+			return 0;
+		base = READ_ONCE(c->pcm_base);
+		/* pairs with the release after each capture copy */
+		copied = smp_load_acquire(&c->cap_drained);
 		now = max(READ_ONCE(c->pcm_frames), copied);
 	}
 
 	/*
-	 * Playback anchored ahead of the engine (START): nothing has played
-	 * yet.
+	 * Anchored ahead of the engine (START): nothing has played or been
+	 * captured yet.
 	 */
 	if (now < base)
 		return 0;
