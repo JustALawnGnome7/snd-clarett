@@ -684,7 +684,13 @@ struct clarett_model {
 #define CLARETT_FLASH_TIMEOUT_MS 2000
 /* clarett_set_data single-write cap (small configs) */
 #define CLARETT_MAX_PAYLOAD      64
-/* mailbox data region past MBOX_DATA; SET_MUX = 412 */
+/*
+ * Mailbox payload limit, request and reply alike: the fw-info word at 0x8010
+ * reads 0x400. A GET_DATA asking for 1025 bytes comes back with 1024; from
+ * 1032 bytes up the device refuses it. The vendor driver splits bulk writes
+ * at 1024 (an 8-byte SET_DATA header + 1016 bytes) and reads in 1016-byte
+ * chunks. SET_MUX, the largest the driver itself sends, is 412.
+ */
 #define CLARETT_MBOX_DATA_MAX    1024
 /* shadow of the device config/app space */
 #define CLARETT_CONFIG_SIZE      256

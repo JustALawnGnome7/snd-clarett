@@ -32,13 +32,22 @@ static int clarett_hwdep_open(struct snd_hwdep *hw, struct file *file)
 }
 
 /*
+ * Reply space for one command: what resp_buf holds after the header, but never
+ * more than the device will send (CLARETT_MBOX_DATA_MAX).
+ */
+static u16 clarett_hwdep_resp_cap(struct clarett *c)
+{
+	return min_t(size_t, c->resp_size - FCP_RESP_DATA_OFF,
+		     CLARETT_MBOX_DATA_MAX);
+}
+
+/*
  * FCP_IOCTL_CMD: relay one FCP command to the mailbox and return its response
  * payload.
  */
 static int clarett_hwdep_cmd(struct clarett *c, struct fcp_cmd __user *arg)
 {
-	/* response payload space in resp_buf */
-	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
+	u16 resp_cap = clarett_hwdep_resp_cap(c);
 	struct fcp_cmd cmd;
 	void *data = NULL;
 	int buf_size, err = 0;
@@ -134,7 +143,7 @@ out:
 static int clarett_hwdep_init_cmd(struct clarett *c,
 				  struct fcp_init __user *arg)
 {
-	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
+	u16 resp_cap = clarett_hwdep_resp_cap(c);
 	struct fcp_init init;
 	u8 *resp;
 	int buf_size, err;
@@ -389,7 +398,7 @@ static int clarett_hwdep_meter_create(struct clarett *c, const s16 *tmp,
 static int clarett_hwdep_set_meter_map(struct clarett *c,
 				       struct fcp_meter_map __user *arg)
 {
-	u16 resp_cap = c->resp_size - FCP_RESP_DATA_OFF;
+	u16 resp_cap = clarett_hwdep_resp_cap(c);
 	struct fcp_meter_map map;
 	s16 *tmp;
 	int err;
