@@ -5,7 +5,6 @@
  */
 #include <linux/pci.h>
 #include <linux/delay.h>
-#include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/ktime.h>
 #include "clarett.h"
@@ -14,9 +13,10 @@
  * The data-plane DMA engine is flow-controlled: it raises a period on the 0x300
  * cause register, with an MSI, and waits for the host to ack it by reading it
  * (read-to-clear); unserviced, it stalls after a few descriptors. The interrupt
- * sweep (clarett_irq_sweep()) acks it and counts the frames; the stream
- * servicer below, a kthread, drives the PCM path (clarett_pcm_tick) from what
- * the sweep collected.
+ * sweep (clarett_irq_sweep()) acks it and counts the frames; vec0's IRQ thread
+ * (clarett_svc_thread()) drives the PCM path (clarett_pcm_tick) from what the
+ * sweep collected, and a per-stream timer (clarett_svc_backstop()) covers an
+ * interrupt that never came.
  */
 /*
  * Log a servicer telemetry line at info if it reports something wrong, else at
@@ -30,60 +30,6 @@
 		else							\
 			dev_dbg(&(c)->pci->dev, fmt, ##__VA_ARGS__);	\
 	} while (0)
-
-/*
- * Servicer telemetry: the 2-second window and the run-wide summary. The event
- * figures are the interrupt sweep's (struct clarett_irq_stats), copied in at
- * each window (clarett_svc_collect()).
- */
-struct clarett_svc_stats {
-	u32 wraps;
-	u32 bad_reads;
-	/* cumulative OR of every unusable 0x100/0x300 sample (badbits) */
-	u32 bad_or;
-	/*
-	 * Cumulative OR of every 0x100 summary read (IRQ0_CAUSE_KNOWN says
-	 * which bits are understood).
-	 */
-	u32 cause_or;
-	/* events flagged CLARETT_CTR_OVERRUN (device saw a missed ack) */
-	u32 overruns;
-	/*
-	 * 0x100 reads showing IRQ0_CAUSE_TX_UNDERRUN (the playback engine ran
-	 * dry). A count of samples, not of separate events.
-	 */
-	u32 underruns;
-	/*
-	 * Previous window's values of the cumulative counters, so a window can
-	 * tell whether IT was bad.
-	 */
-	u32 prev_bad_reads, prev_overruns, prev_underruns;
-	/*
-	 * Run-wide worst case, for the one-line summary at stop (the windows
-	 * reset their own maxima).
-	 */
-	u64 run_gap_max_us, run_read_us_max;
-	u32 run_late, run_step_max;
-	/* when the servicer first saw stream_run (0 = never) */
-	ktime_t run_start;
-	/*
-	 * Event lateness. The period counters cannot show it: they accumulate
-	 * the hardware counter delta, so a late event is made up on the next
-	 * one and the totals stay smooth while the audio glitches. What
-	 * matters is the wall-clock gap between events, against a nominal that
-	 * follows the period and the rate (clarett_tick_late_us(); do not
-	 * reintroduce a fixed threshold). step_max is the same signal without a
-	 * clock: a doubled step is a missed event.
-	 */
-	u64 gap_max_us;
-	u32 gap_late, step_max;
-	/*
-	 * readmax = the longest interrupt sweep (us). If it is close to
-	 * gapmax, the stall was inside a readl() (the link or the whole host
-	 * stalled).
-	 */
-	u64 read_us_max;
-};
 
 /*
  * From the sweep, every 0x100 read while a stream runs: the summary's own
@@ -184,8 +130,8 @@ void clarett_engine_irq_period(struct clarett *c, u32 c2)
 	clarett_irq_timing(c, step);
 	atomic_inc(&c->stream_periods);
 	c->irq_pending += step;
+	/* the caller wakes the IRQ thread (clarett_irq, clarett_svc_kick) */
 	atomic_set(&c->svc_wake, 1);
-	wake_up(&c->svc_wq);
 }
 
 /*
@@ -227,6 +173,7 @@ static void clarett_svc_collect(struct clarett *c, struct clarett_svc_stats *st)
 	st->underruns = is->underruns;
 	st->cause_or = is->cause_or;
 	spin_unlock_irqrestore(&c->irq_lock, flags);
+	st->backstops = atomic_read(&c->svc_backstops);
 }
 
 /* Fold the current window into the run-wide worst case. */
@@ -244,7 +191,8 @@ static void clarett_svc_fold(struct clarett_svc_stats *st)
 /*
  * Close a 2-second window: log it, fold it into the run, start the next. The
  * line is at info only when the window had a late tick, a device-side period
- * overrun, a playback underrun or a rejected sample. Every window, without
+ * overrun, a playback underrun, a rejected sample or an event only the
+ * backstop found. Every window, without
  * the mailbox trace:
  *   echo 'format "stream-svc:" +p' |
  *     tee /sys/kernel/debug/dynamic_debug/control
@@ -253,19 +201,21 @@ static void clarett_svc_window(struct clarett *c, struct clarett_svc_stats *st)
 {
 	bool bad = st->gap_late || st->bad_reads != st->prev_bad_reads ||
 		   st->overruns != st->prev_overruns ||
-		   st->underruns != st->prev_underruns;
+		   st->underruns != st->prev_underruns ||
+		   st->backstops != st->prev_backstops;
 
 	clarett_svc_log(c, bad,
-			"stream-svc: periods=%d ctr=0x%x wraps=%u gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u underrun=%u\n",
+			"stream-svc: periods=%d ctr=0x%x wraps=%u gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u underrun=%u backstop=%u\n",
 			atomic_read(&c->stream_periods), c->stream_ctr,
 			st->wraps, st->gap_max_us, st->read_us_max,
 			st->gap_late, st->step_max, st->bad_reads, st->bad_or,
-			st->overruns, st->underruns);
+			st->overruns, st->underruns, st->backstops);
 
 	clarett_svc_fold(st);
 	st->prev_bad_reads = st->bad_reads;
 	st->prev_overruns = st->overruns;
 	st->prev_underruns = st->underruns;
+	st->prev_backstops = st->backstops;
 
 	st->gap_max_us = 0;
 	st->read_us_max = 0;
@@ -286,15 +236,16 @@ static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
 	clarett_svc_fold(st);
 
 	clarett_svc_log(c, st->run_late || st->bad_reads || st->overruns ||
-			st->underruns,
+			st->underruns || st->backstops,
 			"stream-svc: stopped (periods=%d ctr=0x%x wraps=%u ptr0=0x%x ptr1=0x%x; "
-			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u underrun=%u cause=0x%08x)\n",
+			"run gapmax=%lluus readmax=%lluus late=%u stepmax=0x%x badreads=%u badbits=0x%08x overrun=%u underrun=%u backstop=%u cause=0x%08x)\n",
 			atomic_read(&c->stream_periods), c->stream_ctr,
 			st->wraps, readl(bar + STREAM_BLK0 + STREAM_OFF_PTR),
 			readl(bar + STREAM_BLK1 + STREAM_OFF_PTR),
 			st->run_gap_max_us, st->run_read_us_max, st->run_late,
 			st->run_step_max, st->bad_reads, st->bad_or,
-			st->overruns, st->underruns, st->cause_or);
+			st->overruns, st->underruns, st->backstops,
+			st->cause_or);
 }
 
 /*
@@ -313,12 +264,12 @@ static void clarett_svc_summary(struct clarett *c, struct clarett_svc_stats *st)
  * before it could have raised an event.
  */
 static void clarett_svc_check_silent(struct clarett *c,
-				     const struct clarett_svc_stats *st,
-				     bool gone)
+				     const struct clarett_svc_stats *st)
 {
 	s64 ran_ms;
 
-	if (gone || !st->run_start || atomic_read(&c->stream_periods))
+	if (pci_dev_is_disconnected(c->pci) || !st->run_start ||
+	    atomic_read(&c->stream_periods))
 		return;
 	ran_ms = ktime_ms_delta(ktime_get(), st->run_start);
 	if (ran_ms < CLARETT_SILENT_RUN_MS)
@@ -329,106 +280,93 @@ static void clarett_svc_check_silent(struct clarett *c,
 }
 
 /*
- * Sleep until the sweep collects a period event, or CLARETT_SVC_FALLBACK_US,
- * whichever comes first. Returns true if it did; on a timeout the caller runs
- * the backstop.
+ * Wake vec0's IRQ thread from outside vec0's own handler: the backstop timer,
+ * the other vectors' handlers, and the release of the stream. The thread runs
+ * again if it is already running, so a wake is never lost.
+ */
+void clarett_svc_kick(struct clarett *c)
+{
+	if (READ_ONCE(c->irq_ready))
+		irq_wake_thread(pci_irq_vector(c->pci, 0), &c->irq_ctx[0]);
+}
+
+/* The backstop's spacing: a few nominal periods, never under the floor. */
+static ktime_t clarett_svc_backstop_interval(const struct clarett *c)
+{
+	u64 us = clarett_nominal_period_us(c) * CLARETT_SVC_BACKSTOP_PERIODS;
+
+	return us_to_ktime(max_t(u64, us, CLARETT_SVC_BACKSTOP_MIN_US));
+}
+
+/*
+ * The backstop, a per-stream timer: if no period event arrived since its last
+ * expiry, run the sweep here, reading 0x300 whether or not 0x100 flags it. That
+ * covers a lost interrupt. It also wakes the IRQ thread when a telemetry
+ * window is due, so a stream whose engine raises nothing still logs.
  *
- * atomic_xchg consumes the flag inside the condition, so an event collected
- * while the servicer is busy is not missed: the wait returns at once.
+ * An all-ones read is a FAILED PCIe transaction, never data: the device left
+ * the bus (stop re-arming; engine stop and remove follow) or the link is
+ * transiently unreachable (tens of ms of all-ones reads happen on some hosts).
  */
-static bool clarett_svc_wait(struct clarett *c)
+static enum hrtimer_restart clarett_svc_backstop(struct hrtimer *t)
 {
-	return wait_event_hrtimeout(c->svc_wq,
-				    atomic_xchg(&c->svc_wake, 0) ||
-				    kthread_should_stop(),
-				    us_to_ktime(CLARETT_SVC_FALLBACK_US)) == 0;
+	struct clarett *c = container_of(t, struct clarett, svc_timer);
+	int periods = atomic_read(&c->stream_periods);
+
+	if (!READ_ONCE(c->stream_run))
+		return HRTIMER_NORESTART;
+	if (periods == c->svc_bs_periods) {
+		if (clarett_irq_sweep(c, true) == 0xffffffff) {
+			if (pci_dev_is_disconnected(c->pci))
+				return HRTIMER_NORESTART;
+			if (!c->svc_bs_warned) {
+				c->svc_bs_warned = true;
+				dev_warn(&c->pci->dev,
+					 "0x100 read returned ~0 with the device still attached: the link is transiently unreachable (PCIe power management?)\n");
+			}
+		} else if (atomic_read(&c->stream_periods) != periods) {
+			atomic_inc(&c->svc_backstops);
+		}
+	}
+	c->svc_bs_periods = atomic_read(&c->stream_periods);
+	if (atomic_read(&c->svc_wake) ||
+	    time_after(jiffies, READ_ONCE(c->svc_next_log)))
+		clarett_svc_kick(c);
+	hrtimer_forward_now(t, clarett_svc_backstop_interval(c));
+	return HRTIMER_RESTART;
 }
 
 /*
- * The backstop: no period event for CLARETT_SVC_FALLBACK_US, so run the sweep
- * here, reading 0x300 whether or not 0x100 flags it. That covers a lost
- * interrupt, and an event whose summary bit an earlier sweep consumed before
- * the stream was released. Returns false if the read failed: the device has
- * left the bus (*gone set) or the link is transiently unreachable.
+ * vec0's IRQ thread: takes the frames the interrupt sweep collected and runs
+ * the PCM tick (copies, period_elapsed), and closes a telemetry window every
+ * 2 s. Playback the app writes is copied by .ack, and the position between
+ * events is read by .pointer, not here. Process context; it reads no register.
  */
-static bool clarett_svc_backstop(struct clarett *c, bool *gone, bool *warned)
+irqreturn_t clarett_svc_thread(int irq, void *dev_id)
 {
-	if (clarett_irq_sweep(c, true) != 0xffffffff)
-		return true;
-	/*
-	 * An all-ones read is a FAILED PCIe transaction, never data. Either
-	 * the device left the bus -- then park, never return early: a kthread
-	 * that exits before kthread_stop() runs makes kthread_stop() (from the
-	 * remove path) use the reaped task -- or the link is transiently
-	 * unreachable (tens of ms of all-ones reads happen on some hosts).
-	 */
-	if (pci_dev_is_disconnected(c->pci)) {
-		*gone = true;
-	} else if (!*warned) {
-		*warned = true;
-		dev_warn(&c->pci->dev,
-			 "0x100 read returned ~0 with the device still attached: the link is transiently unreachable (PCIe power management?)\n");
+	struct clarett_irqctx *ic = dev_id;
+	struct clarett *c = ic->c;
+	u32 units, ctr;
+
+	atomic_set(&c->svc_wake, 0);
+	if (!READ_ONCE(c->stream_run))
+		return IRQ_HANDLED;
+	units = clarett_svc_take(c, &ctr);
+	if (units)
+		clarett_pcm_tick(c, units * CLARETT_CTR_FRAMES, ctr);
+	if (time_after(jiffies, c->svc_next_log)) {
+		clarett_svc_collect(c, &c->svc_st);
+		clarett_svc_window(c, &c->svc_st);
+		WRITE_ONCE(c->svc_next_log,
+			   jiffies + msecs_to_jiffies(2000));
 	}
-	return false;
+	return IRQ_HANDLED;
 }
 
-/*
- * The stream servicer: takes the frames the interrupt sweep collected and
- * runs the PCM tick (copies, period_elapsed). Playback the app writes is
- * copied by .ack, and the position between events is read by .pointer, not
- * here. It reads no cause register itself except through the backstop.
- */
-static int clarett_stream_service(void *data)
+void clarett_engine_init(struct clarett *c)
 {
-	struct clarett *c = data;
-	unsigned long next_log = jiffies + msecs_to_jiffies(2000);
-	struct clarett_svc_stats st = { };
-	/* the sweep collected a period event */
-	bool woken = false;
-	/*
-	 * set when the device leaves the bus: park the loop, never return early
-	 * (kthread_stop UAF)
-	 */
-	bool gone = false, warned = false;
-
-	while (!kthread_should_stop()) {
-		u32 units, ctr;
-
-		/*
-		 * bus gone (below): idle here, never self-exit, until
-		 * kthread_stop() reaps us
-		 */
-		if (gone) {
-			usleep_range(1000, 2000);
-			continue;
-		}
-		if (!READ_ONCE(c->stream_run)) {
-			usleep_range(300, 600);
-			continue;
-		}
-		if (!st.run_start)
-			st.run_start = ktime_get();
-
-		if (!woken && !clarett_svc_backstop(c, &gone, &warned)) {
-			usleep_range(100, 200);
-			continue;
-		}
-		woken = false;
-
-		units = clarett_svc_take(c, &ctr);
-		if (units)
-			clarett_pcm_tick(c, units * CLARETT_CTR_FRAMES, ctr);
-		if (time_after(jiffies, next_log)) {
-			clarett_svc_collect(c, &st);
-			clarett_svc_window(c, &st);
-			next_log = jiffies + msecs_to_jiffies(2000);
-		}
-		woken = clarett_svc_wait(c);
-	}
-	clarett_svc_collect(c, &st);
-	clarett_svc_summary(c, &st);
-	clarett_svc_check_silent(c, &st, gone);
-	return 0;
+	hrtimer_setup(&c->svc_timer, clarett_svc_backstop, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 }
 
 /*
@@ -535,35 +473,26 @@ void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1)
 }
 
 /*
- * Start the stream servicer kthread. The caller flips stream_run to let the
- * interrupt sweep ack the engine.
+ * Release the stream: from here the interrupt sweep acks the engine and the
+ * IRQ thread services it. Sweep once at once: an event whose 0x100 bit a sweep
+ * consumed before the release raises no further interrupt until 0x300 is read.
  */
 void clarett_engine_run(struct clarett *c)
 {
-	/*
-	 * Never start a second servicer: the pointer is the ONLY handle
-	 * kthread_stop() has, so overwriting it orphans a SCHED_FIFO thread
-	 * that faults on module text after rmmod. The arm claim in
-	 * clarett_pcm_attach() should make this unreachable.
-	 */
-	if (WARN_ON_ONCE(c->stream_svc))
-		return;
-
 	c->stream_ctr = 0;
-	c->stream_svc = kthread_run(clarett_stream_service, c, "clarett-svc");
-	if (IS_ERR(c->stream_svc)) {
-		dev_warn(&c->pci->dev, "stream servicer failed to start: %ld\n",
-			 PTR_ERR(c->stream_svc));
-		c->stream_svc = NULL;
-		return;
-	}
-	/*
-	 * Low real-time priority: if userspace preempts the servicer, the TX
-	 * fill falls behind and the engine plays stale audio with no XRUN. It
-	 * sleeps until the next period interrupt (CLARETT_SVC_FALLBACK_US at
-	 * the latest), so it cannot starve the system.
-	 */
-	sched_set_fifo_low(c->stream_svc);
+	memset(&c->svc_st, 0, sizeof(c->svc_st));
+	c->svc_st.run_start = ktime_get();
+	c->svc_bs_periods = -1;
+	c->svc_bs_warned = false;
+	atomic_set(&c->svc_backstops, 0);
+	WRITE_ONCE(c->svc_next_log, jiffies + msecs_to_jiffies(2000));
+
+	WRITE_ONCE(c->stream_run, true);
+	clarett_irq_sweep(c, true);
+	if (atomic_read(&c->svc_wake))
+		clarett_svc_kick(c);
+	hrtimer_start(&c->svc_timer, clarett_svc_backstop_interval(c),
+		      HRTIMER_MODE_REL);
 }
 
 /*
@@ -572,18 +501,14 @@ void clarett_engine_run(struct clarett *c)
  */
 void clarett_engine_stop(struct clarett *c)
 {
-	struct task_struct *svc;
-
 	/*
 	 * CLAIM THE TEARDOWN UNDER pcm_lock. Both directions can close at once,
 	 * and clarett_pcm_detach() tests "last one out" after dropping the
-	 * lock, so two callers can arrive here. A second kthread_stop() on the
-	 * same, already reaped task blocks forever. Taking stream_on and the
-	 * handle together under the lock lets exactly one caller proceed (the
+	 * lock, so two callers can arrive here; exactly one proceeds (the
 	 * mirror of the arm claim in clarett_pcm_attach()).
 	 *
-	 * kthread_stop() MUST run outside pcm_lock: the servicer takes it in
-	 * clarett_pcm_tick(), so stopping it under the lock would deadlock.
+	 * The waits below MUST run outside pcm_lock: the IRQ thread takes it in
+	 * clarett_pcm_tick(), so waiting for it under the lock would deadlock.
 	 */
 	mutex_lock(&c->pcm_lock);
 	if (!c->stream_on) {
@@ -591,16 +516,18 @@ void clarett_engine_stop(struct clarett *c)
 		return;
 	}
 	c->stream_on = false;
-	/* stop the interrupt sweep acking 0x300 */
+	/* stop the interrupt sweep acking 0x300 and waking the thread */
 	WRITE_ONCE(c->stream_run, false);
-	svc = c->stream_svc;
-	/* take the handle: only this caller may stop it */
-	c->stream_svc = NULL;
 	mutex_unlock(&c->pcm_lock);
 
-	if (svc)
-		/* stop acking 0x300 before the engine is torn down */
-		kthread_stop(svc);
+	hrtimer_cancel(&c->svc_timer);
+	/* a sweep or tick already under way finishes; none starts after */
+	if (READ_ONCE(c->irq_ready))
+		synchronize_irq(pci_irq_vector(c->pci, 0));
+	clarett_svc_collect(c, &c->svc_st);
+	clarett_svc_summary(c, &c->svc_st);
+	clarett_svc_check_silent(c, &c->svc_st);
+
 	/* disable ring 0 */
 	clarett_wl(c, STREAM_BLK0 + STREAM_OFF_CTRL, 0);
 	/* disable ring 1 */

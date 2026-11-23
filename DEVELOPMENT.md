@@ -18,7 +18,7 @@ MIDI, the sample clock (the `Clock Source` control), and model detection.
 |---|---|
 | `clarett_main.c` | PCI probe and removal, the attach sequence, IRQs, the serial sysfs file |
 | `clarett_models.c` | The per-model table and model detection |
-| `clarett_engine.c` | The data-plane engine (arm/run/stop) and the stream servicer |
+| `clarett_engine.c` | The data-plane engine (arm/run/stop), the stream's IRQ thread and backstop |
 | `clarett_follow.c` | Deferred workers: settings persist, notification relay, front-panel follow |
 | `clarett_pm.c` | System sleep (suspend/resume) |
 | `clarett_mailbox.c` | FCP command transport over BAR0 |
@@ -233,9 +233,11 @@ blocks it flags (`0x300` period, `0x200`, `0x400` mailbox phase and events, then
 FIFO). Reading `0x300` is how a period is acknowledged, so the engine is acked in the interrupt
 itself; at a 16-frame period that removed nearly all of the device's period-overrun flags. The sweep
 counts the frames the engine advanced (the period counter is modular, so a late read recovers what
-it missed) and wakes a SCHED_FIFO servicer thread, which drains the RX ring into the capture buffer
-and calls `snd_pcm_period_elapsed()`. If no period event arrives for `CLARETT_SVC_FALLBACK_US` the
-thread runs the sweep itself, as a backstop against a lost interrupt.
+it missed) and wakes vector 0's IRQ thread, which drains the RX ring into the capture buffer and
+calls `snd_pcm_period_elapsed()`. A per-stream timer, expiring every few periods
+(`CLARETT_SVC_BACKSTOP_PERIODS`, at least `CLARETT_SVC_BACKSTOP_MIN_US`), runs the sweep itself when
+no period event arrived since its last expiry, as a backstop against a lost interrupt; `backstop=`
+in the servicer telemetry counts the events only it found.
 
 The PCM is nonatomic, so `.ack` can sleep: playback is copied into the TX ring on every write the
 app makes, only the frames it wrote, ahead of the device's read position with
@@ -283,9 +285,9 @@ without it, so the driver does not send it. Credit: Geoffrey D. Bennett establis
   shows the lock.
 - **There is no default route**: playback is silent until a PCM source is wired to an output in the
   router.
-- Surprise removal is handled: the servicer and the deferred workers stop before the card is
-  disconnected, a dead link (all-ones reads) ends the servicer, and the mailbox fails fast on a
-  disconnected device.
+- Surprise removal is handled: the stream servicing and the deferred workers stop before the card
+  is disconnected, a dead link (all-ones reads) stops the backstop timer, and the mailbox fails fast
+  on a disconnected device.
 - **Removal does not wait for userspace.** `clarett_remove()` disconnects the card, tears the hardware
   side down at once (`clarett_hw_teardown()`: settings flush, engine stop, interrupt mask, MSI vectors,
   DMA quiesce) and frees the card with `snd_card_free_when_closed()`, so the rest happens whenever the
@@ -365,8 +367,8 @@ commands (`0x004xxx`) therefore get a 2 s response deadline (`CLARETT_FLASH_TIME
 reads flash on the attach path.
 
 - **info** — the probe summary above, and a `stream-svc:` line for any 2-second window (or any
-  stream) in which something went wrong: a late servicer tick, a device-side period overrun, or an
-  unusable `0x300` sample. Also a one-off `stream-cause:` line per stream if the `0x100` summary
+  stream) in which something went wrong: a late servicer tick, a device-side period overrun, an
+  unusable `0x300` sample, or a period event only the backstop found. Also a one-off `stream-cause:` line per stream if the `0x100` summary
   ever shows a bit whose meaning is not established. Silence during playback is the healthy state.
 - **warn** — degraded but working: a short MSI vector count, a subsystem that failed to register, a
   config-shadow seed failure, a transiently unreachable link, and a stream whose engine raised no

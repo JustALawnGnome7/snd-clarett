@@ -1156,8 +1156,8 @@ static int clarett_pcm_attach(struct clarett *c, struct snd_pcm_substream *ss,
 		 * mailbox commands before the engine is up, so if stream_on
 		 * were published only at the end, two prepares in that window
 		 * (a duplex client starting both directions at once) would both
-		 * arm, and the second clarett_engine_run() would orphan the
-		 * first servicer thread. engine_arm sets it again (idempotent).
+		 * arm the engine twice over (two handshakes, two arms of a
+		 * running engine). engine_arm sets it again (idempotent).
 		 */
 		c->stream_on = true;
 		/* first direction in: the shared clock starts here */
@@ -1228,7 +1228,6 @@ static void clarett_pcm_arm(struct clarett *c, unsigned int rate)
 	 * ms of the arm if unserviced. The triggers only gate whether periods
 	 * are reported to ALSA (pcm_running / play_running).
 	 */
-	WRITE_ONCE(c->stream_run, true);
 	clarett_engine_run(c);
 }
 
@@ -1272,9 +1271,9 @@ static int clarett_pcm_prepare(struct snd_pcm_substream *ss)
 
 /*
  * Under the stream mutex (the PCM is nonatomic): only flip this direction's
- * servicing gate. The engine is already armed and the kthread running from
- * prepare(); START begins reporting that direction's periods from the current
- * clock, STOP halts them. Full teardown happens in close()/hw_free.
+ * servicing gate. The engine is already armed and serviced from prepare();
+ * START begins reporting that direction's periods from the current clock,
+ * STOP halts them. Full teardown happens in close()/hw_free.
  */
 static int clarett_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 {

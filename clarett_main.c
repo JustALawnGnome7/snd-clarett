@@ -16,7 +16,6 @@
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
-#include <linux/kthread.h>
 /* sched_set_fifo_low() — real-time priority for the stream servicer */
 #include <linux/sched.h>
 #include <linux/bitmap.h>
@@ -320,10 +319,11 @@ static void clarett_irq_event(struct clarett *c)
  * before its event lands is caught by that event's own interrupt.
  *
  * `full` also reads 0x300 and 0x200 when 0x100 does not flag them: the
- * servicer's backstop (no period interrupt for CLARETT_SVC_FALLBACK_US) and
- * probe, which must not depend on a summary bit a gated sweep has already
- * consumed. 0x300 is read only while stream_run, or while no engine is armed:
- * an armed engine is not acked before the stream is released.
+ * stream's backstop timer (no period interrupt for a few periods), the
+ * release of the stream, and probe, which must not depend on a summary bit a
+ * gated sweep has already consumed. 0x300 is read only while stream_run, or
+ * while no engine is armed: an armed engine is not acked before the stream is
+ * released.
  *
  * Returns the 0x100 value; all-ones is a failed read (the device left the bus
  * or the link is unreachable) and nothing else was read.
@@ -382,14 +382,21 @@ u32 clarett_irq_sweep(struct clarett *c, bool full)
  * MSI handler, one Linux IRQ per vector (dev_id). Every interrupt this device
  * raises arrives on vec0 (see CLARETT_NUM_VECTORS), but the sweep says what
  * happened, not the vector, so all of them run it. MSI is edge-triggered, so
- * an uncleared cause cannot storm. Every vector returns IRQ_HANDLED so the
- * core does not disable it as spurious.
+ * an uncleared cause cannot storm. A collected period event wakes vec0's IRQ
+ * thread (clarett_svc_thread()), which services the stream; otherwise every
+ * vector returns IRQ_HANDLED so the core does not disable it as spurious.
  */
 static irqreturn_t clarett_irq(int irq, void *dev_id)
 {
 	struct clarett_irqctx *ic = dev_id;
+	struct clarett *c = ic->c;
 
-	clarett_irq_sweep(ic->c, false);
+	clarett_irq_sweep(c, false);
+	if (atomic_read(&c->svc_wake)) {
+		if (!ic->idx)
+			return IRQ_WAKE_THREAD;
+		clarett_svc_kick(c);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -437,8 +444,15 @@ static int clarett_setup_irq(struct clarett *c)
 	for (i = 0; i < c->n_vec; i++) {
 		c->irq_ctx[i].c = c;
 		c->irq_ctx[i].idx = i;
-		err = request_irq(pci_irq_vector(pci, i), clarett_irq, 0,
-				  KBUILD_MODNAME, &c->irq_ctx[i]);
+		/*
+		 * vec0 carries the period events, so it has the thread
+		 * that services the stream. Not IRQF_ONESHOT: vec0 also
+		 * completes mailbox commands, which must not wait for a
+		 * tick; an event during a tick runs the thread again.
+		 */
+		err = request_threaded_irq(pci_irq_vector(pci, i), clarett_irq,
+					   i ? NULL : clarett_svc_thread, 0,
+					   KBUILD_MODNAME, &c->irq_ctx[i]);
 		if (err) {
 			dev_err(&pci->dev, "request_irq vec %d failed (%d)\n",
 				i, err);
@@ -592,7 +606,7 @@ static void clarett_init_state(struct clarett *c, struct snd_card *card,
 	spin_lock_init(&c->irq_lock);
 	mutex_init(&c->serial_lock);
 	init_waitqueue_head(&c->hwdep_notify_wait);
-	init_waitqueue_head(&c->svc_wq);
+	clarett_engine_init(c);
 	init_completion(&c->mbox_accepted);
 	init_completion(&c->mbox_landed);
 	init_completion(&c->addr_acked);

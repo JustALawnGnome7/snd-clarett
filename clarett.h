@@ -13,6 +13,8 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>	/* spinlock_t — interrupt sweep, MIDI RX */
 #include <linux/ktime.h>	/* ktime_t — interrupt sweep telemetry */
+#include <linux/hrtimer.h>	/* struct hrtimer — the stream backstop */
+#include <linux/interrupt.h>	/* irqreturn_t — the IRQ thread */
 #include <linux/pci.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>		/* wait_queue_head_t — hwdep relay */
@@ -769,6 +771,62 @@ struct clarett_irq_stats {
 	bool seen, cause_told;
 };
 
+/*
+ * Servicer telemetry: the 2-second window and the run-wide summary, kept by
+ * the IRQ thread (clarett_engine.c). The event figures are the interrupt
+ * sweep's (struct clarett_irq_stats), copied in at each window.
+ */
+struct clarett_svc_stats {
+	u32 wraps;
+	u32 bad_reads;
+	/* cumulative OR of every unusable 0x100/0x300 sample (badbits) */
+	u32 bad_or;
+	/*
+	 * Cumulative OR of every 0x100 summary read (IRQ0_CAUSE_KNOWN says
+	 * which bits are understood).
+	 */
+	u32 cause_or;
+	/* events flagged CLARETT_CTR_OVERRUN (device saw a missed ack) */
+	u32 overruns;
+	/*
+	 * 0x100 reads showing IRQ0_CAUSE_TX_UNDERRUN (the playback engine ran
+	 * dry). A count of samples, not of separate events.
+	 */
+	u32 underruns;
+	/* backstop sweeps that found an event the interrupt had not reported */
+	u32 backstops;
+	/*
+	 * Previous window's values of the cumulative counters, so a window can
+	 * tell whether IT was bad.
+	 */
+	u32 prev_bad_reads, prev_overruns, prev_underruns, prev_backstops;
+	/*
+	 * Run-wide worst case, for the one-line summary at stop (the windows
+	 * reset their own maxima).
+	 */
+	u64 run_gap_max_us, run_read_us_max;
+	u32 run_late, run_step_max;
+	/* when the stream was released (stream_run set) */
+	ktime_t run_start;
+	/*
+	 * Event lateness. The period counters cannot show it: they accumulate
+	 * the hardware counter delta, so a late event is made up on the next
+	 * one and the totals stay smooth while the audio glitches. What
+	 * matters is the wall-clock gap between events, against a nominal that
+	 * follows the period and the rate (clarett_tick_late_us(); do not
+	 * reintroduce a fixed threshold). step_max is the same signal without a
+	 * clock: a doubled step is a missed event.
+	 */
+	u64 gap_max_us;
+	u32 gap_late, step_max;
+	/*
+	 * readmax = the longest interrupt sweep (us). If it is close to
+	 * gapmax, the stall was inside a readl() (the link or the whole host
+	 * stalled).
+	 */
+	u64 read_us_max;
+};
+
 /* --- per-card state ----------------------------------------------------- */
 struct clarett {
 	struct pci_dev *pci;
@@ -1005,11 +1063,22 @@ struct clarett {
 	void *stream_buf;
 	dma_addr_t stream_dma;
 	size_t stream_size;
-	/* reads/acks 0x300 to keep the engine clocked */
-	struct task_struct *stream_svc;
-	/* interrupt sweep -> servicer: a period event is waiting */
-	wait_queue_head_t svc_wq;
-	/* set by the sweep, consumed by the servicer's wait */
+	/*
+	 * The backstop: armed per stream, runs a full sweep when no period
+	 * event arrived since its last expiry (clarett_svc_backstop()).
+	 */
+	struct hrtimer svc_timer;
+	/* stream_periods at the backstop's last expiry */
+	int svc_bs_periods;
+	/* backstop sweeps that collected an event (telemetry) */
+	atomic_t svc_backstops;
+	/* the backstop has warned about an all-ones read this stream */
+	bool svc_bs_warned;
+	/* when the IRQ thread next logs a telemetry window (jiffies) */
+	unsigned long svc_next_log;
+	/* the IRQ thread's telemetry (window and run-wide summary) */
+	struct clarett_svc_stats svc_st;
+	/* set by the sweep with a period event: the IRQ thread has work */
 	atomic_t svc_wake;
 	/* period events collected this stream (the sweep counts them) */
 	atomic_t stream_periods;
@@ -1021,8 +1090,8 @@ struct clarett {
 	u32 stream_ctr;
 	/*
 	 * Serialises the cause sweep (clarett_irq_sweep()), which runs from
-	 * the MSI handler and from the servicer's backstop. The fields below
-	 * it are the sweep's.
+	 * the MSI handler and from the backstop timer. The fields below it are
+	 * the sweep's.
 	 */
 	spinlock_t irq_lock;
 	/* the 0x300 counter as last read, and its last positive step */
@@ -1276,11 +1345,13 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
  */
 #define CLARETT_CTR_FRAMES	16
 /*
- * The servicer wakes on each period event the interrupt sweep collects, and
- * after FALLBACK_US without one runs the sweep itself (the backstop, which
- * also reads 0x300 unflagged). Every period event raises an MSI on vec0, so
- * the backstop only covers one that was lost or delayed; a late read costs
- * nothing, since the counter's modular delta recovers the advance it missed.
+ * The stream is serviced from vec0's IRQ thread, woken by each period event the
+ * interrupt sweep collects. A backstop timer expires every BACKSTOP_PERIODS
+ * nominal periods (at least BACKSTOP_MIN_US) and, if no event arrived since its
+ * last expiry, runs the sweep itself, reading 0x300 unflagged. Every period
+ * event raises an MSI on vec0, so the backstop only covers one that was lost or
+ * delayed; a late read costs nothing, since the counter's modular delta
+ * recovers the advance it missed.
  *
  * Playback needs no cadence of its own: .ack copies what the app writes at
  * once. A client holding a lead of a few frames depends on that. With a 1 ms
@@ -1288,7 +1359,8 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
  * 32-frame period delivered 160 frames of a 480000-frame ramp: intact, but
  * almost entirely replaced by silence.
  */
-#define CLARETT_SVC_FALLBACK_US	1000
+#define CLARETT_SVC_BACKSTOP_PERIODS	3
+#define CLARETT_SVC_BACKSTOP_MIN_US	1000
 /*
  * Modulus of the 0x300 period counter: it wraps at 0x100. Knowing it is what
  * lets a wrap and a LATE POLL be the same arithmetic — a modular difference
@@ -1330,7 +1402,8 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
 #define CLARETT_TICK_LATE_NUM		3
 #define CLARETT_TICK_LATE_DEN		2
 #define CLARETT_TICK_LATE_FLOOR_US	2000
-static inline u64 clarett_tick_late_us(const struct clarett *c)
+/* The spacing of period events (us), from the measured counter step. */
+static inline u64 clarett_nominal_period_us(const struct clarett *c)
 {
 	/*
 	 * Both fall back to a 48 kHz, step-0xd default, so it stays sane before
@@ -1341,8 +1414,13 @@ static inline u64 clarett_tick_late_us(const struct clarett *c)
 	u32 rate = READ_ONCE(c->cur_rate) ?
 		   READ_ONCE(c->cur_rate) : CLARETT_DEFAULT_RATE;
 	u32 step = c->stream_ctr_step ? c->stream_ctr_step : 0xd;
-	u64 nominal = div_u64((u64)step * CLARETT_CTR_FRAMES * USEC_PER_SEC,
-			      rate);
+
+	return div_u64((u64)step * CLARETT_CTR_FRAMES * USEC_PER_SEC, rate);
+}
+
+static inline u64 clarett_tick_late_us(const struct clarett *c)
+{
+	u64 nominal = clarett_nominal_period_us(c);
 
 	return max_t(u64,
 		     nominal * CLARETT_TICK_LATE_NUM / CLARETT_TICK_LATE_DEN,
@@ -1515,6 +1593,12 @@ void clarett_read_rx_layout(struct clarett *c);
 /* engine.c — data-plane engine (shared with pcm.c) */
 void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1);
 void clarett_engine_run(struct clarett *c);
+/* probe: set up the backstop timer */
+void clarett_engine_init(struct clarett *c);
+/* vec0's IRQ thread: the stream tick */
+irqreturn_t clarett_svc_thread(int irq, void *dev_id);
+/* wake vec0's IRQ thread from outside vec0's own handler */
+void clarett_svc_kick(struct clarett *c);
 void clarett_engine_stop(struct clarett *c);
 void clarett_engine_irq_summary(struct clarett *c, u32 sum);
 void clarett_engine_irq_period(struct clarett *c, u32 c2);
