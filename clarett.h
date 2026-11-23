@@ -1014,9 +1014,9 @@ struct clarett {
 	/* period events collected this stream (the sweep counts them) */
 	atomic_t stream_periods;
 	/*
-	 * The 0x300 counter pcm_frames counts to: taken by the servicer with
-	 * the units it adds (clarett_svc_take()), so the live position is
-	 * placed against the same event the frame clock reached.
+	 * The 0x300 counter pcm_frames counts to: set with it by the tick,
+	 * under pcm_lock, so a live position is placed against the same event
+	 * the frame clock reached.
 	 */
 	u32 stream_ctr;
 	/*
@@ -1066,25 +1066,20 @@ struct clarett {
 	u64 tx_silence_to;
 	/* START: cleared; the first fill checks the anchor is still ahead */
 	bool play_primed;
-	/*
-	 * capture START moved pcm_base to the next event; the servicer restarts
-	 * the copies there (clarett_cap_rebase) and clears it
-	 */
-	bool cap_rebase;
 	/* engine frame clock since arm (shared by both directions) */
 	u64 pcm_frames;
 	/*
 	 * Where the playback engine has read to, on the same clock: pcm_frames
-	 * plus the ring position's lead over the last event. Sampled by the
-	 * servicer whenever it reads the device; only moves forward; may lag
-	 * pcm_frames while no playback runs (users take the larger).
+	 * plus the ring position's lead over the last event, read whenever
+	 * .pointer or the fill needs it; only moves forward; may lag pcm_frames
+	 * while no playback runs (users take the larger). Under pcm_lock.
 	 */
 	u64 play_live;
 	/*
 	 * Capture: how far the RX ring has been copied into the ALSA buffer,
 	 * on the same clock. Every period event copies up to the event, and
-	 * between events the servicer copies up to the engine's live position,
-	 * so this runs ahead of pcm_frames by up to a period. Under pcm_lock.
+	 * .pointer copies up to the engine's live position, so this runs ahead
+	 * of pcm_frames by up to a period. Under pcm_lock.
 	 */
 	u64 cap_drained;
 	/*
@@ -1286,7 +1281,6 @@ static inline u32 clarett_irq_period_frames(const struct clarett *c)
  * also reads 0x300 unflagged). Every period event raises an MSI on vec0, so
  * the backstop only covers one that was lost or delayed; a late read costs
  * nothing, since the counter's modular delta recovers the advance it missed.
- * It is also the cadence of the live-position sampling between events.
  *
  * Playback needs no cadence of its own: .ack copies what the app writes at
  * once. A client holding a lead of a few frames depends on that. With a 1 ms
@@ -1551,9 +1545,7 @@ int clarett_create_pcm(struct clarett *c);
  * see the comment on the control in clarett_pcm.c.
  */
 int clarett_add_clock_control(struct clarett *c);
-void clarett_pcm_tick(struct clarett *c, u32 add_frames);
-/* servicer: follow both engines' live positions between period events */
-void clarett_pcm_sample_live(struct clarett *c);
+void clarett_pcm_tick(struct clarett *c, u32 add_frames, u32 ctr);
 /* system sleep: tear the engine down, silence TX */
 void clarett_pcm_suspend(struct clarett *c);
 /* system sleep: re-send the Clock Source */

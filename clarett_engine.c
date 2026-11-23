@@ -190,9 +190,9 @@ void clarett_engine_irq_period(struct clarett *c, u32 c2)
 
 /*
  * Take the counter units the sweep collected since the last call, and the
- * counter value they bring the frame clock to.
+ * counter value they bring the frame clock to (*ctr).
  */
-static u32 clarett_svc_take(struct clarett *c)
+static u32 clarett_svc_take(struct clarett *c, u32 *ctr)
 {
 	unsigned long flags;
 	u32 units;
@@ -200,7 +200,7 @@ static u32 clarett_svc_take(struct clarett *c)
 	spin_lock_irqsave(&c->irq_lock, flags);
 	units = c->irq_pending;
 	c->irq_pending = 0;
-	c->stream_ctr = c->irq_ctr;
+	*ctr = c->irq_ctr;
 	spin_unlock_irqrestore(&c->irq_lock, flags);
 	return units;
 }
@@ -374,9 +374,9 @@ static bool clarett_svc_backstop(struct clarett *c, bool *gone, bool *warned)
 
 /*
  * The stream servicer: takes the frames the interrupt sweep collected and
- * runs the PCM tick (copies, period_elapsed), and follows the live position
- * between events. Playback the app writes is copied by .ack, not here. It
- * reads no cause register itself except through the backstop.
+ * runs the PCM tick (copies, period_elapsed). Playback the app writes is
+ * copied by .ack, and the position between events is read by .pointer, not
+ * here. It reads no cause register itself except through the backstop.
  */
 static int clarett_stream_service(void *data)
 {
@@ -392,7 +392,7 @@ static int clarett_stream_service(void *data)
 	bool gone = false, warned = false;
 
 	while (!kthread_should_stop()) {
-		u32 units;
+		u32 units, ctr;
 
 		/*
 		 * bus gone (below): idle here, never self-exit, until
@@ -415,10 +415,9 @@ static int clarett_stream_service(void *data)
 		}
 		woken = false;
 
-		units = clarett_svc_take(c);
+		units = clarett_svc_take(c, &ctr);
 		if (units)
-			clarett_pcm_tick(c, units * CLARETT_CTR_FRAMES);
-		clarett_pcm_sample_live(c);
+			clarett_pcm_tick(c, units * CLARETT_CTR_FRAMES, ctr);
 		if (time_after(jiffies, next_log)) {
 			clarett_svc_collect(c, &st);
 			clarett_svc_window(c, &st);
