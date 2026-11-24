@@ -500,7 +500,8 @@ struct snd_rawmidi_substream;
  * carries, the name id an entry of the PORT_NAME string table. The 2Pre
  * answers Internal 24, S/PDIF 4, ADAT 0, and the vendor driver sends exactly
  * those values. PORT_NAME {u16 id} -> a NUL-terminated name from one fixed
- * table per family (ids 3-8 are the clock names; past the table the device
+ * table per family (the clock names are ids 3-8 on a Clarett, 3-10 on a Red,
+ * hence the lookup by the ids CLOCK_LIST gives; past the table the device
  * refuses). Probe builds the "Clock Source" control from the two
  * (clarett_read_clock_srcs()).
  */
