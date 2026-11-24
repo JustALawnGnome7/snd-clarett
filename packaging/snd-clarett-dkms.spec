@@ -21,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.5.1
+Version:        0.5.2
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -84,6 +84,11 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %changelog
+* Tue Nov 24 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.2-1
+- Decide whether to create the MIDI device from the unit's own report
+  of its MIDI ports (MIDI_INFO), with the model table as the fallback
+  and a cross-check
+
 * Tue Nov 24 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.1-1
 - Send MIDI output from the device's transmit-ready interrupt instead
   of polling the UART: the output trigger writes until the FIFO is
