@@ -466,13 +466,15 @@ struct snd_rawmidi_substream;
 #define FCP_SYNC_RATE_CFG        0x006002 /* u32 configured rate */
 
 /*
- * STREAM_INFO {u8 speed_band} -> {u16 playback_ch, u16 capture_ch, u32, u32}:
- * the device's stream geometry at single (0), double (1) and quad (2) speed.
- * The band-0 pair identifies the model (clarett_detect_model()); the capture
- * word at bands 1 and 2 is how many leading capture channels the device still
- * writes once ADAT S/MUX has removed some (clarett_read_rx_live()). The two
- * trailing words are not decoded. A band past 2 is answered with an empty
- * reply, and is never asked.
+ * STREAM_INFO {u8 speed_band} -> {u16 playback_ch, u16 capture_ch, u32 a,
+ * u32 b, u32 0, u32 0, u32 0}: the device's stream geometry at single (0),
+ * double (1) and quad (2) speed. The band-0 pair identifies the model
+ * (clarett_detect_model()); the capture word at bands 1 and 2 is how many
+ * leading capture channels the device still writes once ADAT S/MUX has
+ * removed some (clarett_read_rx_live()). a + b matches the measured analogue
+ * round-trip converter latency in frames at that band (28/24/23 on the
+ * 8Pre); which word is the input and which the output is not known. The
+ * request must be exactly one byte; a band past 2 is refused.
  *
  * The host issues only what the stream path needs: SET_CLOCK and the sync
  * queries at every arm (clarett_stream_handshake()), 0x006002 among them.
@@ -499,11 +501,11 @@ struct snd_rawmidi_substream;
  * the order the vendor software lists them: the value is what SET_CLOCK
  * carries, the name id an entry of the PORT_NAME string table. The 2Pre
  * answers Internal 24, S/PDIF 4, ADAT 0, and the vendor driver sends exactly
- * those values. PORT_NAME {u16 id} -> a NUL-terminated name from one fixed
- * table per family (the clock names are ids 3-8 on a Clarett, 3-10 on a Red,
- * hence the lookup by the ids CLOCK_LIST gives; past the table the device
- * refuses). Probe builds the "Clock Source" control from the two
- * (clarett_read_clock_srcs()).
+ * those values. PORT_NAME {u16 id} -> a name from one fixed table per family,
+ * without a NUL: the reply size is its length (the clock names are ids 3-8 on
+ * a Clarett, 3-10 on a Red, hence the lookup by the ids CLOCK_LIST gives; past
+ * the table, or with any request but two bytes, the device refuses). Probe
+ * builds the "Clock Source" control from the two (clarett_read_clock_srcs()).
  */
 #define FCP_CLOCK_LIST           0x006000
 #define FCP_PORT_NAME            0x005000
@@ -511,8 +513,11 @@ struct snd_rawmidi_substream;
  * MIDI_INFO, the info query of FCP category 8 -> {u16, u16}, the unit's DIN
  * MIDI ports: 1 and 1 on every Clarett (one MIDI in, one MIDI out), 0 and 0 on
  * the Red 8Line, which has no MIDI jacks although its register UART answers
- * like a Clarett's. Which half counts inputs and which outputs is not known.
- * Probe creates the rawmidi from it (clarett_read_midi_ports()).
+ * like a Clarett's. Probe creates the rawmidi from it
+ * (clarett_read_midi_ports()). 0x008001 and 0x008002 list the MIDI inputs and
+ * outputs, one 12-byte record per port {u8 0, u8 index, u16 PORT_NAME id,
+ * u32 3125 (the DIN byte rate), u32 0}: MIDI In and MIDI Out on a Clarett,
+ * empty on the Red. So the counts are most likely inputs, then outputs.
  */
 #define FCP_MIDI_INFO            0x008000
 #define CLARETT_MAX_CLOCK_SRCS   16
@@ -521,7 +526,8 @@ struct snd_rawmidi_substream;
 /*
  * Other opcodes, for reference; the driver issues none of them itself.
  *   0x006001 {} -> the supported rates as u32s (44100..192000 on the 2Pre);
- *     0x007000: identity queries a normal attach makes.
+ *     0x007000 -> 40 bytes, zero on every unit read: identity queries a
+ *     normal attach makes.
  *   0x000001 {u16 category} -> one byte: the CAPABILITY READ, non-zero = that
  *     opcode category is live. fcp-server calls it first and refuses the
  *     device unless INIT (0x000) and DATA (0x800) both answer, so it is the
@@ -540,14 +546,19 @@ struct snd_rawmidi_substream;
  */
 
 /*
- * STREAM_CHANS_TX/RX {u32 speed band, u16 count (ignored)} -> one 16-byte
- * record per playback/capture stream channel at that band, in stream order:
+ * STREAM_CHANS_TX/RX {u16 speed band, u16 first, u16 count (ignored)} -> one
+ * 16-byte record per playback/capture stream channel at that band, in stream
+ * order, from index first to the end of the list (a first past the end is
+ * refused):
  * {u8 0, u8 index, u16 port id, u16 port id, u16 port class, u32 0,
- * u32 type}. Port id and class are PORT_NAME ids (the 2Pre's capture: Input
- * 1-2 class Analog, S/PDIF 1-2, Loop 1-2 class LOOP, then ADAT 1-8; at
- * double and quad speed the same list cut to the S/MUX width). A band past 2
- * is refused. The vendor driver sends both at every stream setup; probe reads
- * the capture list for the loopback pair (clarett_read_rx_layout()).
+ * u32 type}; the two port ids are equal in every record read. Port id and
+ * class are PORT_NAME ids (the 2Pre's capture: Input 1-2 class Analog, S/PDIF
+ * 1-2, Loop 1-2 class LOOP, then ADAT 1-8; at double and quad speed the same
+ * list cut to the S/MUX width). The Red 8Line's classes do not describe its
+ * channels (every capture record says Analog), so it has no LOOP entry and
+ * keeps its stream order. The request must be exactly six bytes; a band past
+ * 2 is refused. The vendor driver sends both after every SET_CLOCK; probe
+ * reads the capture list for the loopback pair (clarett_read_rx_layout()).
  */
 #define FCP_STREAM_CHANS_TX      0x007002
 #define FCP_STREAM_CHANS_RX      0x007003

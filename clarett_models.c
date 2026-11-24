@@ -794,7 +794,7 @@ static int clarett_find_loopback(struct clarett *c)
 	r = kmalloc(len, GFP_KERNEL);
 	if (!r)
 		return -ENOMEM;
-	/* band 0 (u32), then a count the device ignores */
+	/* band 0, first channel 0, then a count the device ignores */
 	clarett_put_le16(req + 4, c->capture_ch);
 	err = clarett_fcp_read(c, FCP_STREAM_CHANS_RX, req, sizeof(req), r,
 			       len, &size, &status);
