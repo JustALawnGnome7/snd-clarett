@@ -281,6 +281,18 @@ static void clarett_irq_event(struct clarett *c)
 	u32 cause, ev;
 
 	cause = readl(c->bar0 + REG_NOTIFY_CAUSE);
+	/*
+	 * All-ones is a failed read, not a cause: as data it would complete
+	 * the command in flight and relay every event bit. A read can fail
+	 * on its own while 0x100 read fine, so this needs its own check.
+	 */
+	if (cause == 0xffffffff) {
+		if (READ_ONCE(c->stream_run)) {
+			c->irq_st.bad_reads++;
+			c->irq_st.bad_or |= cause;
+		}
+		return;
+	}
 	ev = cause & NOTIFY_EVENT_MASK;
 
 	if (inflight) {
