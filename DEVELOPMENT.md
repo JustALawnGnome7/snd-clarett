@@ -160,8 +160,11 @@ Probe sequence:
 The `STREAM_INFO{band 0}` answer is kept per card (`playback_ch`/`capture_ch`), and the rings,
 descriptors, fragment strides, the engine's arm registers and the PCM are all sized from it, never
 from the model table, whose channel counts are only identification keys. The model supplies what the
-device does not report: names and slug, config offsets, clock sources, the loopback position, MIDI,
-the notification word. A unit no entry claims (an unknown `MODEL_ID` and geometry, or a `MODEL_ID`
+device does not report: names and slug, config offsets, clock sources, the loopback position, the
+notification word. Whether there is a MIDI device is the device's answer too: `MIDI_INFO` (`0x008000`,
+the info query of FCP category 8) returns two u16 MIDI port counts, 1 and 1 on every Clarett and 0 on
+the Red 8Line, and the rawmidi is created if either is non-zero; the model's `has_midi` is the fallback
+if it does not answer, and a cross-check that warns on disagreement. A unit no entry claims (an unknown `MODEL_ID` and geometry, or a `MODEL_ID`
 whose entry has a different geometry) **still attaches, on its family's defaults** (Clarett or Red,
 from `MODEL_ID`'s family word or register `0x000`): the family's clock sources, notification word and
 MIDI or front-panel word, the stream in the device's order, no per-model controls, and a warning with

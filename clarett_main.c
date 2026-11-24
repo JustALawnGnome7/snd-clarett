@@ -727,6 +727,7 @@ static int clarett_identify(struct clarett *c)
 	clarett_read_rx_live(c);
 	clarett_read_clock_srcs(c);
 	clarett_read_rx_layout(c);
+	clarett_read_midi_ports(c);
 	/* Nothing arms the device, so its flash-persisted routing stands. */
 	return 0;
 }
@@ -832,7 +833,7 @@ static bool clarett_create_interfaces(struct clarett *c)
 		/* c->pcm is set before an alloc that can still fail */
 		pcm_ok = true;
 
-	/* DIN MIDI, on models with MIDI jacks (a no-op otherwise) */
+	/* DIN MIDI, on units with MIDI ports (a no-op otherwise) */
 	err = clarett_create_midi(c);
 	if (err)
 		dev_warn(&pci->dev,

@@ -30,8 +30,9 @@
  * REG_MIDI_ACK once.
  *
  * It is independent of the FCP control session. Every Clarett Thunderbolt model
- * has DIN MIDI; the Red range has none, so the rawmidi is created only where
- * clarett_model.has_midi is set.
+ * has DIN MIDI; the Red range has none, so the rawmidi is created only for a
+ * unit that reports MIDI ports (clarett_read_midi_ports()), or, if it does not
+ * answer, whose model table says it has them.
  */
 #include <linux/io.h>
 #include <linux/list.h>
@@ -258,7 +259,7 @@ int clarett_create_midi(struct clarett *c)
 	char name[40];
 	int err;
 
-	if (!c->model->has_midi)
+	if (!c->has_midi)
 		return 0;
 
 	/*

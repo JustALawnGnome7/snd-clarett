@@ -506,6 +506,14 @@ struct snd_rawmidi_substream;
  */
 #define FCP_CLOCK_LIST           0x006000
 #define FCP_PORT_NAME            0x005000
+/*
+ * MIDI_INFO, the info query of FCP category 8 -> {u16, u16}, the unit's DIN
+ * MIDI ports: 1 and 1 on every Clarett (one MIDI in, one MIDI out), 0 and 0 on
+ * the Red 8Line, which has no MIDI jacks although its register UART answers
+ * like a Clarett's. Which half counts inputs and which outputs is not known.
+ * Probe creates the rawmidi from it (clarett_read_midi_ports()).
+ */
+#define FCP_MIDI_INFO            0x008000
 #define CLARETT_MAX_CLOCK_SRCS   16
 #define CLARETT_CLOCK_NAME_LEN   32
 
@@ -593,7 +601,8 @@ struct clarett_model {
 	int n_out_gains;
 	/*
 	 * DIN MIDI jacks. Every Clarett has them; the Red range has none,
-	 * although the Red's register UART answers like a Clarett's.
+	 * although the Red's register UART answers like a Clarett's. The
+	 * fallback and cross-check for the device's MIDI_INFO.
 	 */
 	bool has_midi;
 	/*
@@ -1051,6 +1060,11 @@ struct clarett {
 	 * stream order alone (clarett_read_rx_layout)
 	 */
 	u8 rx_loopback_at;
+	/*
+	 * the unit has DIN MIDI: MIDI_INFO's answer, else the model's has_midi
+	 * (clarett_read_midi_ports)
+	 */
+	bool has_midi;
 	/*
 	 * leading bytes of each capture frame the device fills at the
 	 * negotiated rate, and the S/MUX-removed tail after them, which the
@@ -1613,6 +1627,7 @@ void clarett_log_ident(struct clarett *c);
 void clarett_read_rx_live(struct clarett *c);
 void clarett_read_clock_srcs(struct clarett *c);
 void clarett_read_rx_layout(struct clarett *c);
+void clarett_read_midi_ports(struct clarett *c);
 
 /* engine.c — data-plane engine (shared with pcm.c) */
 void clarett_engine_arm(struct clarett *c, dma_addr_t r0, dma_addr_t r1);
@@ -1660,7 +1675,7 @@ void clarett_pcm_suspend(struct clarett *c);
 void clarett_pcm_resume(struct clarett *c);
 
 /* midi.c */
-/* register the DIN MIDI rawmidi (no-op on a model without MIDI) */
+/* register the DIN MIDI rawmidi (no-op on a unit without MIDI) */
 int clarett_create_midi(struct clarett *c);
 /* MIDI interrupt: drain RX, refill TX, acknowledge */
 void clarett_midi_irq(struct clarett *c);

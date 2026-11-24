@@ -858,3 +858,36 @@ void clarett_read_rx_layout(struct clarett *c)
 	c->rx_loopback_at = at;
 	dev_dbg(&c->pci->dev, "loopback pair at capture channel %d\n", at);
 }
+
+/*
+ * Whether to create the MIDI device: from MIDI_INFO, the device's own count of
+ * its MIDI ports (any port at all), else the model's table. A disagreement
+ * with the table is reported and the device believed.
+ */
+void clarett_read_midi_ports(struct clarett *c)
+{
+	const struct clarett_model *m = c->model;
+	u8 r[4];
+	u16 size;
+	u32 status;
+	u16 a, b;
+
+	if (clarett_fcp_read(c, FCP_MIDI_INFO, NULL, 0, r, sizeof(r), &size,
+			     &status) || status != FCP_RESP_ERR_OK ||
+	    size < sizeof(r)) {
+		dev_warn(&c->pci->dev,
+			 "MIDI_INFO unanswered: using the %s table (%s)\n",
+			 m->name, m->has_midi ? "MIDI" : "no MIDI");
+		c->has_midi = m->has_midi;
+		return;
+	}
+
+	a = clarett_get_le16(r);
+	b = clarett_get_le16(r + 2);
+	c->has_midi = a || b;
+	if (c->has_midi != m->has_midi)
+		dev_warn(&c->pci->dev,
+			 "MIDI_INFO reports %u/%u MIDI ports, the %s table says %s; using the device's\n",
+			 a, b, m->name, m->has_midi ? "MIDI" : "no MIDI");
+	dev_dbg(&c->pci->dev, "MIDI_INFO: %u/%u MIDI ports\n", a, b);
+}
