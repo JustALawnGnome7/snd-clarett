@@ -40,7 +40,7 @@
 %global debug_package %{nil}
 
 Name:           %{kmod_name}-kmod
-Version:        0.4.2
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module
 
@@ -121,6 +121,20 @@ done
 %{?akmod_install}
 
 %changelog
+* Mon Nov 23 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.0-1
+- Service the stream from the interrupt: the vec0 handler reads the
+  0x100 summary and every cause block once per interrupt (which also
+  acknowledges the period), and its thread copies capture, fills
+  playback and signals ALSA. The clarett-svc kernel thread and its
+  timers are gone; an hrtimer backstop sweeps only if an interrupt is
+  missed
+- Fill playback when the application writes (.ack) as well as at each
+  period event, and read the ring positions in .pointer
+- Start capture on the same period event as playback, so a linked
+  duplex stream has no period of offset: the round trip is the
+  application's lead plus 32 frames plus the converters
+- Refuse hwdep reply requests larger than the 1024-byte mailbox payload
+
 * Thu Nov 19 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.4.2-1
 - Report a live stream position between period events, in both
   directions: the servicer follows each ring block's position register
