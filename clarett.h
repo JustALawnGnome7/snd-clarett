@@ -54,18 +54,32 @@ struct snd_rawmidi_substream;
 /*
  * DIN MIDI UART (register PIO; see clarett_midi.c). REG_MIDI_DATA carries up to
  * 3 bytes packed low->high with a byte count in the top byte, both ways (an RX
- * count of 0 = FIFO empty). REG_MIDI_STATUS's low byte flags RX pending (0x0a),
- * cleared by writing MIDI_IRQ_ACK_VAL to REG_MIDI_ACK after the drain, and its
- * MIDI_TX_READY bit must gate every TX write.
+ * count of 0 = FIFO empty). REG_MIDI_STATUS's low byte reads 0x0a for a receive
+ * interrupt and 0x08 for a transmit-ready one: bit 3 is "MIDI interrupt
+ * pending", bit 1 receive data. Writing MIDI_IRQ_ACK_VAL to REG_MIDI_ACK
+ * acknowledges either. MIDI_TX_READY must gate every TX write.
  */
-/* IRQ summary (low byte 0x0a = MIDI RX pending); also read by servicer */
+/* MIDI status: interrupt code, TX ready, the enables below */
 #define REG_MIDI_STATUS          0x500
-/* write MIDI_IRQ_ACK_VAL to clear the MIDI RX interrupt */
+/*
+ * Write-only. MIDI_IRQ_ACK_VAL acknowledges the MIDI interrupt; bits 24-31 and
+ * bit 4 written here SET the same bits of REG_MIDI_STATUS, and written to
+ * REG_MIDI_CLR clear them.
+ */
 #define REG_MIDI_ACK             0x504
+#define REG_MIDI_CLR             0x508
 /* TX and RX: (count<<24)|(b2<<16)|(b1<<8)|b0 */
 #define REG_MIDI_DATA            0x58c
-/* -> REG_MIDI_ACK to clear the MIDI RX interrupt */
+/* -> REG_MIDI_ACK: acknowledge the MIDI interrupt (receive or transmit) */
 #define MIDI_IRQ_ACK_VAL         0x8
+/*
+ * bit24 of REG_MIDI_STATUS, set via REG_MIDI_ACK and cleared via REG_MIDI_CLR:
+ * the transmit-ready interrupt enable. While it is set, MIDI_TX_READY raises
+ * the MIDI interrupt; it behaves like a level: an ack while the FIFO is ready
+ * raises it again at once, so it is cleared once nothing is left to send.
+ * Bits 25-31 enable other sources, true at idle and not decoded; never set.
+ */
+#define MIDI_TX_IRQ_EN           0x01000000u
 /* packed word: byte count in bits 24-31 */
 #define MIDI_COUNT_SHIFT         24
 /* most MIDI bytes one packed word carries */
@@ -84,6 +98,8 @@ struct snd_rawmidi_substream;
  */
 #define REG_MIDI_TX_THRESH       0x510
 #define MIDI_TX_THRESH_VAL       0x8
+/* words the TX FIFO is sure to take while MIDI_TX_READY is set */
+#define MIDI_TX_BURST            (MIDI_TX_THRESH_VAL + 1)
 
 /*
  * Data-plane streaming registers. Two structurally identical ring blocks:
@@ -178,8 +194,9 @@ struct snd_rawmidi_substream;
  *   bit29  0x400, the mailbox phase and the device events ("DONE"). It
  *          reflects "0x400 has bits pending", so the vec0 ISR must read 0x100
  *          FIRST while a command is in flight (clarett_irq_event()).
- *   bit28  0x500, MIDI RX. Seen in exactly one capture, a MIDI receive, where
- *          its 70 reads match that trace's 70 MIDI acks one for one.
+ *   bit28  0x500, MIDI: receive data, or transmit ready while MIDI_TX_IRQ_EN
+ *          is set. Seen in exactly one capture, a MIDI receive, where its 70
+ *          reads match that trace's 70 MIDI acks one for one.
  *
  * The low bits are a different class: bits 0-3 appear only ever TOGETHER, as
  * 0xf, exactly once per stream stop (the write of 0 to REG_STREAM_IRQ_ARM) in
@@ -223,7 +240,7 @@ struct snd_rawmidi_substream;
 #define IRQ0_CAUSE_RX            0x80000000u	/* 0x300 */
 #define IRQ0_CAUSE_TX            0x40000000u	/* 0x200 */
 #define IRQ0_CAUSE_NOTIFY        0x20000000u	/* 0x400 */
-#define IRQ0_CAUSE_MIDI          0x10000000u	/* MIDI receive */
+#define IRQ0_CAUSE_MIDI          0x10000000u	/* MIDI receive/transmit */
 #define IRQ0_CAUSE_TX_UNDERRUN   0x00000010u
 #define IRQ0_CAUSE_KNOWN         0xf000001fu
 #define DOORBELL_SUBMIT          1
@@ -1176,8 +1193,9 @@ struct clarett {
 	/*
 	 * DIN MIDI (rawmidi over the REG_MIDI_DATA register UART). RX is
 	 * drained from the interrupt sweep (clarett_midi_irq) and pushed to
-	 * midi_in when the input is triggered; TX is drained from midi_out into
-	 * REG_MIDI_DATA by midi_tx_work. The *_up flags are the rawmidi trigger
+	 * midi_in when the input is triggered; TX is written from midi_out into
+	 * REG_MIDI_DATA by the output trigger and, while the FIFO is full, from
+	 * the transmit-ready interrupt. The *_up flags are the rawmidi trigger
 	 * gates. rmidi is set LAST at create and doubles as the ISR's "MIDI
 	 * live" guard.
 	 */
@@ -1188,7 +1206,7 @@ struct clarett {
 	struct snd_rawmidi_substream *midi_out;
 	/* input trigger gate: push RX bytes to ALSA */
 	bool midi_in_up;
-	/* output trigger gate: TX work may run */
+	/* output trigger gate: TX may write */
 	bool midi_out_up;
 	/*
 	 * From system suspend until the resume re-attach has finished, RX is
@@ -1196,8 +1214,14 @@ struct clarett {
 	 * back a burst of stale bytes.
 	 */
 	bool midi_rx_discard;
-	/* drains rawmidi output -> REG_MIDI_DATA */
-	struct work_struct midi_tx_work;
+	/*
+	 * TX state, under midi_tx_lock (taken from the output trigger and, IRQs
+	 * off, from the interrupt sweep): whether MIDI_TX_IRQ_EN is set, and
+	 * whether TX is parked for system sleep.
+	 */
+	spinlock_t midi_tx_lock;
+	bool midi_tx_irq;
+	bool midi_tx_parked;
 	/*
 	 * Serialises the RX FIFO drain, which runs for every MSI vector, on
 	 * whichever CPU each fires: two drainers would reorder the bytes. Taken
@@ -1638,13 +1662,13 @@ void clarett_pcm_resume(struct clarett *c);
 /* midi.c */
 /* register the DIN MIDI rawmidi (no-op on a model without MIDI) */
 int clarett_create_midi(struct clarett *c);
-/* drain the RX FIFO from the ISR */
+/* MIDI interrupt: drain RX, refill TX, acknowledge */
 void clarett_midi_irq(struct clarett *c);
-/* cancel TX work before teardown (safe if no MIDI) */
+/* stop TX and its interrupt before teardown (safe if no MIDI) */
 void clarett_midi_stop(struct clarett *c);
-/* system sleep: park the TX drain, keep the gates */
+/* system sleep: park TX and its interrupt, keep the gates */
 void clarett_midi_suspend(struct clarett *c);
-/* system sleep: restart the TX drain if output is up */
+/* system sleep: restart TX if output is up */
 void clarett_midi_resume(struct clarett *c);
 
 #endif /* CLARETT_H */

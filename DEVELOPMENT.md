@@ -229,8 +229,11 @@ prepares first arms the engine; the other joins the running clock.
 
 Every interrupt the device raises, period events included, arrives on vector 0, and one function
 reads all of its cause registers: `clarett_irq_sweep()` reads the `0x100` summary, then only the
-blocks it flags (`0x300` period, `0x200`, `0x400` mailbox phase and events, then the MIDI receive
-FIFO). Reading `0x300` is how a period is acknowledged, so the engine is acked in the interrupt
+blocks it flags (`0x300` period, `0x200`, `0x400` mailbox phase and events, then the MIDI block:
+drain the receive FIFO, refill the transmit FIFO, one acknowledgment for both). MIDI output is
+written by the rawmidi trigger until the transmit FIFO is full, then by the transmit-ready interrupt
+(`0x500` bit 24, enabled through `0x504` and disabled through `0x508` once nothing is left), so
+nothing polls the UART. Reading `0x300` is how a period is acknowledged, so the engine is acked in the interrupt
 itself; at a 16-frame period that removed nearly all of the device's period-overrun flags. The sweep
 counts the frames the engine advanced (the period counter is modular, so a late read recovers what
 it missed) and wakes vector 0's IRQ thread, which drains the RX ring into the capture buffer and
@@ -310,8 +313,8 @@ Suspend to idle, suspend to RAM and hibernation are supported (`clarett_suspend(
 host's side of the session is redone:
 
 - **Suspend** marks the card suspended (hwdep and control calls wait), stops the driver's work items,
-  flushes a pending settings save, parks the MIDI output drain, tears the stream engine down and
-  silences the playback ring, then masks the interrupts and drops the device's DMA registration and
+  flushes a pending settings save, parks MIDI output (clearing its interrupt enable), tears the
+  stream engine down and silences the playback ring, then masks the interrupts and drops the device's DMA registration and
   bus mastering, as unload does. ALSA has already suspended any running stream by then.
 - **The device goes to D3hot**, left to the PCI core, and keeps its state there (No_Soft_Reset). The
   driver must not save the PCI state itself: the core would then leave the device in D0, and with it

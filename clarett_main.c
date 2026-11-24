@@ -134,6 +134,8 @@ void clarett_hw_init(struct clarett *c)
 	 */
 	clarett_wl(c, REG_MIDI_TX_THRESH, MIDI_TX_THRESH_VAL);
 	clarett_wl(c, REG_MIDI_STATUS, 0x8);
+	/* a previous instance may have left the TX interrupt on */
+	clarett_wl(c, REG_MIDI_CLR, MIDI_TX_IRQ_EN);
 	clarett_wl(c, REG_IRQ0_ENABLE, 0xf000003f);
 	clarett_wl(c, REG_DMA_ADDR_LO, lower_32_bits(c->resp_dma));
 	reinit_completion(&c->addr_acked);
@@ -505,7 +507,7 @@ static void clarett_hw_teardown(struct clarett *c)
 	if (cancel_delayed_work_sync(&c->save_work))
 		clarett_data_cmd(c, FCP_ACTIVATE_PERSIST);
 	cancel_work_sync(&c->notify_work);
-	/* cancel the MIDI TX drain */
+	/* stop MIDI TX and its interrupt */
 	clarett_midi_stop(c);
 	/* halt streaming DMA before devres frees the ring */
 	clarett_engine_stop(c);
