@@ -21,7 +21,7 @@
 %global debug_package %{nil}
 
 Name:           %{module_name}-dkms
-Version:        0.5.0
+Version:        0.5.1
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module (DKMS)
 
@@ -84,6 +84,15 @@ dkms remove -m %{module_name} -v %{version} --all --rpm_safe_upgrade || :
 %{_datadir}/wireplumber/wireplumber.conf.d/51-clarett-naming.conf
 
 %changelog
+* Tue Nov 24 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.1-1
+- Send MIDI output from the device's transmit-ready interrupt instead
+  of polling the UART: the output trigger writes until the FIFO is
+  full, the interrupt refills it, and the interrupt is disabled once
+  nothing is left to send. Nothing touches the UART while no output is
+  queued, and output runs at the wire rate
+- Acknowledge every MIDI interrupt, not only those that bring received
+  data
+
 * Mon Nov 23 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.0-1
 - Service the stream from the interrupt: the vec0 handler reads the
   0x100 summary and every cause block once per interrupt (which also
