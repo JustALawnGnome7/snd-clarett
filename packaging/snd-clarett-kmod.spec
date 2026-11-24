@@ -40,7 +40,7 @@
 %global debug_package %{nil}
 
 Name:           %{kmod_name}-kmod
-Version:        0.5.2
+Version:        0.5.3
 Release:        1%{?dist}
 Summary:        Focusrite Clarett/Red (Thunderbolt) ALSA kernel module
 
@@ -121,6 +121,11 @@ done
 %{?akmod_install}
 
 %changelog
+* Tue Nov 24 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.3-1
+- Ignore an all-ones read of the interrupt's notification register: a
+  failed PCIe read could otherwise complete the command in flight and
+  relay every event to fcp-server
+
 * Tue Nov 24 2026 Miles Ramage <miles.ramage@yahoo.com> - 0.5.2-1
 - Decide whether to create the MIDI device from the unit's own report
   of its MIDI ports (MIDI_INFO), with the model table as the fallback
